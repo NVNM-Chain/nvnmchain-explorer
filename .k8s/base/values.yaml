@@ -23,6 +23,8 @@ StatefulSet:
   image:
     repository: ghcr.io/nvnm-chain/nvnmchain-explorer
     pullPolicy: IfNotPresent
+  imagePullSecrets:
+    - name: ghcr-nvnm-chain-applications-registry-read-secret
   # Dockerfile runs the binary as `app`, uid/gid 10001.
   podSecurityContext:
     fsGroup: 10001
