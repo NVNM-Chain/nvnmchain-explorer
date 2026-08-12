@@ -1,0 +1,24 @@
+apiVersion: getambassador.io/v3alpha1
+kind: Host
+metadata:
+  name: nvnmchain-explorer
+  annotations:
+    external-dns.ambassador-service: emissary-ingress.emissary
+spec:
+  hostname: explorer.nvnm.canary.mantrachain.dev
+  acmeProvider:
+    authority: none
+  tlsSecret:
+    name: asia-east2-std.canary.mantrachain.dev-wildcard-tls-secret
+    namespace: emissary
+---
+apiVersion: getambassador.io/v3alpha1
+kind: Mapping
+metadata:
+  name: nvnmchain-explorer
+spec:
+  hostname: explorer.nvnm.canary.mantrachain.dev
+  prefix: /
+  rewrite: ''
+  service: nvnmchain-explorer:80
+  timeout_ms: 30000

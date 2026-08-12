@@ -1,0 +1,72 @@
+# The app keeps its whole state (indexer + web) in a single SQLite file, so
+# it can only ever run as one replica. Deployment is disabled in favor of a
+# single-replica StatefulSet with a PVC for that file.
+deployment:
+  enabled: false
+
+serviceAccount:
+  create: true
+  name: nvnmchain-explorer
+
+service:
+  enabled: true
+  type: ClusterIP
+  port:
+    - port: 80
+      targetPort: http
+      protocol: TCP
+      name: http
+
+StatefulSet:
+  enabled: true
+  replicaCount: 1
+  image:
+    repository: ghcr.io/nvnm-chain/nvnmchain-explorer
+    pullPolicy: IfNotPresent
+  # Dockerfile runs the binary as `app`, uid/gid 10001.
+  podSecurityContext:
+    fsGroup: 10001
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    allowPrivilegeEscalation: false
+  service:
+    port:
+      - containerPort: 8080
+        protocol: TCP
+        name: http
+  livenessProbe:
+    httpGet:
+      path: /
+      port: http
+    initialDelaySeconds: 20
+    periodSeconds: 15
+    timeoutSeconds: 3
+    failureThreshold: 3
+  readinessProbe:
+    httpGet:
+      path: /
+      port: http
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "256Mi"
+    limits:
+      cpu: "1000m"
+      memory: "1Gi"
+  envFrom:
+    - name: nvnmchain-explorer-env-variables
+      type: configmap
+  volumeMounts:
+    - name: data
+      mountPath: /data
+  persistenceStorage:
+    - name: data
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: standard-rwo
+      volumeMode: Filesystem
+      size: 10Gi

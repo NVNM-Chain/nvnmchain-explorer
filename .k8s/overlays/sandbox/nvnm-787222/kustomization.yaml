@@ -1,0 +1,15 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: nvnm-tempo-devnet-1-applications
+resources:
+  - ../../../base/
+  - resources/host_mapping.yaml
+generatorOptions:
+  disableNameSuffixHash: true
+configMapGenerator:
+  - envs:
+      - resources/env.yaml
+    name: nvnmchain-explorer-env-variables
+images:
+  - name: ghcr.io/nvnm-chain/nvnmchain-explorer
+    newTag: "v1.0.0"

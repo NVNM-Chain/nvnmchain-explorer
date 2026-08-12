@@ -1,12 +1,4 @@
-# Environment / tooling
-.envrc
-.direnv
-.aider*
-
-# db
-explorer.db*
-
-# Rust
-/target/
-Cargo.lock.orig
-/TODO.md
+**/charts/**
+# For local testing of the kustomize output
+kustomize-output.yaml
+.DS_Store
