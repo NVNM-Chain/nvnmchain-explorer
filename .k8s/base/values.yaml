@@ -25,12 +25,11 @@ StatefulSet:
     pullPolicy: IfNotPresent
   imagePullSecrets:
     - name: ghcr-nvnm-chain-applications-registry-read-secret
-  # Dockerfile runs the binary as `app`, uid/gid 10001.
-  podSecurityContext:
-    fsGroup: 10001
+  # entrypoint.sh must start as root: it chowns /data to app:app (uid/gid
+  # 10001) before dropping privileges itself via setpriv. Forcing
+  # runAsUser/runAsNonRoot here starts the container as 10001 already, so
+  # that chown fails with "Operation not permitted".
   securityContext:
-    runAsNonRoot: true
-    runAsUser: 10001
     allowPrivilegeEscalation: false
   service:
     port:
