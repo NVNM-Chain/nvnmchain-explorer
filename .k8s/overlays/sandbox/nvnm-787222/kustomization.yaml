@@ -12,4 +12,4 @@ configMapGenerator:
     name: nvnmchain-explorer-env-variables
 images:
   - name: ghcr.io/nvnm-chain/nvnmchain-explorer
-    newTag: "v1.0.0"
+    newTag: "v1.1.0"
