@@ -1,8 +1,15 @@
 //! ABI decoding for calls, events, traces, and balance changes.
 //!
-//! A self-contained ABIv2 decoder (no alloy dependency) plus built-in TIP-20 /
-//! ERC-20 token metadata and labels.
+//! ABI type parsing and argument decoding are delegated to ethers-core
+//! ([`HumanReadableParser`] + the ethabi decoder), with a thin formatter on
+//! top that renders addresses checksummed and integers decimal. Built-in
+//! TIP-20 / ERC-20 token metadata and labels round it out.
 
+use std::{collections::HashMap, sync::LazyLock};
+
+use ethers_core::abi::{
+    decode as abi_decode, HumanReadableParser, ParamType, Token, Uint as EthersUint,
+};
 use num_bigint::{BigInt, Sign};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -176,149 +183,8 @@ impl DecodedCall {
 }
 
 // ---------------------------------------------------------------------------
-// ABI type parser + decoder
+// ABI type parsing + decoding (ethers-core / ethabi)
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, PartialEq)]
-enum AbiType {
-    Address,
-    Bool,
-    Uint(usize),
-    Int(usize),
-    FixedBytes(usize),
-    Bytes,
-    String,
-    Array(Box<AbiType>, Option<usize>),
-    Tuple(Vec<AbiType>),
-    Function,
-}
-
-impl AbiType {
-    fn parse(s: &str) -> Option<AbiType> {
-        let s = s.trim();
-        if s.is_empty() {
-            return None;
-        }
-        if s == "address" {
-            return Some(AbiType::Address);
-        }
-        if s == "bool" {
-            return Some(AbiType::Bool);
-        }
-        if s == "string" {
-            return Some(AbiType::String);
-        }
-        if s == "bytes" {
-            return Some(AbiType::Bytes);
-        }
-        if s == "function" {
-            return Some(AbiType::Function);
-        }
-        if let Some(n) = s.strip_prefix("uint") {
-            if let Ok(bits) = n.parse::<usize>() {
-                if (8..=256).contains(&bits) && bits % 8 == 0 {
-                    return Some(AbiType::Uint(bits));
-                }
-            }
-        }
-        if let Some(n) = s.strip_prefix("int") {
-            if let Ok(bits) = n.parse::<usize>() {
-                if (8..=256).contains(&bits) && bits % 8 == 0 {
-                    return Some(AbiType::Int(bits));
-                }
-            }
-        }
-        if let Some(n) = s.strip_prefix("bytes") {
-            if let Ok(len) = n.parse::<usize>() {
-                if (1..=32).contains(&len) {
-                    return Some(AbiType::FixedBytes(len));
-                }
-            }
-        }
-        if s.starts_with('(') {
-            let inner = {
-                let i = find_tuple_end(s)?;
-                &s[1..i]
-            };
-            let mut types = Vec::new();
-            for part in split_top_level(inner) {
-                types.push(AbiType::parse(part)?);
-            }
-            return Some(AbiType::Tuple(types));
-        }
-        // Array suffixes: T[] or T[k]
-        if s.ends_with(']') {
-            let open = s.rfind('[')?;
-            let inner = &s[..open];
-            let dim = &s[open + 1..s.len() - 1];
-            let elem = Box::new(AbiType::parse(inner)?);
-            let len = if dim.is_empty() {
-                None
-            } else {
-                Some(dim.parse::<usize>().ok()?)
-            };
-            return Some(AbiType::Array(elem, len));
-        }
-        None
-    }
-
-    fn is_dynamic(&self) -> bool {
-        match self {
-            AbiType::Bytes | AbiType::String => true,
-            AbiType::Array(_, None) => true,
-            AbiType::Array(elem, Some(_)) => elem.is_dynamic(),
-            AbiType::Tuple(types) => types.iter().any(|t| t.is_dynamic()),
-            _ => false,
-        }
-    }
-
-    /// Number of 32-byte head words a value of this type occupies (only valid
-    /// for static types; dynamic values always occupy one head word).
-    fn head_words(&self) -> usize {
-        match self {
-            AbiType::Array(elem, Some(k)) => k * elem.head_words(),
-            AbiType::Tuple(types) => types.iter().map(|t| t.head_words()).sum(),
-            _ => 1,
-        }
-    }
-}
-
-fn find_tuple_end(s: &str) -> Option<usize> {
-    let mut depth = 0usize;
-    for (i, c) in s.char_indices() {
-        match c {
-            '(' => depth += 1,
-            ')' => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Split `a,b,(c,d),e[]` on top-level commas.
-fn split_top_level(s: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut depth = 0usize;
-    let mut start = 0usize;
-    for (i, c) in s.char_indices() {
-        match c {
-            '(' | '[' => depth += 1,
-            ')' | ']' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => {
-                parts.push(&s[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    parts.push(&s[start..]);
-    parts
-}
 
 fn word(bytes: &[u8]) -> &[u8] {
     &bytes[..bytes.len().min(32)]
@@ -335,146 +201,64 @@ fn hex_bytes(value: &[u8]) -> String {
     format!("0x{}", hex::encode(value))
 }
 
-/// Format a decoded value: addresses checksummed, ints decimal, bytes hex,
-/// bools lowercase.
-fn format_value(ty: &AbiType, value: &[u8], _ty_str: &str) -> String {
-    match ty {
-        AbiType::Address => {
-            checksum_address(&hex::encode(&value[value.len().saturating_sub(20)..]))
-        }
-        AbiType::Bool => {
-            if big_from_word(value).sign() == Sign::Plus && big_from_word(value) != BigInt::from(0)
-            {
-                "true".into()
-            } else {
-                "false".into()
-            }
-        }
-        AbiType::Uint(_) => big_from_word(value).to_string(),
-        AbiType::Int(bits) => {
-            let n = big_from_word(value);
-            let mask = BigInt::from(1) << (bits - 1);
-            if &n & &mask != BigInt::from(0) {
-                (n - (BigInt::from(1) << bits)).to_string()
-            } else {
+/// Format an ethers-decoded `Token` the way the explorer displays values:
+/// addresses EIP-55 checksummed, ints/uint decimal, bytes hex, arrays and
+/// tuples as `[a, b]` / `(a, b)`.
+fn format_token(ty: &ParamType, token: &Token) -> String {
+    match (ty, token) {
+        (ParamType::Address, Token::Address(addr)) => checksum_address(&format!("{addr:x}")),
+        (ParamType::Bool, Token::Bool(b)) => b.to_string(),
+        (ParamType::Uint(_), Token::Uint(n)) => n.to_string(),
+        (ParamType::Int(bits), Token::Int(n)) => {
+            // Canonical encoding sign-extends narrow ints across the word, so
+            // mask to the declared width before the two's-complement conversion.
+            let bits = *bits;
+            let mask = EthersUint::MAX >> (256 - bits);
+            let n = *n & mask;
+            let sign_bit = EthersUint::from(1u64) << (bits - 1);
+            if n < sign_bit {
                 n.to_string()
+            } else {
+                format!("-{}", (n ^ mask) + EthersUint::from(1u64))
             }
         }
-        AbiType::FixedBytes(len) => hex_bytes(&value[..*len.min(&value.len())]),
-        AbiType::Bytes => {
-            // len word + payload
-            let len = big_from_word(value)
-                .to_string()
-                .parse::<usize>()
-                .unwrap_or(0);
-            let payload = value.get(32..32 + len).unwrap_or(&[]);
-            hex_bytes(payload)
-        }
-        AbiType::String => {
-            let len = big_from_word(value)
-                .to_string()
-                .parse::<usize>()
-                .unwrap_or(0);
-            let payload = value.get(32..32 + len).unwrap_or(&[]);
-            String::from_utf8_lossy(payload).into_owned()
-        }
-        AbiType::Function => hex_bytes(&value[..24.min(value.len())]),
-        AbiType::Array(_, _) | AbiType::Tuple(_) => {
-            // Decoded higher up; fall back to raw hex.
-            hex_bytes(value)
-        }
-    }
-}
-
-/// Decode a tuple (or top-level argument list) of `types` from `data`.
-fn decode_tuple(types: &[AbiType], data: &[u8]) -> Vec<String> {
-    let mut values = Vec::with_capacity(types.len());
-    let mut head_off = 0usize;
-    for ty in types {
-        if ty.is_dynamic() {
-            let off_bytes = word(data.get(head_off * 32..head_off * 32 + 32).unwrap_or(&[]));
-            let off = big_from_word(off_bytes)
-                .to_string()
-                .parse::<usize>()
-                .unwrap_or(0);
-            let tail = data.get(off..).unwrap_or(&[]);
-            values.push(decode_dynamic(ty, tail));
-        } else {
-            let words = ty.head_words();
-            let start = head_off * 32;
-            let slice = data.get(start..start + words * 32).unwrap_or(&[]);
-            values.push(decode_static(ty, slice));
-        }
-        head_off += ty.head_words();
-    }
-    values
-}
-
-fn decode_static(ty: &AbiType, slice: &[u8]) -> String {
-    match ty {
-        AbiType::Array(elem, Some(k)) => {
-            let mut parts = Vec::new();
-            let stride = elem.head_words() * 32;
-            for i in 0..*k {
-                let start = i * stride;
-                let item = slice.get(start..start + stride).unwrap_or(&[]);
-                if elem.is_dynamic() {
-                    parts.push(decode_dynamic(elem, item));
-                } else {
-                    parts.push(decode_static(elem, item));
-                }
-            }
+        (ParamType::FixedBytes(_), Token::FixedBytes(bytes))
+        | (ParamType::Bytes, Token::Bytes(bytes)) => hex_bytes(bytes),
+        (ParamType::String, Token::String(s)) => s.clone(),
+        (ParamType::Array(elem), Token::Array(items))
+        | (ParamType::FixedArray(elem, _), Token::FixedArray(items)) => {
+            let parts: Vec<String> = items.iter().map(|t| format_token(elem, t)).collect();
             format!("[{}]", parts.join(", "))
         }
-        AbiType::Tuple(types) => format!("({})", decode_tuple(types, slice).join(", ")),
-        _ => format_value(ty, slice, ""),
-    }
-}
-
-fn decode_dynamic(ty: &AbiType, data: &[u8]) -> String {
-    match ty {
-        AbiType::Bytes | AbiType::String => format_value(ty, data, ""),
-        AbiType::Array(elem, _) => {
-            let count = big_from_word(word(data))
-                .to_string()
-                .parse::<usize>()
-                .unwrap_or(0);
-            let body = data.get(32..).unwrap_or(&[]);
-            let mut parts = Vec::new();
-            let mut head_off = 0usize;
-            for _ in 0..count {
-                if elem.is_dynamic() {
-                    let off = big_from_word(word(
-                        body.get(head_off * 32..head_off * 32 + 32).unwrap_or(&[]),
-                    ))
-                    .to_string()
-                    .parse::<usize>()
-                    .unwrap_or(0);
-                    parts.push(decode_dynamic(elem, body.get(off..).unwrap_or(&[])));
-                } else {
-                    let words = elem.head_words();
-                    let start = head_off * 32;
-                    parts.push(decode_static(
-                        elem,
-                        body.get(start..start + words * 32).unwrap_or(&[]),
-                    ));
-                }
-                head_off += elem.head_words();
-            }
-            format!("[{}]", parts.join(", "))
+        (ParamType::Tuple(types), Token::Tuple(items)) => {
+            let parts: Vec<String> = types
+                .iter()
+                .zip(items.iter())
+                .map(|(t, tok)| format_token(t, tok))
+                .collect();
+            format!("({})", parts.join(", "))
         }
-        AbiType::Tuple(types) => format!("({})", decode_tuple(types, data).join(", ")),
-        _ => format_value(ty, data, ""),
+        _ => token.to_string(),
     }
 }
 
 /// Decode ABI-encoded arguments for `types` from raw calldata (after selector).
 pub fn decode_abi_args(types: &[&str], data: &[u8]) -> Vec<String> {
-    let parsed: Vec<AbiType> = types.iter().filter_map(|t| AbiType::parse(t)).collect();
-    if parsed.len() != types.len() {
+    let params: Vec<ParamType> = types
+        .iter()
+        .filter_map(|t| HumanReadableParser::parse_type(t).ok())
+        .collect();
+    if params.len() != types.len() {
         return Vec::new();
     }
-    decode_tuple(&parsed, data)
+    match abi_decode(&params, data) {
+        Ok(tokens) => params
+            .iter()
+            .zip(tokens.iter())
+            .map(|(ty, tok)| format_token(ty, tok))
+            .collect(),
+        Err(_) => Vec::new(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -555,19 +339,33 @@ fn tip20_fns() -> &'static [FnDef] {
     ]
 }
 
-fn additional_sigs() -> &'static [(&'static str, &'static str)] {
-    // selector -> "signature with parameter names"
+/// Functions known by signature alone, in the named form the UI shows. The
+/// selector is derived from this string when [`BY_SELECTOR`] is built, so
+/// there is no hand-written selector to fall out of step.
+fn additional_sigs() -> &'static [&'static str] {
     &[
-        ("0x70a08231", "balanceOf(address account)"),
-        ("0x18160ddd", "totalSupply()"),
-        ("0x06fdde03", "name()"),
-        ("0x95d89b41", "symbol()"),
-        ("0x313ce567", "decimals()"),
-        ("0xdd62ed3e", "allowance(address owner, address spender)"),
-        ("0x40c10f19", "mint(address to, uint256 amount)"),
-        ("0x42966c68", "burn(uint256 amount)"),
-        ("0x0b631400", "authorizeKey(address,uint8,tuple)"),
-        ("0x18783a95", "revokeKey(address keyId)"),
+        "balanceOf(address account)",
+        "totalSupply()",
+        "name()",
+        "symbol()",
+        "decimals()",
+        "allowance(address owner, address spender)",
+        // AccountKeychain. `KeyRestrictions` is spelled as the tuple it
+        // expands to, since the selector hashes the expansion. `authorizeKey`
+        // is overloaded three times, each overload with its own selector.
+        "authorizeKey(address keyId, uint8 signatureType, uint64 expiry, bool enforceLimits, \
+         (address,uint256)[] limits)",
+        "authorizeKey(address keyId, uint8 signatureType, \
+         (uint64,bool,(address,uint256,uint64)[],bool,(address,(bytes4,address[])[])[]) restrictions)",
+        "authorizeKey(address keyId, uint8 signatureType, \
+         (uint64,bool,(address,uint256,uint64)[],bool,(address,(bytes4,address[])[])[]) restrictions, \
+         bytes32 witness)",
+        "authorizeAdminKey(address keyId, uint8 signatureType, bytes32 witness)",
+        "burnKeyAuthorizationWitness(bytes32 witness)",
+        "revokeKey(address keyId)",
+        "updateSpendingLimit(address keyId, address token, uint256 newLimit)",
+        "setAllowedCalls(address keyId, (address,(bytes4,address[])[])[] scopes)",
+        "removeAllowedCalls(address keyId, address target)",
     ]
 }
 
@@ -576,38 +374,91 @@ fn selector_hex(sig: &str) -> String {
     format!("0x{}", hex::encode(&hash[..4]))
 }
 
-fn param_names_from_sig(sig: &str) -> Vec<String> {
-    let open = sig.find('(').unwrap_or(0);
-    let close = sig.rfind(')').unwrap_or(sig.len());
-    let inner = &sig[open + 1..close];
-    let mut names = Vec::new();
-    for part in split_top_level(inner) {
-        let part = part.trim();
-        if part.is_empty() {
-            names.push(String::new());
-        } else if let Some(sp) = part.rfind(' ') {
-            names.push(part[sp + 1..].trim().to_string());
-        } else {
-            names.push(String::new());
-        }
-    }
-    names
+/// How a recognised selector is decoded: a TIP-20 entry, or a signature-list
+/// entry parsed when the table is built.
+enum Known {
+    Tip20(&'static FnDef),
+    Sig(SigEntry),
 }
 
-fn types_from_sig(sig: &str) -> Vec<String> {
-    let open = sig.find('(').unwrap_or(0);
-    let close = sig.rfind(')').unwrap_or(sig.len());
-    let inner = &sig[open + 1..close];
-    split_top_level(inner)
-        .into_iter()
-        .map(|p| {
-            let p = p.trim();
-            match p.rfind(' ') {
-                Some(i) => p[..i].trim().to_string(),
-                None => p.to_string(),
-            }
+/// A signature-list entry, parsed once at table build.
+struct SigEntry {
+    name: String,
+    canonical: String,
+    inputs: Vec<(String, String)>,
+}
+
+impl Known {
+    /// Name, canonical signature, and `(type, name)` inputs.
+    fn parts(&self) -> (&str, &str, Vec<(&str, &str)>) {
+        match self {
+            Known::Tip20(def) => (
+                def.name,
+                def.canonical,
+                def.inputs.iter().map(|&(t, n)| (t, n)).collect(),
+            ),
+            Known::Sig(entry) => (
+                &entry.name,
+                &entry.canonical,
+                entry
+                    .inputs
+                    .iter()
+                    .map(|(t, n)| (t.as_str(), n.as_str()))
+                    .collect(),
+            ),
+        }
+    }
+}
+
+/// Selector -> function, hashed once rather than on every decode. TIP-20
+/// entries take precedence.
+static BY_SELECTOR: LazyLock<HashMap<String, Known>> =
+    LazyLock::new(|| build_table(tip20_fns(), additional_sigs()));
+
+/// Split out so precedence can be tested against a deliberate collision.
+fn build_table(tip20: &'static [FnDef], sigs: &'static [&'static str]) -> HashMap<String, Known> {
+    let mut by_selector = HashMap::new();
+    for def in tip20 {
+        by_selector.insert(selector_hex(def.canonical), Known::Tip20(def));
+    }
+    for &sig in sigs {
+        // Selector, canonical form, and parameter names all derive from the
+        // one spelling; an unparsable signature is skipped (caught by test).
+        let Ok(fun) = HumanReadableParser::parse_function(sig) else {
+            continue;
+        };
+        let selector = format!("0x{}", hex::encode(fun.short_signature()));
+        let types: Vec<String> = fun.inputs.iter().map(|p| p.kind.to_string()).collect();
+        by_selector.entry(selector).or_insert_with(|| {
+            Known::Sig(SigEntry {
+                canonical: format!("{}({})", fun.name, types.join(",")),
+                inputs: types
+                    .into_iter()
+                    .zip(fun.inputs.iter().map(|p| p.name.clone()))
+                    .collect(),
+                name: fun.name,
+            })
+        });
+    }
+    by_selector
+}
+
+/// Pair each declared input with its value; a missing one renders empty so
+/// the call's shape stays visible.
+fn decoded_params(inputs: &[(&str, &str)], values: &[String]) -> Vec<DecodedParam> {
+    inputs
+        .iter()
+        .enumerate()
+        .map(|(i, (ty, name))| DecodedParam {
+            ty: ty.to_string(),
+            name: if name.is_empty() {
+                format!("arg{i}")
+            } else {
+                name.to_string()
+            },
+            value: values.get(i).cloned().unwrap_or_default(),
+            indexed: false,
         })
-        .filter(|s| !s.is_empty())
         .collect()
 }
 
@@ -621,63 +472,28 @@ pub fn decode_function_call(data: &str) -> Option<DecodedCall> {
     if raw.len() < 4 {
         return None;
     }
-    let selector = &raw[..4];
+    let (selector, args) = raw.split_at(4);
     let sel_hex = format!("0x{}", hex::encode(selector));
-    let args = &raw[4..];
 
-    for def in tip20_fns() {
-        if selector_hex(def.canonical) == sel_hex {
-            let types: Vec<&str> = def.inputs.iter().map(|(t, _)| *t).collect();
+    // Both tables report the canonical signature; the names are on `params`.
+    let (name, signature, params) = match BY_SELECTOR.get(&sel_hex) {
+        Some(known) => {
+            let (name, canonical, inputs) = known.parts();
+            let types: Vec<&str> = inputs.iter().map(|&(t, _)| t).collect();
             let values = decode_abi_args(&types, args);
-            let params: Vec<DecodedParam> = def
-                .inputs
-                .iter()
-                .enumerate()
-                .map(|(i, (t, n))| DecodedParam {
-                    ty: t.to_string(),
-                    name: n.to_string(),
-                    value: values.get(i).cloned().unwrap_or_default(),
-                    indexed: false,
-                })
-                .collect();
-            return Some(DecodedCall {
-                name: Some(def.name.to_string()),
-                signature: Some(def.canonical.to_string()),
-                params,
-                selector: sel_hex,
-                raw_args: format!("0x{}", hex::encode(args)),
-            });
+            (
+                Some(name.to_string()),
+                Some(canonical.to_string()),
+                decoded_params(&inputs, &values),
+            )
         }
-    }
-
-    if let Some((_, sig)) = additional_sigs().iter().find(|(s, _)| s == &sel_hex) {
-        let types = types_from_sig(sig);
-        let type_refs: Vec<&str> = types.iter().map(|s| s.as_str()).collect();
-        let values = decode_abi_args(&type_refs, args);
-        let names = param_names_from_sig(sig);
-        let params: Vec<DecodedParam> = types
-            .iter()
-            .enumerate()
-            .map(|(i, t)| DecodedParam {
-                ty: t.clone(),
-                name: names.get(i).cloned().unwrap_or_else(|| format!("arg{i}")),
-                value: values.get(i).cloned().unwrap_or_default(),
-                indexed: false,
-            })
-            .collect();
-        return Some(DecodedCall {
-            name: Some(sig.split('(').next().unwrap_or("").to_string()),
-            signature: Some(sig.to_string()),
-            params,
-            selector: sel_hex,
-            raw_args: format!("0x{}", hex::encode(args)),
-        });
-    }
+        None => (None, None, Vec::new()),
+    };
 
     Some(DecodedCall {
-        name: None,
-        signature: None,
-        params: Vec::new(),
+        name,
+        signature,
+        params,
         selector: sel_hex,
         raw_args: format!("0x{}", hex::encode(args)),
     })
@@ -1088,5 +904,116 @@ pub fn parse_decimal_or_hex(s: &str) -> i128 {
         i128::from_str_radix(h, 16).unwrap_or(0)
     } else {
         s.parse().unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ethers_core::abi::encode as abi_encode;
+
+    #[test]
+    fn decode_abi_args_dynamic_string() {
+        let data = abi_encode(&[Token::String("hello world".into())]);
+        assert_eq!(decode_abi_args(&["string"], &data), vec!["hello world"]);
+        // A string spanning multiple words.
+        let long = "pathUSD-pathUSD-pathUSD-pathUSD-pathUSD-pathUSD";
+        let data = abi_encode(&[Token::String(long.into())]);
+        assert_eq!(decode_abi_args(&["string"], &data), vec![long]);
+    }
+
+    #[test]
+    fn decode_abi_args_bytes() {
+        let data = abi_encode(&[Token::Bytes(vec![0xde, 0xad, 0xbe, 0xef])]);
+        assert_eq!(decode_abi_args(&["bytes"], &data), vec!["0xdeadbeef"]);
+        let data = abi_encode(&[Token::FixedBytes(vec![0xaa; 8])]);
+        assert_eq!(
+            decode_abi_args(&["bytes8"], &data),
+            vec!["0xaaaaaaaaaaaaaaaa"]
+        );
+    }
+
+    #[test]
+    fn decode_abi_args_arrays() {
+        let data = abi_encode(&[Token::Array(vec![
+            Token::Uint(1u64.into()),
+            Token::Uint(2u64.into()),
+            Token::Uint(3u64.into()),
+        ])]);
+        assert_eq!(decode_abi_args(&["uint256[]"], &data), vec!["[1, 2, 3]"]);
+
+        let data = abi_encode(&[Token::FixedArray(vec![
+            Token::Bool(true),
+            Token::Bool(false),
+        ])]);
+        assert_eq!(decode_abi_args(&["bool[2]"], &data), vec!["[true, false]"]);
+    }
+
+    #[test]
+    fn decode_abi_args_tuple_and_address() {
+        let addr = "0x20c0000000000000000000000000000000000000";
+        let data = abi_encode(&[Token::Tuple(vec![
+            Token::Uint(7u64.into()),
+            Token::Address(addr.parse().unwrap()),
+        ])]);
+        let values = decode_abi_args(&["(uint256,address)"], &data);
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0], format!("(7, {})", checksum_address(addr)));
+    }
+
+    #[test]
+    fn decode_abi_args_signed_int() {
+        // An int8 -1 arrives sign-extended as 32 bytes of 0xff; the formatter
+        // masks to the declared width first.
+        let data = abi_encode(&[Token::Int(EthersUint::MAX)]);
+        assert_eq!(decode_abi_args(&["int256"], &data), vec!["-1"]);
+        assert_eq!(decode_abi_args(&["int8"], &data), vec!["-1"]);
+        // The most negative int8, sign-extended: 0xff…80.
+        let data = abi_encode(&[Token::Int(EthersUint::MAX - EthersUint::from(0x7fu64))]);
+        assert_eq!(decode_abi_args(&["int8"], &data), vec!["-128"]);
+        let data = abi_encode(&[Token::Int(42u64.into())]);
+        assert_eq!(decode_abi_args(&["int256"], &data), vec!["42"]);
+        assert_eq!(decode_abi_args(&["int8"], &data), vec!["42"]);
+    }
+
+    #[test]
+    fn decode_abi_args_rejects_unparsable_types() {
+        // Any unparsable type makes the whole decode degrade to no values,
+        // matching the pre-ethers behavior.
+        assert!(decode_abi_args(&["not-a-type"], &[0u8; 32]).is_empty());
+    }
+
+    /// A signature-list entry must not shadow a TIP-20 entry; the live tables
+    /// share no selector, so build one that collides.
+    #[test]
+    fn tip20_wins_when_both_tables_claim_a_selector() {
+        static TIP20: [FnDef; 1] = [FnDef {
+            name: "burn",
+            canonical: "burn(uint256)",
+            inputs: &[("uint256", "amount")],
+        }];
+        let table = build_table(&TIP20, &["burn(uint256 value)"]);
+        match table.get(&selector_hex("burn(uint256)")) {
+            Some(Known::Tip20(def)) => assert_eq!(def.inputs[0].1, "amount"),
+            Some(Known::Sig(entry)) => {
+                panic!(
+                    "signature list shadowed the TIP-20 entry: {}",
+                    entry.canonical
+                )
+            }
+            None => panic!("burn(uint256) missing from the table"),
+        }
+    }
+
+    /// The table build skips an unparsable signature, which would silently
+    /// stop it from matching; catch that here.
+    #[test]
+    fn every_signature_parses() {
+        for &sig in additional_sigs() {
+            assert!(
+                HumanReadableParser::parse_function(sig).is_ok(),
+                "`{sig}` does not parse as a human-readable signature"
+            );
+        }
     }
 }

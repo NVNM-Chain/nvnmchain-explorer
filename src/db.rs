@@ -217,7 +217,12 @@ pub fn init_db(path: &str) -> Result<Connection> {
         );
         CREATE INDEX IF NOT EXISTS idx_transfer_tx_hash ON transfer_events(tx_hash);
         CREATE INDEX IF NOT EXISTS idx_transfer_block ON transfer_events(block_number);
-        CREATE INDEX IF NOT EXISTS idx_transfer_token ON transfer_events(token_addr);
+        -- (token_addr) alone made the token transfers page sort the token's
+        -- whole history to serve 25 rows; this index hands them back already
+        -- in page order. The DROP migrates databases that predate it.
+        DROP INDEX IF EXISTS idx_transfer_token;
+        CREATE INDEX IF NOT EXISTS idx_transfer_token_block
+            ON transfer_events(token_addr, block_number, log_index);
         CREATE INDEX IF NOT EXISTS idx_transfer_from ON transfer_events(from_addr);
         CREATE INDEX IF NOT EXISTS idx_transfer_to ON transfer_events(to_addr);
 
@@ -463,7 +468,6 @@ pub fn get_min_block_number(db: &Db) -> Option<i64> {
         |r| r.get::<_, Option<i64>>(0),
     )
     .flatten()
-    .filter(|n| *n != 0)
 }
 
 pub fn get_recent_blocks(db: &Db, limit: usize) -> Vec<Block> {
@@ -912,25 +916,23 @@ fn row_to_transfer(row: &rusqlite::Row) -> rusqlite::Result<TransferEvent> {
 }
 
 /// A transfer row plus the four fields of its transaction the listings show.
-/// Columns 10..14 come from the `LEFT JOIN`, so they are all null together when
-/// the transaction has not been indexed; the transfer's own values stand in.
+/// Columns 10..13 come from the `LEFT JOIN`; `from_addr` is NOT NULL, so a null
+/// there means no transaction row and the transfer's own values stand in.
 fn row_to_transfer_json(row: &rusqlite::Row) -> rusqlite::Result<Value> {
     let transfer = row_to_transfer(row)?;
-    let joined = row.get::<_, Option<Vec<u8>>>(10)?.is_some();
-    let (tx_from, tx_to, tx_timestamp, tx_status) = if joined {
-        (
-            blob_addr(&row.get::<_, Vec<u8>>(11)?),
-            row.get::<_, Option<Vec<u8>>>(12)?.map(|b| blob_addr(&b)),
+    let (tx_from, tx_to, tx_timestamp, tx_status) = match row.get::<_, Option<Vec<u8>>>(10)? {
+        Some(from) => (
+            blob_addr(&from),
+            row.get::<_, Option<Vec<u8>>>(11)?.map(|b| blob_addr(&b)),
+            row.get(12)?,
             row.get(13)?,
-            row.get(14)?,
-        )
-    } else {
-        (
+        ),
+        None => (
             transfer.from_addr.clone(),
             Some(transfer.to_addr.clone()),
             transfer.timestamp,
             1,
-        )
+        ),
     };
     Ok(json!({
         "id": transfer.id,
@@ -952,9 +954,9 @@ fn row_to_transfer_json(row: &rusqlite::Row) -> rusqlite::Result<Value> {
 
 /// One page of transfers matching `filter`, joined to their transactions.
 ///
-/// Joined rather than fetched per row: the listing wants four fields of the
-/// transaction, and reading each one back whole would re-materialize the raw
-/// RLP and the stored trace once per line of the page.
+/// Joined rather than read per row: the listing wants four fields, and fetching
+/// each transaction whole would re-materialize its raw RLP and stored trace
+/// once per line of the page.
 fn transfer_page(
     db: &Db,
     what: &str,
@@ -964,7 +966,7 @@ fn transfer_page(
     per_page: u32,
 ) -> Vec<Value> {
     let sql = format!(
-        "SELECT {TRANSFER_COLS}, t.hash, t.from_addr, t.to_addr, t.timestamp, t.status
+        "SELECT {TRANSFER_COLS}, t.from_addr, t.to_addr, t.timestamp, t.status
          FROM transfer_events e LEFT JOIN transactions t ON t.hash = e.tx_hash
          WHERE {filter}
          ORDER BY e.block_number DESC, e.log_index DESC LIMIT ?2 OFFSET ?3"
