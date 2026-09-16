@@ -1,6 +1,7 @@
 //! TIP-20 / ERC-20 token metadata fetching and amount formatting,
 //! mirroring `app/tokens.py`.
 
+use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -49,12 +50,13 @@ pub fn decode_string_result(raw: &str) -> String {
     let offset = u64::from_be_bytes(bytes[24..32].try_into().unwrap_or([0; 8])) as usize;
     // Standard dynamic-string encoding: the first word is an offset into the
     // buffer pointing at the length word, followed by the payload.
-    if offset >= 32 && offset + 32 <= bytes.len() {
+    if offset >= 32 && offset.checked_add(32).is_some_and(|end| end <= bytes.len()) {
         let len = u64::from_be_bytes(bytes[offset + 24..offset + 32].try_into().unwrap_or([0; 8]))
             as usize;
-        let start = offset + 32;
-        let end = (start + len).min(bytes.len());
-        return String::from_utf8_lossy(&bytes[start..end]).into_owned();
+        // The length word is the contract's to fill, so a length past the end of
+        // the payload reads what there is rather than panicking.
+        let payload = &bytes[offset + 32..];
+        return String::from_utf8_lossy(&payload[..len.min(payload.len())]).into_owned();
     }
     // Fallback: short string encoded in place (length in word 0).
     let len = offset.min(bytes.len().saturating_sub(32));
@@ -109,16 +111,14 @@ pub fn has_control_chars(s: &str) -> bool {
     s.chars().any(|c| c.is_control())
 }
 
-/// Read several of a token's views at the chain head in one HTTP request.
-///
-/// Anything unanswered — a view the token lacks, a request that never arrives —
-/// comes back as `"0x"`, which the decoders read as "no answer", so a token
-/// still gets a row.
+/// Read several of a token's views at the chain head in one HTTP request. A view
+/// the token lacks comes back as `"0x"`, which the decoders read as "no answer";
+/// a request that never arrives is an error.
 async fn view_calls<const N: usize>(
     rpc: &ChainRpc,
     address: &str,
     selectors: &[&str; N],
-) -> [String; N] {
+) -> Result<[String; N]> {
     let calls: Vec<(String, Value)> = selectors
         .iter()
         .map(|data| {
@@ -128,15 +128,11 @@ async fn view_calls<const N: usize>(
             )
         })
         .collect();
-    let results = match rpc.batch_call(calls).await {
-        Ok(results) => results,
-        Err(e) => {
-            // Without this an unreachable node reads as a token with no name.
-            tracing::warn!("reading token views for {address} failed: {e:#}");
-            Vec::new()
-        }
-    };
-    std::array::from_fn(|i| {
+    let results = rpc
+        .batch_call(calls)
+        .await
+        .with_context(|| format!("reading token views for {address}"))?;
+    Ok(std::array::from_fn(|i| {
         results
             .get(i)
             .and_then(|result| result.as_ref().ok())
@@ -144,11 +140,13 @@ async fn view_calls<const N: usize>(
             .filter(|hex| !hex.is_empty())
             .unwrap_or("0x")
             .to_string()
-    })
+    }))
 }
 
-/// Fetch TIP-20 token metadata from the chain, tolerating missing views.
-pub async fn fetch_token_metadata(rpc: &ChainRpc, address: &str) -> TokenMeta {
+/// Fetch TIP-20 token metadata from the chain. An address answering to no view
+/// has an empty name and symbol; an unreachable node is an error, so a token is
+/// never stored from an answer the node never gave.
+pub async fn fetch_token_metadata(rpc: &ChainRpc, address: &str) -> Result<TokenMeta> {
     let checksummed = checksum_address(address);
 
     // One request per token, reserved addresses included: a chain is free to
@@ -158,21 +156,21 @@ pub async fn fetch_token_metadata(rpc: &ChainRpc, address: &str) -> TokenMeta {
         &checksummed,
         &[NAME_CALL, SYMBOL_CALL, DECIMALS_CALL, TOTAL_SUPPLY_CALL],
     )
-    .await;
+    .await?;
 
     // Guard against stale/bad decodes: a mis-decoded ABI word must not be
     // stored or rendered as a name/symbol.
     let name = sanitize_metadata_text(&decode_string_result(&name));
     let symbol = sanitize_metadata_text(&decode_string_result(&symbol));
 
-    TokenMeta {
+    Ok(TokenMeta {
         address: checksummed,
         name,
         currency: infer_currency(&symbol),
         symbol,
         decimals: decode_uint_result(&decimals_raw, 18),
         total_supply: decode_uint256_result(&supply_raw),
-    }
+    })
 }
 
 fn infer_currency(symbol: &str) -> String {
@@ -193,21 +191,16 @@ pub fn format_token_amount(amount: &str, decimals: i64) -> String {
     if amount.sign() == num_bigint::Sign::NoSign {
         return "0".into();
     }
+    // The sign comes off before dividing: a quotient carries it only from a whole
+    // token up, so -0.01 would divide to a zero that is not negative.
+    let (sign, amount) = match amount.sign() {
+        num_bigint::Sign::Minus => ("-", -amount),
+        _ => ("", amount),
+    };
     let decimals = decimals.clamp(0, 30) as u32;
     let divisor = num_bigint::BigInt::from(10u8).pow(decimals);
-    if divisor.sign() == num_bigint::Sign::NoSign {
-        return amount.to_string();
-    }
     let integer_part = &amount / &divisor;
-    let fractional_part = &amount % &divisor;
-    if fractional_part.sign() == num_bigint::Sign::NoSign {
-        return integer_part.to_string();
-    }
-    let mut frac = if fractional_part.sign() == num_bigint::Sign::Minus {
-        (-&fractional_part).to_string()
-    } else {
-        fractional_part.to_string()
-    };
+    let mut frac = (&amount % &divisor).to_string();
     if (frac.len() as u32) < decimals {
         frac = format!("{}{}", "0".repeat(decimals as usize - frac.len()), frac);
     }
@@ -215,12 +208,12 @@ pub fn format_token_amount(amount: &str, decimals: i64) -> String {
         frac.pop();
     }
     if frac.is_empty() {
-        return integer_part.to_string();
+        return format!("{sign}{integer_part}");
     }
     if frac.len() > 6 {
         frac.truncate(6);
     }
-    format!("{integer_part}.{frac}")
+    format!("{sign}{integer_part}.{frac}")
 }
 
 pub fn format_token_amount_with_symbol(amount: &str, decimals: i64, symbol: &str) -> String {
@@ -342,7 +335,7 @@ mod tests {
         let rpc = ChainRpc::new(&node.url).expect("rpc");
         let token = "0x3333333333333333333333333333333333333333";
 
-        let meta = fetch_token_metadata(&rpc, token).await;
+        let meta = fetch_token_metadata(&rpc, token).await.expect("fetched");
         assert_eq!(meta.address, checksum_address(token));
         assert_eq!(meta.name, "Test USD");
         assert_eq!(meta.symbol, "TUSD");
@@ -366,7 +359,9 @@ mod tests {
         .await;
         let rpc = ChainRpc::new(&node.url).expect("rpc");
 
-        let meta = fetch_token_metadata(&rpc, RESERVED_TOKENS[0]).await;
+        let meta = fetch_token_metadata(&rpc, RESERVED_TOKENS[0])
+            .await
+            .expect("fetched");
         assert_eq!(meta.symbol, "nvmnUSD");
         assert_eq!(meta.decimals, 6);
         assert_eq!(meta.total_supply, "42");
@@ -380,26 +375,43 @@ mod tests {
         let node = stub_node(vec![(SYMBOL_CALL, abi_string("ODD"))]).await;
         let rpc = ChainRpc::new(&node.url).expect("rpc");
 
-        let meta = fetch_token_metadata(&rpc, "0x5555555555555555555555555555555555555555").await;
+        let meta = fetch_token_metadata(&rpc, "0x5555555555555555555555555555555555555555")
+            .await
+            .expect("fetched");
         assert_eq!(meta.symbol, "ODD");
         assert_eq!(meta.name, "");
         assert_eq!(meta.decimals, 18, "the ERC-20 default");
         assert_eq!(meta.total_supply, "0");
     }
 
-    /// A node that will not answer still yields a row; the token is retried the
-    /// next time it is seen.
-    #[tokio::test]
-    async fn an_unreachable_node_still_yields_a_row() {
-        let rpc = ChainRpc::new("http://127.0.0.1:1").expect("rpc");
-        let token = "0x4444444444444444444444444444444444444444";
+    /// Under one whole token the quotient is zero, which carries no sign, so an
+    /// amount owed would otherwise format as one held.
+    #[test]
+    fn an_amount_under_one_token_keeps_its_sign() {
+        for (amount, decimals, want) in [
+            ("-10000", 6, "-0.01"),
+            ("-4000", 6, "-0.004"),
+            ("-1003000", 6, "-1.003"),
+            ("-5", 1, "-0.5"),
+            ("-1000000", 6, "-1"),
+            ("10000", 6, "0.01"),
+        ] {
+            assert_eq!(
+                format_token_amount(amount, decimals),
+                want,
+                "{amount} at {decimals}"
+            );
+        }
+    }
 
-        let meta = fetch_token_metadata(&rpc, token).await;
-        assert_eq!(meta.address, checksum_address(token));
-        assert_eq!(meta.name, "");
-        assert_eq!(meta.symbol, "");
-        assert_eq!(meta.currency, "", "nothing to infer one from");
-        assert_eq!(meta.decimals, 18);
-        assert_eq!(meta.total_supply, "0");
+    /// A node that will not answer is an error, not a token with no name.
+    #[tokio::test]
+    async fn an_unreachable_node_is_an_error_not_a_nameless_token() {
+        let rpc = ChainRpc::new("http://127.0.0.1:1").expect("rpc");
+        let err = fetch_token_metadata(&rpc, "0x4444444444444444444444444444444444444444")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("reading token views for 0x4444"), "{err}");
     }
 }

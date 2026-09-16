@@ -289,14 +289,20 @@ async fn attach_token_metadata(
     let mut set = tokio::task::JoinSet::new();
     for addr in unseen {
         let rpc = rpc.clone();
-        set.spawn(async move { fetch_token_metadata(&rpc, &addr).await });
+        set.spawn(async move {
+            let meta = fetch_token_metadata(&rpc, &addr).await;
+            (addr, meta)
+        });
     }
     let mut metas = HashMap::new();
     while let Some(res) = set.join_next().await {
         match res {
-            Ok(meta) => {
+            Ok((_, Ok(meta))) => {
                 metas.insert(meta.address.clone(), meta);
             }
+            // Nothing stored and nothing remembered, so the next block that
+            // mentions the token asks again.
+            Ok((addr, Err(e))) => warn!("token metadata for {addr} unavailable: {e:#}"),
             Err(e) => warn!("token metadata task failed: {e:#}"),
         }
     }
@@ -486,13 +492,13 @@ async fn repair_token_metadata(rpc: &ChainRpc, db: &Db) -> Result<()> {
     }
     while let Some(res) = set.join_next().await {
         match res {
-            // A node that answers nothing looks like a nameless token, so leave
-            // the row for the next start rather than blanking it.
-            Ok(meta) if meta.name.is_empty() && meta.symbol.is_empty() => {
+            // A token that answers to neither view has nothing to repair the
+            // row with; leave it for the next start rather than blanking it.
+            Ok(Ok(meta)) if meta.name.is_empty() && meta.symbol.is_empty() => {
                 warn!("nothing to repair {} with; leaving the row", meta.address)
             }
             // Written as they arrive: the writes take the lock, so they queue anyway.
-            Ok(meta) => {
+            Ok(Ok(meta)) => {
                 if let Err(e) = db::save_token_metadata(db, &meta) {
                     warn!(
                         "failed to repair token metadata for {}: {e:#}",
@@ -500,6 +506,7 @@ async fn repair_token_metadata(rpc: &ChainRpc, db: &Db) -> Result<()> {
                     );
                 }
             }
+            Ok(Err(e)) => warn!("token metadata repair skipped: {e:#}"),
             Err(e) => warn!("token metadata repair task failed: {e:#}"),
         }
     }

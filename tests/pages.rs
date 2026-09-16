@@ -381,6 +381,33 @@ async fn the_transactions_listing_holds_every_indexed_transaction() {
     assert_eq!(page["total_txns"], json!(7), "the stats count is trusted");
 }
 
+/// A token page for an unknown address asks the node, and writes nothing when the
+/// node cannot be reached — the fixture's is a closed port, so the page is a 502
+/// and the address stays an account.
+#[tokio::test]
+async fn a_token_page_for_an_unknown_address_stores_nothing() {
+    let (_dir, base) = serve(Value::Null).await;
+    let before = get_json(&base, "/tokens?").await["total"].clone();
+    let junk = "0x1111111111111111111111111111111111111111";
+
+    let page = reqwest::get(format!("{base}/token/{junk}?format=json"))
+        .await
+        .expect("GET /token");
+    assert_eq!(page.status().as_u16(), 502, "the node could not be asked");
+
+    let after = get_json(&base, "/tokens?").await;
+    assert_eq!(after["total"], before, "no token row was written");
+    let listed = after["tokens"]
+        .as_array()
+        .expect("tokens")
+        .iter()
+        .any(|t| t["address"] == json!(junk));
+    assert!(!listed);
+    let address = get_json(&base, &format!("/address/{junk}?")).await;
+    assert_eq!(address["type"], json!("eoa"));
+    assert!(address["token_meta"].is_null());
+}
+
 /// Pressing Enter in the search box resolves to one destination, and the
 /// candidates are tried in the order a reader means them. A block hash and a
 /// transaction hash are the same shape, so only asking the index tells them

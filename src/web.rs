@@ -1550,10 +1550,20 @@ pub async fn token_page(
 
     // A corrupt row (NUL/control chars from the pre-fix decoder) is treated
     // as missing so the page re-fetches clean metadata on the spot.
-    let meta = match db::get_token_metadata(&state.db, &checksummed) {
-        Some(m) if !has_control_chars(&m.name) && !has_control_chars(&m.symbol) => m,
-        _ => {
-            let fetched = fetch_token_metadata(&state.rpc, &checksummed).await;
+    let stored = db::get_token_metadata(&state.db, &checksummed)
+        .filter(|m| !has_control_chars(&m.name) && !has_control_chars(&m.symbol));
+    let meta = match stored {
+        Some(m) => m,
+        None => {
+            let fetched = match fetch_token_metadata(&state.rpc, &checksummed).await {
+                Ok(fetched) => fetched,
+                Err(e) => return node_failed(&state, &headers, &query, e),
+            };
+            // An address that answers to neither name() nor symbol() is not a
+            // token; stored, it would be listed as one.
+            if fetched.name.is_empty() && fetched.symbol.is_empty() {
+                return not_found(&state, &headers, &query, "Token", &address);
+            }
             let _ = db::save_token_metadata(&state.db, &fetched);
             db::get_token_metadata(&state.db, &checksummed).unwrap_or_else(|| {
                 // Fall back to a minimal descriptor if the save failed.
@@ -1587,7 +1597,8 @@ pub async fn token_page(
         Vec::new()
     };
 
-    let holders = db::get_token_holder_count(&state.db, &checksummed);
+    // Kept with the balances by the writer, so the page does not recount them.
+    let holders = meta.holder_count;
     let transfer_count = db::get_token_transfer_count(&state.db, &checksummed);
     // The balances are already indexed — the page just never showed them.
     let holder_rows = if tab == "holders" {
@@ -1762,7 +1773,7 @@ fn node_failed(
     query: &HashMap<String, String>,
     err: anyhow::Error,
 ) -> Response {
-    tracing::warn!("anchoring read failed: {err:#}");
+    tracing::warn!("node read failed: {err:#}");
     let page = if wants_json(headers, query) {
         Json(json!({"error": format!("{err:#}")})).into_response()
     } else {

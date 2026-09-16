@@ -6,7 +6,7 @@ use nvnmchain_explorer::decoder::{
 use nvnmchain_explorer::models::{BlockBundle, Transaction, TransferEvent};
 use nvnmchain_explorer::parse::{parse_block, parse_transaction};
 use nvnmchain_explorer::tokens::{
-    decode_string_result, format_token_amount, has_control_chars, sanitize_metadata_text,
+    decode_string_result, format_token_amount, has_control_chars, sanitize_metadata_text, TokenMeta,
 };
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
@@ -276,6 +276,16 @@ fn decode_string_result_dynamic_encoding() {
     assert_eq!(decode_string_result(""), "");
     assert_eq!(decode_string_result("0x"), "");
     assert_eq!(decode_string_result("0x12"), "");
+
+    // A length word of all ones reads to the end of the buffer, not past it.
+    let mut hostile = hex::decode(abi_string("TestUSD").trim_start_matches("0x")).unwrap();
+    hostile[32..64].fill(0xff);
+    let decoded = decode_string_result(&format!("0x{}", hex::encode(&hostile)));
+    assert!(decoded.starts_with("TestUSD"), "{decoded:?}");
+    // An offset word past the buffer falls back to the in-place shape.
+    let mut wild = hostile.clone();
+    wild[24..32].fill(0xff);
+    let _ = decode_string_result(&format!("0x{}", hex::encode(&wild)));
 }
 
 #[test]
@@ -681,6 +691,61 @@ fn counters_are_seeded_from_the_tables_of_an_older_database() {
     let conn = db::init_db(path.to_str().unwrap()).expect("reopen");
     assert_eq!(db::counter(&conn, "blocks"), 1);
     assert_eq!(db::counter(&conn, "transactions"), 1);
+}
+
+/// The count the writer keeps is what a recount finds, at every step.
+#[test]
+fn holder_count_follows_the_balances() {
+    let (_dir, db) = temp_db("holders.db");
+    let raw_block = sample_raw_block();
+    let block = parse_block(&raw_block);
+    let tx = parse_transaction(&raw_block["transactions"][0], &block);
+    let (token, a, b) = sample_parties();
+    let meta = TokenMeta {
+        address: token.clone(),
+        name: "T".into(),
+        symbol: "T".into(),
+        decimals: 0,
+        currency: "T".into(),
+        total_supply: "0".into(),
+    };
+    let save = |log_index: i64, from: &str, to: &str, amount: &str| {
+        let transfer = TransferEvent {
+            id: 0,
+            tx_hash: tx.hash.clone(),
+            block_number: block.number,
+            log_index,
+            token_addr: token.clone(),
+            from_addr: from.into(),
+            to_addr: to.into(),
+            amount: amount.into(),
+            timestamp: block.timestamp,
+            created_at: 0,
+        };
+        let bundle = BlockBundle {
+            block: block.clone(),
+            txs: vec![tx.clone()],
+            transfers: vec![transfer],
+            tokens: vec![meta.clone()],
+        };
+        db::save_block_bundle(&db, &bundle).expect("save");
+        let kept = db::get_token_metadata(&db, &token)
+            .expect("token")
+            .holder_count;
+        assert_eq!(
+            kept,
+            db::get_token_holder_count(&db, &token),
+            "the kept count is what a recount finds"
+        );
+        kept
+    };
+    // a pays b out of nothing: b holds, a is owed.
+    assert_eq!(save(0, &a, &b, "100"), 1);
+    // b pays it back: both at zero, nobody holds.
+    assert_eq!(save(1, &b, &a, "100"), 0);
+    // b holds again, and a second payment adds no holder.
+    assert_eq!(save(2, &a, &b, "50"), 1);
+    assert_eq!(save(3, &a, &b, "50"), 1);
 }
 
 #[test]
