@@ -90,52 +90,14 @@ fn deployed_contracts() -> &'static HashMap<String, String> {
     })
 }
 
-fn known_tokens() -> &'static HashMap<String, TokenInfo> {
-    static MAP: OnceLock<HashMap<String, TokenInfo>> = OnceLock::new();
-    MAP.get_or_init(|| {
-        let mut map = HashMap::new();
-        map.insert(
-            checksum_address("0x20C0000000000000000000000000000000000000"),
-            TokenInfo {
-                name: "pathUSD".into(),
-                symbol: "pathUSD".into(),
-                currency: "USD".into(),
-            },
-        );
-        map.insert(
-            checksum_address("0x20C0000000000000000000000000000000000001"),
-            TokenInfo {
-                name: "Alpha USD".into(),
-                symbol: "ALPHA".into(),
-                currency: "USD".into(),
-            },
-        );
-        map.insert(
-            checksum_address("0x20C0000000000000000000000000000000000002"),
-            TokenInfo {
-                name: "Beta USD".into(),
-                symbol: "BETA".into(),
-                currency: "USD".into(),
-            },
-        );
-        map.insert(
-            checksum_address("0x20C0000000000000000000000000000000000003"),
-            TokenInfo {
-                name: "Theta USD".into(),
-                symbol: "THETA".into(),
-                currency: "USD".into(),
-            },
-        );
-        map
-    })
-}
-
-#[derive(Debug, Clone)]
-pub struct TokenInfo {
-    pub name: String,
-    pub symbol: String,
-    pub currency: String,
-}
+/// Tokens genesis puts at reserved addresses, spelled as metadata rows store
+/// them. Listed only so rows an older build named from a table can be refreshed.
+pub const RESERVED_TOKENS: [&str; 4] = [
+    "0x20C0000000000000000000000000000000000000",
+    "0x20C0000000000000000000000000000000000001",
+    "0x20C0000000000000000000000000000000000002",
+    "0x20C0000000000000000000000000000000000003",
+];
 
 /// TIP-20 native token prefix: all StdTokens start with 0x20C000...
 pub const TIP20_TOKEN_PREFIX: &str = "0x20c0000000000000000";
@@ -165,7 +127,6 @@ pub fn get_contract_name(addr: &str) -> Option<String> {
         .get(&checksummed)
         .or_else(|| deployed_contracts().get(&checksummed))
         .cloned()
-        .or_else(|| known_tokens().get(&checksummed).map(|i| i.name.clone()))
 }
 
 pub fn is_eoa(addr: &str) -> bool {
@@ -188,13 +149,6 @@ pub fn identify_address(addr: &str) -> AddressInfo {
             kind: "precompile".into(),
             label: Some(label.clone()),
             symbol: None,
-        };
-    }
-    if let Some(info) = known_tokens().get(&checksummed) {
-        return AddressInfo {
-            kind: "token".into(),
-            label: Some(info.name.clone()),
-            symbol: Some(info.symbol.clone()),
         };
     }
     if let Some(label) = deployed_contracts().get(&checksummed) {
@@ -221,10 +175,6 @@ pub fn identify_address(addr: &str) -> AddressInfo {
 /// The name of a canonical deployed contract (Multicall3, Permit2, CreateX).
 pub fn deployed_contract_name(addr: &str) -> Option<String> {
     deployed_contracts().get(&checksum_address(addr)).cloned()
-}
-
-pub fn get_known_token(address: &str) -> Option<TokenInfo> {
-    known_tokens().get(&checksum_address(address)).cloned()
 }
 
 /// Which built-in ABIs describe the contract at `addr`, by the names the
@@ -406,5 +356,13 @@ mod tests {
             ["tip20", "tip20_roles_auth"]
         );
         assert!(abis_for_address("0x1111111111111111111111111111111111111111").is_empty());
+    }
+
+    /// The repair matches these against stored addresses without normalizing.
+    #[test]
+    fn reserved_tokens_are_spelled_as_they_are_stored() {
+        for address in RESERVED_TOKENS {
+            assert_eq!(checksum_address(address), address);
+        }
     }
 }

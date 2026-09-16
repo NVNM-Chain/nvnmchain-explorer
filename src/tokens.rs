@@ -4,7 +4,6 @@
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::contracts::get_known_token;
 use crate::decoder::checksum_address;
 use crate::rpc::ChainRpc;
 
@@ -151,57 +150,28 @@ async fn view_calls<const N: usize>(
 /// Fetch TIP-20 token metadata from the chain, tolerating missing views.
 pub async fn fetch_token_metadata(rpc: &ChainRpc, address: &str) -> TokenMeta {
     let checksummed = checksum_address(address);
-    let known = get_known_token(&checksummed);
 
-    // One request per token, and a built-in one asks only for what the label
-    // table cannot answer.
-    let (name, symbol, decimals_raw, supply_raw) = match &known {
-        Some(k) => {
-            let [decimals, supply] =
-                view_calls(rpc, &checksummed, &[DECIMALS_CALL, TOTAL_SUPPLY_CALL]).await;
-            (k.name.clone(), k.symbol.clone(), decimals, supply)
-        }
-        None => {
-            let [name, symbol, decimals, supply] = view_calls(
-                rpc,
-                &checksummed,
-                &[NAME_CALL, SYMBOL_CALL, DECIMALS_CALL, TOTAL_SUPPLY_CALL],
-            )
-            .await;
-            (
-                decode_string_result(&name),
-                decode_string_result(&symbol),
-                decimals,
-                supply,
-            )
-        }
-    };
+    // One request per token, reserved addresses included: a chain is free to
+    // name the tokens genesis puts there whatever it likes.
+    let [name, symbol, decimals_raw, supply_raw] = view_calls(
+        rpc,
+        &checksummed,
+        &[NAME_CALL, SYMBOL_CALL, DECIMALS_CALL, TOTAL_SUPPLY_CALL],
+    )
+    .await;
+
     // Guard against stale/bad decodes: a mis-decoded ABI word must not be
     // stored or rendered as a name/symbol.
-    let name = sanitize_metadata_text(&name);
-    let symbol = sanitize_metadata_text(&symbol);
-    let decimals = decode_uint_result(&decimals_raw, 18);
-    let total_supply = decode_uint256_result(&supply_raw);
-
-    let currency = if let Some(k) = known {
-        if k.currency.is_empty() {
-            infer_currency(&symbol)
-        } else {
-            k.currency.clone()
-        }
-    } else if symbol.is_empty() {
-        String::new()
-    } else {
-        infer_currency(&symbol)
-    };
+    let name = sanitize_metadata_text(&decode_string_result(&name));
+    let symbol = sanitize_metadata_text(&decode_string_result(&symbol));
 
     TokenMeta {
         address: checksummed,
         name,
+        currency: infer_currency(&symbol),
         symbol,
-        decimals,
-        currency,
-        total_supply,
+        decimals: decode_uint_result(&decimals_raw, 18),
+        total_supply: decode_uint256_result(&supply_raw),
     }
 }
 
@@ -270,6 +240,7 @@ pub fn token_to_json(meta: &TokenMeta) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contracts::RESERVED_TOKENS;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -382,27 +353,24 @@ mod tests {
         assert_eq!(node.asked().len(), 4);
     }
 
-    /// A built-in token's name and symbol are in the label table, so the two
-    /// views that would ask the chain for them are never sent.
+    /// A token at a reserved address is named by the chain, not by the
+    /// explorer: a chain that renames it is reported under the new name.
     #[tokio::test]
-    async fn a_known_token_asks_only_what_the_table_cannot_answer() {
+    async fn a_reserved_token_is_named_by_the_chain() {
         let node = stub_node(vec![
+            (NAME_CALL, abi_string("nvmnUSD")),
+            (SYMBOL_CALL, abi_string("nvmnUSD")),
             (DECIMALS_CALL, abi_uint(6)),
             (TOTAL_SUPPLY_CALL, abi_uint(42)),
         ])
         .await;
         let rpc = ChainRpc::new(&node.url).expect("rpc");
 
-        let meta = fetch_token_metadata(&rpc, "0x20C0000000000000000000000000000000000000").await;
-        assert_eq!(meta.symbol, "pathUSD");
+        let meta = fetch_token_metadata(&rpc, RESERVED_TOKENS[0]).await;
+        assert_eq!(meta.symbol, "nvmnUSD");
         assert_eq!(meta.decimals, 6);
         assert_eq!(meta.total_supply, "42");
-        assert_eq!(node.requests(), 1);
-        assert_eq!(
-            node.asked(),
-            [DECIMALS_CALL, TOTAL_SUPPLY_CALL],
-            "name() and symbol() are not worth asking"
-        );
+        assert_eq!(node.requests(), 1, "four views, one round trip");
     }
 
     /// A token missing a view is still a token: whatever it does answer lands,
@@ -430,6 +398,7 @@ mod tests {
         assert_eq!(meta.address, checksum_address(token));
         assert_eq!(meta.name, "");
         assert_eq!(meta.symbol, "");
+        assert_eq!(meta.currency, "", "nothing to infer one from");
         assert_eq!(meta.decimals, 18);
         assert_eq!(meta.total_supply, "0");
     }

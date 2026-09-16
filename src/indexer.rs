@@ -20,12 +20,13 @@ use tracing::{info, warn};
 
 use crate::anchoring::ANCHORING_ADDRESS;
 use crate::config::Settings;
+use crate::contracts::RESERVED_TOKENS;
 use crate::db::{self, Db};
 use crate::decoder::{checksum_address, decode_event};
 use crate::models::{AnchoredEvent, BlockBundle, RegistryDeployed, Transaction, TransferEvent};
 use crate::parse::{parse_block, parse_transaction};
 use crate::rpc::ChainRpc;
-use crate::tokens::fetch_token_metadata;
+use crate::tokens::{fetch_token_metadata, has_control_chars};
 
 /// How many blocks share one JSON-RPC HTTP request. Sixteen empty blocks
 /// (32 methods when receipts are included) measured at ~265ms against the
@@ -583,30 +584,38 @@ pub async fn index_block(rpc: &ChainRpc, db: &Db, block_num: u64) -> Result<()> 
     Ok(())
 }
 
-/// Re-fetch metadata for tokens whose stored name/symbol carry control
-/// characters — the signature of the pre-fix ABI string decoder. Run once at
-/// startup so the deployed database self-heals without manual intervention.
+/// Re-fetch rows the database cannot be trusted for: a name or symbol carrying
+/// control characters, from the pre-fix ABI string decoder, and the reserved
+/// tokens, which an older build named from a table of its own. Run at startup
+/// so a deployed database self-heals without manual intervention.
 async fn repair_token_metadata(rpc: &ChainRpc, db: &Db) -> Result<()> {
-    let corrupt: Vec<String> = db::get_all_token_metas(db)
+    let stale: Vec<String> = db::get_all_token_metas(db)
         .into_iter()
         .filter(|m| {
-            crate::tokens::has_control_chars(&m.name) || crate::tokens::has_control_chars(&m.symbol)
+            RESERVED_TOKENS.contains(&m.address.as_str())
+                || has_control_chars(&m.name)
+                || has_control_chars(&m.symbol)
         })
         .map(|m| m.address)
         .collect();
-    if corrupt.is_empty() {
+    if stale.is_empty() {
         return Ok(());
     }
-    info!("repairing {} token metadata row(s)", corrupt.len());
+    info!("repairing {} token metadata row(s)", stale.len());
     // Fetched together, the way a block's new tokens are: every row here is one
     // round trip, and a database that needs repairing tends to need a lot of it.
     let mut set = tokio::task::JoinSet::new();
-    for addr in corrupt {
+    for addr in stale {
         let rpc = rpc.clone();
         set.spawn(async move { fetch_token_metadata(&rpc, &addr).await });
     }
     while let Some(res) = set.join_next().await {
         match res {
+            // A node that answers nothing looks like a nameless token, so leave
+            // the row for the next start rather than blanking it.
+            Ok(meta) if meta.name.is_empty() && meta.symbol.is_empty() => {
+                warn!("nothing to repair {} with; leaving the row", meta.address)
+            }
             // Written as they arrive: the writes take the lock, so they queue anyway.
             Ok(meta) => {
                 if let Err(e) = db::save_token_metadata(db, &meta) {

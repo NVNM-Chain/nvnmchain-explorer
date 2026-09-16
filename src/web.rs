@@ -25,8 +25,8 @@ use tower_http::cors::CorsLayer;
 use crate::anchoring::{decode_envelope, envelope_kind, is_self_verifying};
 use crate::config::Settings;
 use crate::contracts::{
-    abis_for_address, get_contract_name, get_known_token, get_precompile_name, identify_address,
-    is_contract, is_tip20_token, search_named,
+    abis_for_address, get_contract_name, get_precompile_name, identify_address, is_contract,
+    is_tip20_token, search_named,
 };
 use crate::db::{self, Db};
 use crate::decoder::{
@@ -601,9 +601,6 @@ pub fn address_label(db: &Db, address: &str) -> Option<String> {
         if !meta.name.is_empty() {
             return Some(meta.name);
         }
-    }
-    if let Some(known) = get_known_token(&checksummed) {
-        return Some(known.symbol);
     }
     if let Some(name) = db::get_contract_label(db, &checksummed).filter(|n| !n.is_empty()) {
         return Some(name);
