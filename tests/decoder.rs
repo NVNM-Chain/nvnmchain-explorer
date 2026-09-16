@@ -489,7 +489,8 @@ fn a_database_with_single_column_address_indexes_gets_the_composite_ones() {
     conn.execute_batch(
         "DROP INDEX idx_tx_from_block; DROP INDEX idx_tx_to_block;
          CREATE INDEX idx_tx_from ON transactions(from_addr);
-         CREATE INDEX idx_tx_to ON transactions(to_addr);",
+         CREATE INDEX idx_tx_to ON transactions(to_addr);
+         CREATE INDEX idx_tx_block_number ON transactions(block_number);",
     )
     .expect("the indexes an older explorer built");
     drop(conn);
@@ -509,7 +510,7 @@ fn a_database_with_single_column_address_indexes_gets_the_composite_ones() {
     assert_eq!(
         names,
         [
-            "idx_tx_block_number",
+            "idx_tx_block_position",
             "idx_tx_from_block",
             "idx_tx_timestamp",
             "idx_tx_to_block"

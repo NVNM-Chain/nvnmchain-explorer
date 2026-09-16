@@ -242,7 +242,6 @@ pub fn init_db(path: &str) -> Result<Connection> {
             timestamp INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL DEFAULT 0
         );
-        CREATE INDEX IF NOT EXISTS idx_tx_block_number ON transactions(block_number);
         -- (from_addr) and (to_addr) alone made the address page sort every
         -- transaction the address ever made to serve 25 rows; these hand them
         -- back in page order. The DROPs migrate databases that predate them.
@@ -253,6 +252,12 @@ pub fn init_db(path: &str) -> Result<Connection> {
         CREATE INDEX IF NOT EXISTS idx_tx_to_block
             ON transactions(to_addr, block_number, position);
         CREATE INDEX IF NOT EXISTS idx_tx_timestamp ON transactions(timestamp);
+        -- The chain-wide listing pages in this order, and a block's rows come off
+        -- it in position order. (block_number) alone was its prefix, one more
+        -- b-tree per insert; the DROP migrates databases that carry it.
+        DROP INDEX IF EXISTS idx_tx_block_number;
+        CREATE INDEX IF NOT EXISTS idx_tx_block_position
+            ON transactions(block_number, position);
 
         CREATE TABLE IF NOT EXISTS token_metadata (
             address BLOB PRIMARY KEY,
@@ -715,6 +720,12 @@ pub fn save_transaction(db: &Db, tx: &Transaction) -> Result<()> {
 
 const TX_COLS: &str = "hash, block_number, position, from_addr, to_addr, status, gas_used, base_fee, contract_address, fee_token, fee_amount, input, raw, trace_data, receipt_data, timestamp, created_at";
 
+/// `TX_COLS` for a listing, which shows none of the three left NULL. On a
+/// large database `raw` and `receipt_data` run to a hundred kilobytes a
+/// transaction, and `row_to_tx` would hex-encode `raw` only for the row to
+/// drop it.
+const TX_LIST_COLS: &str = "hash, block_number, position, from_addr, to_addr, status, gas_used, base_fee, contract_address, fee_token, fee_amount, input, NULL, NULL, NULL, timestamp, created_at";
+
 fn row_to_tx(row: &rusqlite::Row) -> rusqlite::Result<Transaction> {
     Ok(Transaction {
         hash: blob_hex(&row.get::<_, Vec<u8>>(0)?),
@@ -774,16 +785,6 @@ pub fn get_block_transactions(db: &Db, block_number: i64) -> Vec<Transaction> {
     )
 }
 
-pub fn get_recent_transactions(db: &Db, limit: usize) -> Vec<Transaction> {
-    query_rows(
-        &lock(db),
-        "get_recent_transactions",
-        &format!("SELECT {TX_COLS} FROM transactions ORDER BY timestamp DESC LIMIT ?1"),
-        params![limit as i64],
-        row_to_tx,
-    )
-}
-
 /// One page of an address's transactions, newest first: by block, then by
 /// position in it.
 ///
@@ -821,6 +822,33 @@ pub fn get_address_transactions(
             limit.saturating_add(offset)
         ],
         row_to_tx,
+    )
+}
+
+/// One page of the chain's transactions, newest first: by block, then by
+/// position in it; the home feed is its first page. Ordered on
+/// `idx_tx_block_position`, so a deep page costs the walk to its offset and no
+/// sort.
+pub fn get_transactions(db: &Db, page: u32, per_page: u32) -> Vec<Transaction> {
+    let (limit, offset) = (i64::from(per_page), page_offset(page, per_page));
+    query_rows(
+        &lock(db),
+        "get_transactions",
+        &format!(
+            "SELECT {TX_LIST_COLS} FROM transactions
+             ORDER BY block_number DESC, position DESC LIMIT ?1 OFFSET ?2"
+        ),
+        params![limit, offset],
+        row_to_tx,
+    )
+}
+
+pub fn get_transaction_count(db: &Db) -> i64 {
+    query_count(
+        &lock(db),
+        "get_transaction_count",
+        "SELECT COUNT(*) FROM transactions",
+        params![],
     )
 }
 

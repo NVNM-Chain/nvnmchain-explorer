@@ -164,39 +164,7 @@
 <div class="card overflow-x-auto">
     <div class="card-header">Transactions</div>
     {% if html_transactions %}
-    <div class="min-w-[760px]">
-        <div class="flex table-header">
-            <div class="flex-1 px-3">Tx Hash</div>
-            <div class="w-24 px-3">Block</div>
-            <div class="w-32 px-3 hidden md:block">Method</div>
-            <div class="w-44 px-3 hidden md:block">From</div>
-            <div class="w-44 px-3 hidden md:block">To</div>
-            <div class="w-20 px-3 text-right">Time</div>
-        </div>
-        {% for tx in html_transactions %}
-        <div class="t-row flex text-xs">
-            <div class="flex-1 px-3 py-3">
-                {{ ui::copy_tx(hash=tx.tx_hash) }}
-                {% if tx.tx_status == 0 %}<span class="badge badge-error ml-1">fail</span>{% endif %}
-            </div>
-            <div class="w-24 px-3 py-3">
-                <a href="/block/{{ tx.tx_block }}" class="mono text-blue-400 hover:text-blue-300">{{ tx.tx_block }}</a>
-            </div>
-            <div class="w-32 px-3 py-3 hidden md:block">
-                {% if tx.tx_method %}<span class="badge badge-method mono">{{ tx.tx_method }}</span>{% else %}<span class="text-faint">—</span>{% endif %}
-            </div>
-            <div class="w-44 px-3 py-3 hidden md:block mono truncate">
-                {{ ui::copy_address(address=tx.tx_from) }}
-            </div>
-            <div class="w-44 px-3 py-3 hidden md:block mono truncate">
-                {% if tx.tx_to %}
-                {{ ui::copy_address(address=tx.tx_to) }}
-                {% else %}<span class="text-faint">create</span>{% endif %}
-            </div>
-            <div class="w-20 px-3 py-3 text-right text-dim">{{ format_time_ago(timestamp=tx.tx_timestamp) }}</div>
-        </div>
-        {% endfor %}
-    </div>
+    {{ ui::tx_table(transactions=html_transactions) }}
     {% else %}
     <div class="card-body text-center text-dim text-sm py-10">No transactions found</div>
     {% endif %}

@@ -160,6 +160,19 @@ fn has_anchors(state: &AppState) -> bool {
         .unwrap_or(false)
 }
 
+/// The keys a transaction row draws, for the listings that share its markup.
+fn tx_row(t: &crate::models::Transaction) -> Value {
+    json!({
+        "tx_hash": t.hash,
+        "tx_from": t.from_addr,
+        "tx_to": t.to_addr,
+        "tx_timestamp": t.timestamp,
+        "tx_status": t.status,
+        "tx_block": t.block_number,
+        "tx_method": tx_method_badge(&t.input),
+    })
+}
+
 /// Rows per page, for every listing the explorer serves.
 const PER_PAGE: u32 = 25;
 
@@ -690,7 +703,7 @@ pub async fn home(
 ) -> Response {
     let latest_block = db::get_latest_block(&state.db);
     let recent_blocks = db::get_recent_blocks(&state.db, state.cfg.recent_block_count);
-    let recent_txs = db::get_recent_transactions(&state.db, state.cfg.recent_tx_count);
+    let recent_txs = db::get_transactions(&state.db, 1, state.cfg.recent_tx_count as u32);
     let latest_num = latest_block.as_ref().map(|b| b.number).unwrap_or(0);
     let mut stats = state
         .stats
@@ -1009,6 +1022,43 @@ pub async fn blocks_page(
         }),
     );
     html_or_json(&state, &headers, &query, "blocks.html", &ctx)
+}
+
+/// Every transaction the indexer holds, newest first: what the home page's feed
+/// of the latest few cannot page past.
+pub async fn txs_page(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    let page = page_param(&query);
+    // The indexer recounts into the stats every few seconds; a request must not
+    // hold the one connection for a count of its own, a quarter second cold on
+    // a large database. Only a database the stats have not seen is counted here.
+    let counted = state
+        .stats
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get("total_txns")
+        .and_then(Value::as_i64);
+    let total = counted.unwrap_or_else(|| db::get_transaction_count(&state.db));
+    let txs: Vec<Value> = db::get_transactions(&state.db, page, PER_PAGE)
+        .iter()
+        .map(tx_row)
+        .collect();
+
+    let ctx = page_ctx_for(
+        &state,
+        db::get_latest_block(&state.db),
+        json!({
+            "transactions": txs,
+            "total_txns": total,
+            "page": page,
+            "per_page": PER_PAGE,
+            "total_pages": total_pages(total, PER_PAGE),
+        }),
+    );
+    html_or_json(&state, &headers, &query, "txs.html", &ctx)
 }
 
 /// Tripped when the node turns out to have no `debug_` namespace. Indexing
@@ -1451,20 +1501,7 @@ pub async fn address_page(
         (transfers.clone(), transfers)
     } else {
         let txs = db::get_address_transactions(&state.db, &checksummed, page, per_page);
-        let html_txs: Vec<Value> = txs
-            .iter()
-            .map(|t| {
-                json!({
-                    "tx_hash": t.hash,
-                    "tx_from": t.from_addr,
-                    "tx_to": t.to_addr,
-                    "tx_timestamp": t.timestamp,
-                    "tx_status": t.status,
-                    "tx_block": t.block_number,
-                    "tx_method": tx_method_badge(&t.input),
-                })
-            })
-            .collect();
+        let html_txs: Vec<Value> = txs.iter().map(tx_row).collect();
         (
             txs.into_iter()
                 .map(|t| serde_json::to_value(t).unwrap_or(Value::Null))
@@ -2273,6 +2310,7 @@ pub fn app(state: AppState) -> Router {
         .route("/api/events", get(events))
         .route("/block/{block_id}", get(block_page))
         .route("/blocks", get(blocks_page))
+        .route("/txs", get(txs_page))
         .route("/tx/{tx_hash}", get(tx_page))
         .route("/receipt/{tx_hash}", get(receipt_page))
         .route("/address/{address}", get(address_page))

@@ -201,7 +201,8 @@ fn transfer_bundle() -> BlockBundle {
     }
 }
 
-async fn serve() -> (tempfile::TempDir, String) {
+/// A server over the fixture, with `stats` as what the indexer would have left.
+async fn serve(stats: Value) -> (tempfile::TempDir, String) {
     use nvnmchain_explorer::web::{self, AppState};
 
     let (dir, db) = temp_db("pages.db");
@@ -245,7 +246,7 @@ async fn serve() -> (tempfile::TempDir, String) {
         cfg,
         tera,
         block_events: tokio::sync::broadcast::channel(16).0,
-        stats: Arc::new(std::sync::RwLock::new(Value::Null)),
+        stats: Arc::new(std::sync::RwLock::new(stats)),
         shutdown: tokio::sync::watch::channel(false).1,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -272,7 +273,7 @@ async fn get_json(base: &str, path: &str) -> Value {
 /// would 404.
 #[tokio::test]
 async fn a_block_links_only_to_neighbours_that_are_indexed() {
-    let (_dir, base) = serve().await;
+    let (_dir, base) = serve(Value::Null).await;
     let page = get_json(&base, "/block/100?").await;
 
     assert_eq!(page["next_block"], json!(101));
@@ -292,7 +293,7 @@ async fn a_block_links_only_to_neighbours_that_are_indexed() {
 /// 101 but not 99, and a row for a missing block would link to a 404.
 #[tokio::test]
 async fn the_blocks_listing_descends_from_the_tip_over_the_gaps() {
-    let (_dir, base) = serve().await;
+    let (_dir, base) = serve(Value::Null).await;
     let page = get_json(&base, "/blocks?").await;
 
     let numbers: Vec<i64> = page["blocks"]
@@ -324,13 +325,86 @@ async fn the_blocks_listing_descends_from_the_tip_over_the_gaps() {
     assert_eq!(numbers, [100], "101 is above the requested start");
 }
 
+/// The chain-wide listing, which the home page's feed of the latest few cannot
+/// page past. Rows carry the keys `txs.html` draws, and an empty page renders
+/// rather than 404s.
+#[tokio::test]
+async fn the_transactions_listing_holds_every_indexed_transaction() {
+    let (_dir, base) = serve(Value::Null).await;
+    let page = get_json(&base, "/txs?").await;
+
+    assert_eq!(
+        page["total_txns"],
+        json!(3),
+        "every saved transaction counted"
+    );
+    assert_eq!(page["total_pages"], json!(1));
+
+    let rows = page["transactions"].as_array().expect("transactions");
+    let hashes: Vec<&str> = rows
+        .iter()
+        .map(|t| t["tx_hash"].as_str().expect("hash"))
+        .collect();
+    for expected in [TX_HASH, FAILED_TX_HASH, UNKNOWN_LOG_TX_HASH] {
+        assert!(
+            hashes.contains(&expected),
+            "{expected} missing from the listing"
+        );
+    }
+    // The fixture's three all sit in block 100, so only the keys the row draws
+    // can be asserted, not their order.
+    for row in rows {
+        assert_eq!(row["tx_block"], json!(100));
+        assert!(row["tx_from"].is_string(), "from address for the row");
+        assert!(row["tx_method"].is_string(), "method badge for the row");
+    }
+    assert!(
+        rows.iter().any(|t| t["tx_status"] == json!(0)),
+        "the failed transaction is listed too"
+    );
+
+    let empty = get_json(&base, "/txs?page=2").await;
+    assert!(empty["transactions"]
+        .as_array()
+        .expect("transactions")
+        .is_empty());
+
+    // The template renders, which the JSON context alone does not prove.
+    let html = reqwest::get(format!("{base}/txs"))
+        .await
+        .expect("GET /txs")
+        .text()
+        .await
+        .expect("body");
+    assert!(html.contains("Transactions"), "the page has its heading");
+    assert!(html.contains(TX_HASH), "a row reaches the rendered page");
+
+    // The address tab draws the same macro, so one broken row would break both.
+    let address = reqwest::get(format!("{base}/address/{SENDER}?tab=transactions"))
+        .await
+        .expect("GET /address")
+        .text()
+        .await
+        .expect("body");
+    assert!(
+        address.contains(TX_HASH),
+        "the address tab draws the same rows"
+    );
+
+    // The total is the indexer's count from the stats, not a scan per request;
+    // the fixture above, with no stats yet, was the one case that is counted.
+    let (_dir, counted) = serve(json!({ "total_txns": 7 })).await;
+    let page = get_json(&counted, "/txs?").await;
+    assert_eq!(page["total_txns"], json!(7), "the stats count is trusted");
+}
+
 /// Pressing Enter in the search box resolves to one destination, and the
 /// candidates are tried in the order a reader means them. A block hash and a
 /// transaction hash are the same shape, so only asking the index tells them
 /// apart.
 #[tokio::test]
 async fn search_resolves_each_kind_of_identifier() {
-    let (_dir, base) = serve().await;
+    let (_dir, base) = serve(Value::Null).await;
     let hit = |page: &Value| {
         let m = &page["match"];
         (
@@ -374,7 +448,7 @@ async fn search_resolves_each_kind_of_identifier() {
 
 #[tokio::test]
 async fn a_successful_transaction_says_what_it_did() {
-    let (_dir, base) = serve().await;
+    let (_dir, base) = serve(Value::Null).await;
     let page = get_json(&base, &format!("/tx/{TX_HASH}?")).await;
 
     // The fee transfer came first in the receipt; the payment is the point.
@@ -401,7 +475,7 @@ async fn a_successful_transaction_says_what_it_did() {
 
 #[tokio::test]
 async fn a_failed_transaction_says_why() {
-    let (_dir, base) = serve().await;
+    let (_dir, base) = serve(Value::Null).await;
     let page = get_json(&base, &format!("/tx/{FAILED_TX_HASH}?")).await;
 
     assert_eq!(page["summary"]["tone"], json!("failure"));
@@ -420,7 +494,7 @@ async fn a_failed_transaction_says_why() {
 
 #[tokio::test]
 async fn the_fee_breakdown_splits_the_gas_cost() {
-    let (_dir, base) = serve().await;
+    let (_dir, base) = serve(Value::Null).await;
     let page = get_json(&base, &format!("/tx/{TX_HASH}?")).await;
     let fee = &page["fee_breakdown"];
 
@@ -435,7 +509,7 @@ async fn the_fee_breakdown_splits_the_gas_cost() {
 /// Every template the transaction page can render must render.
 #[tokio::test]
 async fn every_transaction_tab_renders() {
-    let (_dir, base) = serve().await;
+    let (_dir, base) = serve(Value::Null).await;
     for hash in [TX_HASH, FAILED_TX_HASH] {
         for tab in ["overview", "balances", "calls", "events", "raw"] {
             let path = format!("/tx/{hash}?tab={tab}");
@@ -458,7 +532,7 @@ async fn every_transaction_tab_renders() {
 /// page that claims to show every event.
 #[tokio::test]
 async fn an_unknown_log_still_appears() {
-    let (_dir, base) = serve().await;
+    let (_dir, base) = serve(Value::Null).await;
     let page = get_json(&base, &format!("/tx/{UNKNOWN_LOG_TX_HASH}?")).await;
 
     let events = page["events"].as_array().expect("events");
@@ -479,7 +553,7 @@ async fn an_unknown_log_still_appears() {
 
 #[tokio::test]
 async fn an_address_counts_every_transfer_not_just_the_page() {
-    let (_dir, base) = serve().await;
+    let (_dir, base) = serve(Value::Null).await;
     let sender = checksum_address(SENDER);
 
     // The count is of the whole history; a page holds 25 of them.
@@ -627,7 +701,7 @@ fn an_address_transfer_page_merges_sent_and_received_in_block_order() {
 
 #[tokio::test]
 async fn a_token_lists_its_holders() {
-    let (_dir, base) = serve().await;
+    let (_dir, base) = serve(Value::Null).await;
     let token = checksum_address(TOKEN);
     let page = get_json(&base, &format!("/token/{token}?tab=holders")).await;
 
@@ -652,7 +726,7 @@ async fn a_token_lists_its_holders() {
 /// Addresses are copied all day; every page that shows one must offer it.
 #[tokio::test]
 async fn addresses_are_copyable_and_labelled() {
-    let (_dir, base) = serve().await;
+    let (_dir, base) = serve(Value::Null).await;
     let token = checksum_address(TOKEN);
 
     let body = reqwest::get(format!("{base}/tx/{TX_HASH}"))
@@ -717,7 +791,7 @@ fn urlencoding_encode(value: &str) -> String {
 
 #[tokio::test]
 async fn the_search_box_suggests_what_is_being_typed() {
-    let (_dir, base) = serve().await;
+    let (_dir, base) = serve(Value::Null).await;
 
     // A token by name, before the whole name is typed.
     let by_name = suggest(&base, "path").await;
@@ -778,7 +852,7 @@ async fn the_search_box_suggests_what_is_being_typed() {
 /// else in the explorer would tell the reader that.
 #[tokio::test]
 async fn a_virtual_address_is_recognised_in_search() {
-    let (_dir, base) = serve().await;
+    let (_dir, base) = serve(Value::Null).await;
     let address = nvnmchain_explorer::tempo_address::virtual_address(&[0xab; 4], &[0xcd; 6]);
 
     let results = suggest(&base, &address).await;
@@ -794,7 +868,7 @@ async fn a_virtual_address_is_recognised_in_search() {
 /// character to match, not a pattern that matches everything.
 #[tokio::test]
 async fn search_terms_are_never_patterns() {
-    let (_dir, base) = serve().await;
+    let (_dir, base) = serve(Value::Null).await;
     // Leaked wildcards would make these match pathUSD or the docs registry;
     // escaped, they cannot.
     assert!(suggest(&base, "%path%").await.is_empty());
@@ -928,7 +1002,7 @@ async fn the_directory_can_be_turned_off() {
 
 #[tokio::test]
 async fn a_token_address_shows_the_interface_it_exposes() {
-    let (_dir, base) = serve().await;
+    let (_dir, base) = serve(Value::Null).await;
     let token = checksum_address(TOKEN);
     let page = get_json(&base, &format!("/address/{token}?tab=contract")).await;
 
@@ -974,7 +1048,7 @@ async fn a_token_address_shows_the_interface_it_exposes() {
 /// otherwise.
 #[tokio::test]
 async fn a_plain_account_has_no_interface() {
-    let (_dir, base) = serve().await;
+    let (_dir, base) = serve(Value::Null).await;
     let page = get_json(
         &base,
         &format!("/address/{}?tab=contract", checksum_address(SENDER)),
@@ -988,7 +1062,7 @@ async fn a_plain_account_has_no_interface() {
 /// The address page renders on every tab, including the ones added last.
 #[tokio::test]
 async fn every_address_tab_renders() {
-    let (_dir, base) = serve().await;
+    let (_dir, base) = serve(Value::Null).await;
     for address in [checksum_address(SENDER), checksum_address(TOKEN)] {
         for tab in ["transactions", "transfers", "holdings", "contract"] {
             let path = format!("/address/{address}?tab={tab}");
@@ -1005,7 +1079,7 @@ async fn every_address_tab_renders() {
 /// must know them.
 #[tokio::test]
 async fn canonical_contracts_are_named_and_searchable() {
-    let (_dir, base) = serve().await;
+    let (_dir, base) = serve(Value::Null).await;
     let multicall = "0xcA11bde05977b3631167028862bE2a173976CA11";
 
     let (dir, db) = temp_db("canonical.db");

@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% import "_macros.html" as ui %}
+{% block title %}Transactions – nvnmchain Explorer{% endblock %}
+{% block content %}
+
+<div class="mb-6">
+    <h1 class="text-2xl font-extrabold tracking-tight">Transactions</h1>
+    <p class="text-xs text-dim mt-1">{{ total_txns | comma }} transactions indexed</p>
+</div>
+
+<div class="card overflow-x-auto">
+    {% if transactions %}
+    {{ ui::tx_table(transactions=transactions) }}
+    {% else %}
+    <div class="card-body text-center text-dim text-sm py-10">No transactions indexed yet</div>
+    {% endif %}
+</div>
+
+{{ ui::pager(page=page, total_pages=total_pages) }}
+{% endblock %}
