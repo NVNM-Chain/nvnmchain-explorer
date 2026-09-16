@@ -1919,7 +1919,10 @@ impl Hit {
 /// chain matches. Empty when neither knows it, or cannot be reached.
 async fn anchoring_hits(state: &AppState, q: &str, limit: usize) -> Vec<Hit> {
     let mut hits = Vec::new();
-    if let Ok((registries, records)) = anchoring::lookup(&state.rpc, q).await {
+    // Two calls to the node per keystroke: a slow node costs the reader these
+    // rows, not the whole suggestion.
+    let asked = tokio::time::timeout(name_search::TIMEOUT, anchoring::lookup(&state.rpc, q)).await;
+    if let Ok(Ok((registries, records))) = asked {
         hits.extend(
             registries
                 .iter()

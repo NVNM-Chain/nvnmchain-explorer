@@ -8,6 +8,7 @@ pub const DEFAULT_RPC_URL: &str = "https://rpc.nvnm.canary.mantrachain.dev";
 pub const DEFAULT_WS_URL: &str = "wss://ws.nvnm.canary.mantrachain.dev";
 /// Chain id reported by the RPC above (`eth_chainId` → 0xc0316).
 pub const DEFAULT_CHAIN_ID: u64 = 787_222;
+pub const DEFAULT_PORT: u16 = 8080;
 
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -71,15 +72,20 @@ fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// A finite number of seconds; `inf` or `nan` would panic where a `Duration` is built.
 fn env_f64(key: &str, default: f64) -> f64 {
     env::var(key)
         .ok()
         .and_then(|v| v.trim().parse().ok())
+        .filter(|v: &f64| v.is_finite())
         .unwrap_or(default)
 }
 
 impl Settings {
+    /// Every number is clamped to a usable range here, where it is read, so the
+    /// rest of the explorer can build a `Duration` or a window from one as it is.
     pub fn from_env() -> Self {
+        let port = env_u64("PORT", DEFAULT_PORT.into());
         Self {
             rpc_url: rpc_url(),
             ws_url: env_or("WS_URL", DEFAULT_WS_URL),
@@ -88,15 +94,19 @@ impl Settings {
                 .unwrap_or(false),
             chain_id: env_u64("CHAIN_ID", DEFAULT_CHAIN_ID),
             host: env_or("HOST", "0.0.0.0"),
-            port: env_u64("PORT", 8080) as u16,
+            port: u16::try_from(port).unwrap_or_else(|_| {
+                tracing::warn!("PORT {port} is not a port number; listening on {DEFAULT_PORT}");
+                DEFAULT_PORT
+            }),
             db_path: env_or("DB_PATH", "explorer.db"),
             recent_block_count: env_usize("RECENT_BLOCK_COUNT", 15),
             recent_tx_count: env_usize("RECENT_TX_COUNT", 15),
-            poll_seconds: env_f64("INDEX_POLL_SECONDS", 1.0),
-            batch_size: env_u64("INDEX_BATCH", 32),
-            index_concurrency: env_usize("INDEX_CONCURRENCY", 32),
+            poll_seconds: env_f64("INDEX_POLL_SECONDS", 1.0).clamp(0.05, 3600.0),
+            // A window is fetched whole before it is written, so this bounds memory too.
+            batch_size: env_u64("INDEX_BATCH", 32).clamp(1, 1024),
+            index_concurrency: env_usize("INDEX_CONCURRENCY", 32).clamp(1, 256),
             native_symbol: env_or("NATIVE_SYMBOL", "NVNM"),
-            stats_interval_seconds: env_f64("STATS_INTERVAL_SECONDS", 5.0),
+            stats_interval_seconds: env_f64("STATS_INTERVAL_SECONDS", 5.0).clamp(1.0, 3600.0),
             signature_lookup_url: signature_lookup_url(),
             name_search_url: trimmed("NAME_SEARCH_URL"),
         }

@@ -11,6 +11,11 @@ use tracing::{debug, info, warn};
 
 use crate::rpc::ChainRpc;
 
+/// How long the watcher waits before retrying the socket, doubling up to the cap
+/// while it stays unreachable and starting over once a subscription has run.
+const RETRY_BASE: Duration = Duration::from_millis(500);
+const RETRY_CAP: Duration = Duration::from_secs(300);
+
 /// Poll the chain head once and forward it; returns false when the consumer
 /// is gone (callers should stop).
 async fn poll_once(rpc: &ChainRpc, tx: &mpsc::Sender<u64>) -> bool {
@@ -58,7 +63,7 @@ pub async fn head_watcher(
         }
     }
 
-    let mut retry = Duration::from_millis(500);
+    let mut retry = RETRY_BASE;
     let mut consecutive_failures = 0u32;
     loop {
         if *shutdown.borrow() {
@@ -96,6 +101,7 @@ pub async fn head_watcher(
         match outcome {
             Ok(()) => {
                 consecutive_failures = 0;
+                retry = RETRY_BASE;
                 warn!("websocket subscription ended; reconnecting");
                 // Keep polling during the brief reconnect pause.
                 let until = tokio::time::Instant::now() + Duration::from_millis(250);
@@ -133,7 +139,7 @@ pub async fn head_watcher(
                     }
                     tokio::time::sleep(poll).await;
                 }
-                retry = (retry * 2).min(Duration::from_secs(300));
+                retry = (retry * 2).min(RETRY_CAP);
             }
         }
     }
@@ -161,6 +167,11 @@ async fn subscribe_ws(url: &str, tx: &mpsc::Sender<u64>) -> Result<()> {
         match msg {
             Message::Text(text) => {
                 if let Ok(value) = serde_json::from_str::<Value>(text.as_str()) {
+                    // A refused subscription would otherwise leave the socket
+                    // open and silent.
+                    if let Some(error) = value.get("error") {
+                        anyhow::bail!("eth_subscribe refused: {error}");
+                    }
                     if let Some(number) = parse_head(&value) {
                         if tx.send(number).await.is_err() {
                             return Ok(()); // consumer gone; end subscription

@@ -8,8 +8,9 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-/// A keystroke must not wait on another service.
-const TIMEOUT: Duration = Duration::from_secs(2);
+/// A keystroke must not wait on another service. Shared with the contract half of
+/// a suggestion, which is subject to the same impatience.
+pub const TIMEOUT: Duration = Duration::from_secs(2);
 
 /// `RegistryNameMatchMode.REGISTRY_NAME_MATCH_MODE_CONTAINS`. A reader types the part of
 /// the name they remember, which is as often the middle as the start.

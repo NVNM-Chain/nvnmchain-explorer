@@ -50,12 +50,12 @@ pub struct IndexerConfig {
 impl IndexerConfig {
     pub fn from_settings(s: &Settings) -> Self {
         Self {
-            poll: Duration::from_secs_f64(s.poll_seconds.max(0.05)),
-            batch: s.batch_size.max(1),
-            concurrency: s.index_concurrency.max(1),
+            poll: Duration::from_secs_f64(s.poll_seconds),
+            batch: s.batch_size,
+            concurrency: s.index_concurrency,
             ws_url: s.ws_url.clone(),
             index_ws: s.index_ws,
-            stats_interval: Duration::from_secs_f64(s.stats_interval_seconds.max(1.0)),
+            stats_interval: Duration::from_secs_f64(s.stats_interval_seconds),
         }
     }
 }
