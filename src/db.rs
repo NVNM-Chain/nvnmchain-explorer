@@ -215,7 +215,9 @@ pub fn init_db(path: &str) -> Result<Connection> {
             ON transactions(from_addr, block_number, position);
         CREATE INDEX IF NOT EXISTS idx_tx_to_block
             ON transactions(to_addr, block_number, position);
-        CREATE INDEX IF NOT EXISTS idx_tx_timestamp ON transactions(timestamp);
+        -- The stats sum the day's transactions over blocks, and nothing else
+        -- filters transactions by time. The DROP migrates databases that carry it.
+        DROP INDEX IF EXISTS idx_tx_timestamp;
         -- The chain-wide listing pages in this order, and a block's rows come off
         -- it in position order. (block_number) alone was its prefix, one more
         -- b-tree per insert; the DROP migrates databases that carry it.
@@ -235,16 +237,13 @@ pub fn init_db(path: &str) -> Result<Connection> {
             created_at INTEGER NOT NULL DEFAULT 0,
             updated_at INTEGER NOT NULL DEFAULT 0
         );
-        CREATE INDEX IF NOT EXISTS idx_token_name ON token_metadata(name);
+        -- A name is only ever matched through lower() or LIKE, which no plain
+        -- index on it serves.
+        DROP INDEX IF EXISTS idx_token_name;
 
-        CREATE TABLE IF NOT EXISTS contract_labels (
-            address BLOB PRIMARY KEY,
-            name TEXT NOT NULL DEFAULT '',
-            abi TEXT NOT NULL DEFAULT '[]',
-            is_token INTEGER NOT NULL DEFAULT 0,
-            is_precompile INTEGER NOT NULL DEFAULT 0,
-            created_at INTEGER NOT NULL DEFAULT 0
-        );
+        -- Contract labels only ever held empty names, and every page looked
+        -- one up per address for nothing. The DROP clears the table.
+        DROP TABLE IF EXISTS contract_labels;
 
         CREATE TABLE IF NOT EXISTS transfer_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -260,7 +259,8 @@ pub fn init_db(path: &str) -> Result<Connection> {
             UNIQUE (block_number, log_index)
         );
         CREATE INDEX IF NOT EXISTS idx_transfer_tx_hash ON transfer_events(tx_hash);
-        CREATE INDEX IF NOT EXISTS idx_transfer_block ON transfer_events(block_number);
+        -- UNIQUE (block_number, log_index) already indexes block_number first.
+        DROP INDEX IF EXISTS idx_transfer_block;
         -- (token_addr) alone made the token transfers page sort the token's
         -- whole history to serve 25 rows; this index hands them back already
         -- in page order. The DROP migrates databases that predate it.
@@ -286,6 +286,14 @@ pub fn init_db(path: &str) -> Result<Connection> {
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL DEFAULT '',
             updated_at INTEGER NOT NULL DEFAULT 0
+        );
+
+        -- Row counts for the stats, kept by the writer. A COUNT(*) over
+        -- transactions walks an index of every row, a quarter second cold on
+        -- a large database, on the one connection every page view waits for.
+        CREATE TABLE IF NOT EXISTS counters (
+            name TEXT PRIMARY KEY,
+            n INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS token_balances (
@@ -317,7 +325,54 @@ pub fn init_db(path: &str) -> Result<Connection> {
          ON token_balances(token_addr, LENGTH(balance) DESC, balance DESC)
          WHERE {HOLDING};"
     ))?;
+    seed_counters(&conn)?;
     Ok(conn)
+}
+
+/// Count the rows once on a database that predates the counters, so the writer
+/// can keep them from there.
+fn seed_counters(conn: &Connection) -> Result<()> {
+    for table in ["blocks", "transactions"] {
+        let seeded: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM counters WHERE name=?1)",
+            [table],
+            |r| r.get(0),
+        )?;
+        if !seeded {
+            let n: i64 =
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
+            conn.execute(
+                "INSERT INTO counters (name, n) VALUES (?1, ?2)",
+                params![table, n],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// A row count the writer keeps: `blocks` or `transactions`.
+pub fn counter(conn: &Connection, table: &str) -> i64 {
+    query_opt(
+        conn,
+        "counter",
+        "SELECT n FROM counters WHERE name=?1",
+        [table],
+        |r| r.get(0),
+    )
+    .unwrap_or(0)
+}
+
+fn add_to_counter(conn: &Connection, table: &str, delta: i64) -> Result<()> {
+    if delta == 0 {
+        return Ok(());
+    }
+    exec_cached(
+        conn,
+        "INSERT INTO counters (name, n) VALUES (?1, ?2)
+         ON CONFLICT(name) DO UPDATE SET n = n + excluded.n",
+        params![table, delta],
+    )?;
+    Ok(())
 }
 
 /// Row offset of a 1-based page. Widened before multiplying: `page` comes
@@ -428,10 +483,20 @@ pub fn save_block_bundles(db: &Db, bundles: &[BlockBundle]) -> Result<()> {
 
 /// One block's worth of writes, inside a caller-owned transaction.
 fn write_block(txn: &Connection, bundle: &BlockBundle) -> Result<()> {
+    // What this write adds to the counters: a block already stored, and the
+    // transactions it already holds, are rewritten, not counted again.
+    let stored: i64 = txn
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM blocks WHERE number=?1)")?
+        .query_row(params![bundle.block.number], |r| r.get(0))?;
+    let held: i64 = txn
+        .prepare_cached("SELECT COUNT(*) FROM transactions WHERE block_number=?1")?
+        .query_row(params![bundle.block.number], |r| r.get(0))?;
     upsert_block(txn, &bundle.block)?;
     for tx in &bundle.txs {
         upsert_transaction(txn, tx)?;
     }
+    add_to_counter(txn, "blocks", 1 - stored)?;
+    add_to_counter(txn, "transactions", (bundle.txs.len() as i64 - held).max(0))?;
     // Transfers are keyed by (block_number, log_index): re-writing an
     // already-indexed block inserts nothing the second time, and only
     // freshly-inserted transfers move balances / holder counts.
@@ -449,16 +514,6 @@ fn write_block(txn: &Connection, bundle: &BlockBundle) -> Result<()> {
     }
     apply_transfer_balances(txn, &inserted)?;
     refresh_holder_counts(txn, &inserted)?;
-    for tx in &bundle.txs {
-        if let Some(addr) = &tx.contract_address {
-            exec_cached(
-                txn,
-                "INSERT OR IGNORE INTO contract_labels (address, name, abi, is_token, is_precompile, created_at)
-                 VALUES (?1, '', '[]', 0, 0, ?2)",
-                params![addr, now_ts()],
-            )?;
-        }
-    }
     Ok(())
 }
 
@@ -605,6 +660,16 @@ fn upsert_transaction(conn: &Connection, tx: &Transaction) -> Result<()> {
     Ok(())
 }
 
+/// Cache a call trace onto its row. One column: rewriting the row would copy the
+/// raw bytes and the receipt beside it for nothing.
+pub fn set_trace(db: &Db, hash: &str, trace: &str) -> Result<()> {
+    lock(db).execute(
+        "UPDATE transactions SET trace_data=?1 WHERE hash=?2",
+        params![trace, hex_blob(hash)],
+    )?;
+    Ok(())
+}
+
 pub fn save_transaction(db: &Db, tx: &Transaction) -> Result<()> {
     let conn = lock(db);
     upsert_transaction(&conn, tx)
@@ -617,6 +682,23 @@ const TX_COLS: &str = "hash, block_number, position, from_addr, to_addr, status,
 /// transaction, and `row_to_tx` would hex-encode `raw` only for the row to
 /// drop it.
 const TX_LIST_COLS: &str = "hash, block_number, position, from_addr, to_addr, status, gas_used, base_fee, contract_address, fee_token, fee_amount, input, NULL, NULL, NULL, timestamp, created_at";
+
+/// Which columns a transaction read carries. A listing shows a handful and never
+/// the three blobs; the transaction page and any JSON answer show them all.
+#[derive(Clone, Copy)]
+pub enum TxColumns {
+    List,
+    Full,
+}
+
+impl TxColumns {
+    fn sql(self) -> &'static str {
+        match self {
+            Self::List => TX_LIST_COLS,
+            Self::Full => TX_COLS,
+        }
+    }
+}
 
 fn row_to_tx(row: &rusqlite::Row) -> rusqlite::Result<Transaction> {
     Ok(Transaction {
@@ -654,24 +736,33 @@ pub fn get_transaction(db: &Db, hash: &str) -> Option<Transaction> {
 
 /// Transactions of every block in a range, in block then position order, so a
 /// caller replaying a span groups them itself instead of asking per block.
-pub fn get_transactions_in_range(db: &Db, from: i64, to: i64) -> Vec<Transaction> {
+pub fn get_transactions_in_range(
+    db: &Db,
+    from: i64,
+    to: i64,
+    columns: TxColumns,
+) -> Vec<Transaction> {
     query_rows(
         &lock(db),
         "get_transactions_in_range",
         &format!(
-            "SELECT {TX_COLS} FROM transactions WHERE block_number BETWEEN ?1 AND ?2 \
-             ORDER BY block_number, position"
+            "SELECT {} FROM transactions WHERE block_number BETWEEN ?1 AND ?2 \
+             ORDER BY block_number, position",
+            columns.sql()
         ),
         params![from, to],
         row_to_tx,
     )
 }
 
-pub fn get_block_transactions(db: &Db, block_number: i64) -> Vec<Transaction> {
+pub fn get_block_transactions(db: &Db, block_number: i64, columns: TxColumns) -> Vec<Transaction> {
     query_rows(
         &lock(db),
         "get_block_transactions",
-        &format!("SELECT {TX_COLS} FROM transactions WHERE block_number=?1 ORDER BY position"),
+        &format!(
+            "SELECT {} FROM transactions WHERE block_number=?1 ORDER BY position",
+            columns.sql()
+        ),
         params![block_number],
         row_to_tx,
     )
@@ -689,13 +780,14 @@ pub fn get_address_transactions(
     address: &str,
     page: u32,
     per_page: u32,
+    columns: TxColumns,
 ) -> Vec<Transaction> {
     let (limit, offset) = (i64::from(per_page), page_offset(page, per_page));
     query_rows(
         &lock(db),
         "get_address_transactions",
         &format!(
-            "SELECT {TX_COLS} FROM (
+            "SELECT {} FROM (
                  SELECT * FROM (SELECT hash AS h, block_number AS b, position AS p
                                 FROM transactions WHERE from_addr=?1
                                 ORDER BY block_number DESC, position DESC LIMIT ?4)
@@ -705,7 +797,8 @@ pub fn get_address_transactions(
                                 ORDER BY block_number DESC, position DESC LIMIT ?4)
                  ORDER BY b DESC, p DESC LIMIT ?2 OFFSET ?3
              ) page JOIN transactions ON hash = page.h
-             ORDER BY page.b DESC, page.p DESC"
+             ORDER BY page.b DESC, page.p DESC",
+            columns.sql()
         ),
         params![
             hex_blob(address),
@@ -1095,12 +1188,6 @@ fn addr_from_value(v: ValueRef<'_>) -> String {
     crate::decoder::checksum_address(&hex)
 }
 
-pub fn save_transfer(db: &Db, transfer: &TransferEvent) -> Result<()> {
-    let conn = lock(db);
-    insert_transfer(&conn, transfer)?;
-    Ok(())
-}
-
 const TRANSFER_COLS: &str = "e.id, e.tx_hash, e.block_number, e.log_index, e.token_addr, \
                              e.from_addr, e.to_addr, e.amount, e.timestamp, e.created_at";
 
@@ -1355,17 +1442,6 @@ pub fn sync_holder_counts(conn: &Connection) -> Result<()> {
         update_holder_count(conn, &token)?;
     }
     Ok(())
-}
-
-/// Contract-label lookup (populated at index time for created contracts).
-pub fn get_contract_label(db: &Db, addr: &str) -> Option<String> {
-    query_opt(
-        &lock(db),
-        "get_contract_label",
-        "SELECT name FROM contract_labels WHERE address=?1",
-        params![addr],
-        |r| r.get(0),
-    )
 }
 
 pub fn get_address_holdings(db: &Db, address: &str) -> Vec<Value> {

@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use nvnmchain_explorer::config::Settings;
-use nvnmchain_explorer::db::{self, Db};
+use nvnmchain_explorer::db::{self, Db, TxColumns};
 use nvnmchain_explorer::decoder::{checksum_address, keccak256, keccak_hex, TRANSFER_TOPIC};
 use nvnmchain_explorer::models::{Block, BlockBundle, Transaction, TransferEvent};
 use nvnmchain_explorer::signatures;
@@ -599,7 +599,7 @@ fn an_address_page_merges_sent_and_received_in_block_order() {
 
     let pages: Vec<Vec<(i64, i64)>> = (1..=4)
         .map(|page| {
-            db::get_address_transactions(&db, &me, page, 2)
+            db::get_address_transactions(&db, &me, page, 2, TxColumns::List)
                 .iter()
                 .map(|tx| (tx.block_number, tx.position))
                 .collect()

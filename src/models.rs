@@ -109,16 +109,6 @@ pub struct TokenMetadata {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct ContractLabel {
-    pub address: String,
-    pub name: String,
-    pub abi: String,
-    pub is_token: i64,
-    pub is_precompile: i64,
-    pub created_at: i64,
-}
-
-#[derive(Debug, Clone, Serialize)]
 pub struct TransferEvent {
     pub id: i64,
     pub tx_hash: String,

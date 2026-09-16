@@ -1,4 +1,4 @@
-use nvnmchain_explorer::db::{self, Db};
+use nvnmchain_explorer::db::{self, Db, TxColumns};
 use nvnmchain_explorer::decoder::{
     checksum_address, decode_abi_args, decode_event, decode_function_call, extract_balance_changes,
     extract_calls, flatten_trace, TRANSFER_TOPIC,
@@ -456,7 +456,6 @@ fn fresh_schema_has_all_columns() {
         "blocks",
         "transactions",
         "token_metadata",
-        "contract_labels",
         "transfer_events",
         "kv",
         "token_balances",
@@ -530,7 +529,6 @@ fn a_database_with_single_column_address_indexes_gets_the_composite_ones() {
         [
             "idx_tx_block_position",
             "idx_tx_from_block",
-            "idx_tx_timestamp",
             "idx_tx_to_block"
         ]
     );
@@ -564,7 +562,6 @@ fn a_database_with_single_column_transfer_indexes_gets_the_composite_ones() {
     assert_eq!(
         names,
         [
-            "idx_transfer_block",
             "idx_transfer_from_block",
             "idx_transfer_to_block",
             "idx_transfer_token_block",
@@ -655,6 +652,37 @@ fn a_rewrite_without_the_blobs_keeps_them() {
     assert_eq!(stored.receipt_data.as_deref(), Some("{}"));
 }
 
+/// A database from before the counters is counted once when it opens, and the
+/// writer carries on from there.
+#[test]
+fn counters_are_seeded_from_the_tables_of_an_older_database() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("counters.db");
+    let conn = db::init_db(path.to_str().unwrap()).expect("init_db");
+    let db: Db = Arc::new(Mutex::new(conn));
+    let raw_block = sample_raw_block();
+    let block = parse_block(&raw_block);
+    let tx = parse_transaction(&raw_block["transactions"][0], &block);
+    db::save_block_bundle(
+        &db,
+        &BlockBundle {
+            block,
+            txs: vec![tx],
+            transfers: vec![],
+            tokens: vec![],
+        },
+    )
+    .expect("save");
+    db::lock(&db)
+        .execute("DELETE FROM counters", [])
+        .expect("an older database has none");
+    drop(db);
+
+    let conn = db::init_db(path.to_str().unwrap()).expect("reopen");
+    assert_eq!(db::counter(&conn, "blocks"), 1);
+    assert_eq!(db::counter(&conn, "transactions"), 1);
+}
+
 #[test]
 fn duplicate_bundle_is_idempotent() {
     let (_dir, db) = temp_db("dedup.db");
@@ -683,6 +711,9 @@ fn duplicate_bundle_is_idempotent() {
         count, 1,
         "duplicate bundle must not duplicate transfer rows"
     );
+    // A rewrite moves the counters the stats read no further either.
+    assert_eq!(db::counter(&conn, "blocks"), 1);
+    assert_eq!(db::counter(&conn, "transactions"), 1);
 
     let unique: i64 = conn
         .query_row(
@@ -916,10 +947,14 @@ fn huge_page_numbers_do_not_panic() {
         db::init_db(path.to_str().unwrap()).expect("init_db"),
     ));
 
-    assert!(
-        db::get_address_transactions(&db, &format!("0x{}", "11".repeat(20)), u32::MAX, 25)
-            .is_empty()
-    );
+    assert!(db::get_address_transactions(
+        &db,
+        &format!("0x{}", "11".repeat(20)),
+        u32::MAX,
+        25,
+        TxColumns::List,
+    )
+    .is_empty());
     assert!(
         db::get_token_transfers(&db, &format!("0x{}", "aa".repeat(20)), u32::MAX, 25).is_empty()
     );

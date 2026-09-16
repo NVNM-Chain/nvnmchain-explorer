@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use rusqlite::params;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{info, warn};
@@ -113,8 +114,9 @@ fn assemble_bundle(raw_block: &Value, receipts: Option<&Value>) -> BlockBundle {
         let mut tx = parse_transaction(tx_data, &block);
         tx.timestamp = block.timestamp;
         // Re-encode the RPC object with the official tempo primitives; the
-        // block already carries the signed tx, so no extra per-tx RPC.
-        if let Ok(signed) = serde_json::from_value::<crate::tempo::AASigned>(tx_data.clone()) {
+        // block already carries the signed tx, so no extra per-tx RPC. Read in
+        // place: a copy of every transaction object per block adds up.
+        if let Ok(signed) = crate::tempo::AASigned::deserialize(tx_data) {
             let mut buf = Vec::new();
             signed.eip2718_encode(&mut buf);
             tx.raw = Some(format!("0x{}", hex::encode(buf)));
@@ -431,9 +433,9 @@ fn apply_receipt(
     let logs = receipt
         .get("logs")
         .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    for log in &logs {
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    for log in logs {
         // `logIndex` is the per-block unique half of the transfer_events key.
         // Prefer the node's value, but every log still advances the running
         // counter (undecodable logs occupy index slots too), so a missing or
@@ -963,12 +965,14 @@ fn compute_and_store_stats(db: &Db) -> Result<Value> {
     let conn = db::lock(db);
     let now = db::now_ts();
 
-    let total_blocks: i64 = conn.query_row("SELECT COUNT(*) FROM blocks", [], |r| r.get(0))?;
-    let total_txns: i64 = conn.query_row("SELECT COUNT(*) FROM transactions", [], |r| r.get(0))?;
+    // The counters the writer keeps, and a sum over the blocks of the last day:
+    // nothing here walks the transactions table.
+    let total_blocks = db::counter(&conn, "blocks");
+    let total_txns = db::counter(&conn, "transactions");
     let token_count: i64 =
         conn.query_row("SELECT COUNT(*) FROM token_metadata", [], |r| r.get(0))?;
     let txns_24h: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM transactions WHERE timestamp >= ?1",
+        "SELECT COALESCE(SUM(tx_count), 0) FROM blocks WHERE timestamp >= ?1",
         params![now - 86400],
         |r| r.get(0),
     )?;

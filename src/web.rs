@@ -28,7 +28,7 @@ use crate::contracts::{
     abis_for_address, get_contract_name, get_precompile_name, identify_address, is_contract,
     is_tip20_token, search_named,
 };
-use crate::db::{self, Db};
+use crate::db::{self, Db, TxColumns};
 use crate::decoder::{
     checksum_address, decode_event, decode_function_call, decode_revert, decode_with_signature,
     event_signature, extract_balance_changes, extract_calls, flatten_trace, function_signature,
@@ -65,6 +65,16 @@ fn wants_json(headers: &HeaderMap, query: &HashMap<String, String>) -> bool {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     accept.contains("application/json") || query.get("format").map(|f| f == "json").unwrap_or(false)
+}
+
+/// The columns a listing reads. A JSON answer carries the rows whole; a page shows
+/// a few fields of each, and the blobs it never renders are three megabytes a page.
+fn columns_for(headers: &HeaderMap, query: &HashMap<String, String>) -> TxColumns {
+    if wants_json(headers, query) {
+        TxColumns::Full
+    } else {
+        TxColumns::List
+    }
 }
 
 fn render_html(tera: &Tera, template: &str, ctx: &Value) -> Response {
@@ -574,9 +584,6 @@ pub fn address_label(db: &Db, address: &str) -> Option<String> {
             return Some(meta.name);
         }
     }
-    if let Some(name) = db::get_contract_label(db, &checksummed).filter(|n| !n.is_empty()) {
-        return Some(name);
-    }
     if let Some(parts) = parse_virtual(&checksummed) {
         return Some(format!("Virtual {}", parts.master_id));
     }
@@ -809,7 +816,7 @@ async fn sse_step(
         state.sent_initial = true;
         if let Some(b) = db::get_latest_block(&state.db) {
             state.last_num = b.number;
-            let txs = db::get_block_transactions(&state.db, b.number);
+            let txs = db::get_block_transactions(&state.db, b.number, TxColumns::List);
             let payload = crate::models::block_event_json(&b, &txs, crate::models::STREAM_TX_CAP);
             return Some((sse_event(&payload), state));
         }
@@ -853,7 +860,7 @@ async fn sse_step(
                 // Two range queries for the whole span, not two per height: a
                 // client that fell far behind replays up to `SSE_MAX_REPLAY`.
                 let blocks = db::get_blocks_in_range(&state.db, start, end);
-                let txs = db::get_transactions_in_range(&state.db, start, end);
+                let txs = db::get_transactions_in_range(&state.db, start, end, TxColumns::List);
                 // Oldest first, since the writer emits in number order.
                 for block in blocks.into_iter().rev() {
                     let first = txs.partition_point(|t| t.block_number < block.number);
@@ -896,7 +903,8 @@ pub async fn block_page(
     let Some(block) = block else {
         return not_found(&state, &headers, &query, "Block", &block_id);
     };
-    let transactions = db::get_block_transactions(&state.db, block.number);
+    let transactions =
+        db::get_block_transactions(&state.db, block.number, columns_for(&headers, &query));
     let gas_pct = block_pct(block.gas_used, block.gas_limit);
     let token_addrs: Vec<String> = transactions
         .iter()
@@ -1079,10 +1087,10 @@ async fn fetch_missing_trace(
     if flat.is_empty() {
         return None;
     }
-    let mut cached = tx.clone();
-    cached.trace_data = serde_json::to_string(&flat).ok();
-    if let Err(e) = db::save_transaction(&state.db, &cached) {
-        tracing::warn!("caching trace for {} failed: {e:#}", tx.hash);
+    if let Ok(trace) = serde_json::to_string(&flat) {
+        if let Err(e) = db::set_trace(&state.db, &tx.hash, &trace) {
+            tracing::warn!("caching trace for {} failed: {e:#}", tx.hash);
+        }
     }
     Some(flat)
 }
@@ -1305,8 +1313,6 @@ pub async fn tx_page(
         .receipt_data
         .as_deref()
         .and_then(|s| serde_json::from_str(s).ok());
-    // Fetched before `to_addr` is derived below: the cache write stores the row
-    // as indexed, not as rendered.
     let trace: Option<Vec<Value>> = match tx
         .trace_data
         .as_deref()
@@ -1459,7 +1465,13 @@ pub async fn address_page(
         enrich_transfers(&state, &mut transfers);
         (transfers.clone(), transfers)
     } else {
-        let txs = db::get_address_transactions(&state.db, &checksummed, page, per_page);
+        let txs = db::get_address_transactions(
+            &state.db,
+            &checksummed,
+            page,
+            per_page,
+            columns_for(&headers, &query),
+        );
         let html_txs: Vec<Value> = txs.iter().map(tx_row).collect();
         (
             txs.into_iter()
@@ -1489,13 +1501,7 @@ pub async fn address_page(
     } else {
         addr_info.kind.as_str()
     };
-    let label = addr_info.label.clone().or_else(|| {
-        if kind == "contract" {
-            db::get_contract_label(&state.db, &checksummed).filter(|n| !n.is_empty())
-        } else {
-            None
-        }
-    });
+    let label = addr_info.label.clone();
 
     let token_meta = db::get_token_metadata(&state.db, &checksummed);
     let code = if tab == "contract" {
