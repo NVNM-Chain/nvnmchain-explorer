@@ -29,79 +29,17 @@ use crate::models::Transaction;
 // The ABI registry
 // ---------------------------------------------------------------------------
 
-/// What no binding declares: the errors every Solidity `revert` produces, and
-/// the registry contracts, which are deployed *on* this chain rather than part
-/// of it, so `tempo-contracts` never sees them.
+/// What no binding declares: the errors every Solidity `revert` produces.
 ///
 /// Written as signatures rather than hand-built ABIs. A signature is what the
 /// selector hashes, so there is one spelling to get right and it reads like
 /// Solidity; a mistyped type does not parse at all, which
 /// `every_local_declaration_parses` catches, and `local_selectors_are_pinned`
 /// pins what they hash to so a renamed argument cannot pass unnoticed.
-///
-/// Grouped by contract because that is what the contract tab lists, and a
-/// registry is a separate address from the factory that deployed it.
-/// `RecordCategory` is a Solidity enum, so it crosses the ABI as `uint8`.
-const LOCAL: &[(&str, &[&str])] = &[
-    (
-        "solidity",
-        &["error Error(string message)", "error Panic(uint256 code)"],
-    ),
-    (
-        "registry_factory",
-        &[
-            "event RegistryDeployed(address indexed registry, address indexed creator, string name, string description, string metadata)",
-            "function deployRegistry(string name, string description, string metadata) external returns (address registry)",
-            "function owner() external view returns (address)",
-            "error EmptyName()",
-            "error OwnershipCannotBeRenounced()",
-        ],
-    ),
-    (
-        "registry",
-        &[
-            "event RecordAdded(bytes32 indexed checksumHash, uint256 index, string checksum, uint8 category, string dataPointer, address indexed author)",
-            "event RecordStatusUpdated(bytes32 indexed checksumHash, uint256 index, string status)",
-            "event RoleGranted(bytes32 indexed checksumHash, address indexed account, bytes32 role)",
-            "event RoleRevoked(bytes32 indexed checksumHash, address indexed account, bytes32 role)",
-            "function addRecord(string uri, string checksum, string checksumAlgo, string metadata, uint8 category, string dataPointer) external returns (bytes32 checksumHash, uint256 index)",
-            "function updateRecordStatus(string checksum, uint256 index, string status) external",
-            "function grantRole(string checksum, address account, bytes32 role) external",
-            "function revokeRole(string checksum, address account, bytes32 role) external",
-            "function hasRole(string checksum, address account, bytes32 role) external view returns (bool)",
-            "function recordRole(bytes32 checksumHash, bytes32 role) external pure returns (bytes32)",
-            // Leaves. Both take the precompile's own signatures, because the
-            // registry forwards the call as it came once it has checked the
-            // caller's role -- so what is logged is the precompile's event, not
-            // one of these, and it is declared with the precompile's ABI.
-            "function appendLeaf(bytes32 commitment, bytes metadata) external",
-            "struct Chunk { bytes32 root; uint8 height; }",
-            "function appendLeaves(Chunk[] chunks, bytes metadata) external",
-            "function mmrRoot() external view returns (bytes32)",
-            "function versionCount(bytes32 checksumHash) external view returns (uint256)",
-            "function factory() external view returns (address)",
-            "function owner() external view returns (address)",
-            "error EmptyChecksum()",
-            "error EmptyUri()",
-            "error RecordNotFound(bytes32 checksumHash, uint256 index)",
-            "error NoRecordForChecksum(bytes32 checksumHash)",
-            "error InvalidRole(bytes32 role)",
-            "error MissingRole(address account, bytes32 role)",
-            "error LastAdmin()",
-            "error Unauthorized()",
-        ],
-    ),
-    (
-        // One address for every registry: verifying is pure, and the root is the
-        // only input that differs.
-        "mmr_verifier",
-        &[
-            "function verify(bytes32 root, bytes32 commitment, uint256 index, bytes32[] siblings, bytes32[] peaks, uint256 count) external pure returns (bool)",
-            "error PeaksDoNotMatch(bytes32 root)",
-            "error ChunkNotAligned(uint256 count, uint256 height)",
-        ],
-    ),
-];
+const LOCAL: &[(&str, &[&str])] = &[(
+    "solidity",
+    &["error Error(string message)", "error Panic(uint256 code)"],
+)];
 
 /// Every Tempo precompile, from the chain's own `tempo-contracts` bindings.
 ///
@@ -165,17 +103,24 @@ fn tempo_contracts() -> Vec<(&'static str, JsonAbi)> {
             "current_committee",
             current_committee::ICurrentCommittee::abi::contract(),
         ),
-        ("anchoring", anchoring::IAnchoring::abi::contract()),
     ]
 }
 
-/// Contracts that are not Tempo's, so no binding carries them — deployed at
-/// canonical addresses and called constantly, and without these their calls
-/// decode to a bare selector. JSON under `abi/`.
+/// Contracts that are not Tempo's, so no binding carries them; without these their calls decode to
+/// a bare selector. The canonical deployments are vendored under `abi/`; anchoring and its module
+/// admin come from the nvnmchain-contracts submodule, so they cannot drift from what they decode.
 const VENDORED: &[(&str, &str)] = &[
     ("multicall3", include_str!("../abi/multicall3.json")),
     ("permit2", include_str!("../abi/permit2.json")),
     ("createx", include_str!("../abi/createx.json")),
+    (
+        "anchoring",
+        include_str!("../contracts/layout/anchoring.abi.json"),
+    ),
+    (
+        "module_admin",
+        include_str!("../contracts/layout/module-admin-multisig.abi.json"),
+    ),
 ];
 
 /// One parsed ABI and the name it was registered under.
@@ -746,12 +691,6 @@ pub fn revert_data_in(message: &str) -> Option<String> {
 pub const TRANSFER_SIGNATURE: &str = "Transfer(address,address,uint256)";
 pub const TRANSFER_WITH_MEMO_SIGNATURE: &str = "TransferWithMemo(address,address,uint256,bytes32)";
 pub const APPROVAL_SIGNATURE: &str = "Approval(address,address,uint256)";
-pub const LEAF_APPENDED_SIGNATURE: &str = "LeafAppended(address,uint256,bytes32,bytes32[],bytes)";
-pub const LEAVES_APPENDED_SIGNATURE: &str =
-    "LeavesAppended(address,uint256,uint256,(bytes32,uint8)[],bytes32[],bytes)";
-/// The factory announcing a registry.
-pub const REGISTRY_DEPLOYED_SIGNATURE: &str =
-    "RegistryDeployed(address,address,string,string,string)";
 
 /// `keccak256` of the signature beside it, in the lowercase `0x…` form the
 /// chain reports `topic0` in.
@@ -765,21 +704,6 @@ pub static TRANSFER_WITH_MEMO_TOPIC: LazyLock<String> =
     LazyLock::new(|| keccak_hex(TRANSFER_WITH_MEMO_SIGNATURE.as_bytes()));
 pub static APPROVAL_TOPIC: LazyLock<String> =
     LazyLock::new(|| keccak_hex(APPROVAL_SIGNATURE.as_bytes()));
-pub static LEAF_APPENDED_TOPIC: LazyLock<String> =
-    LazyLock::new(|| keccak_hex(LEAF_APPENDED_SIGNATURE.as_bytes()));
-pub static LEAVES_APPENDED_TOPIC: LazyLock<String> =
-    LazyLock::new(|| keccak_hex(LEAVES_APPENDED_SIGNATURE.as_bytes()));
-pub static REGISTRY_DEPLOYED_TOPIC: LazyLock<String> =
-    LazyLock::new(|| keccak_hex(REGISTRY_DEPLOYED_SIGNATURE.as_bytes()));
-
-/// Lowercase `0x…` form, so hex from the chain and hex we derive compare equal.
-pub fn normalize_hex(value: &str) -> String {
-    let value = value.trim();
-    format!(
-        "0x{}",
-        value.strip_prefix("0x").unwrap_or(value).to_lowercase()
-    )
-}
 
 /// Whether `addr` is 20 hex-encoded bytes — the shape, not the checksum.
 pub fn is_valid_address(addr: &str) -> bool {
@@ -1201,24 +1125,6 @@ mod tests {
         assert!(REGISTRY.error(&selector("Panic(uint256)")).is_some());
     }
 
-    /// The chain-local ABI is registered first so nothing upstream shadows it,
-    /// and each group answers under its own contract's name.
-    #[test]
-    fn local_abi_wins_its_selectors() {
-        let (contract, _) = REGISTRY
-            .event(&keccak256(
-                b"RegistryDeployed(address,address,string,string,string)",
-            ))
-            .expect("RegistryDeployed registered");
-        assert_eq!(contract, "registry_factory");
-        let (contract, _) = REGISTRY
-            .event(&keccak256(
-                b"RecordAdded(bytes32,uint256,string,uint8,string,address)",
-            ))
-            .expect("RecordAdded registered");
-        assert_eq!(contract, "registry");
-    }
-
     /// A declaration that does not parse registers nothing, which would show
     /// up only as calls quietly failing to decode. Counted per group, so a
     /// declaration lost to a typo cannot hide behind another group's total.
@@ -1229,20 +1135,13 @@ mod tests {
             let parsed = contract.functions().count()
                 + contract.events().count()
                 + contract.errors().count();
-            // A struct declares a type for the others to use, not a member of its own.
-            let declared = declarations
-                .iter()
-                .filter(|d| !d.starts_with("struct "))
-                .count();
-            assert_eq!(parsed, declared, "in `{name}`");
+            assert_eq!(parsed, declarations.len(), "in `{name}`");
         }
     }
 
     /// Parsing proves the declarations are well formed, not that they are the
-    /// right ones, so pin what they hash to. `Error`/`Panic` are the language's
-    /// own constants; the registry topics are `nvnmchain-anchoring`'s
-    /// `REGISTRY_TOPICS`, which that repo checks against the deployed contract.
-    /// Two readers of one log have to agree on what its rows are.
+    /// right ones, so pin what they hash to: `Error`/`Panic` are the language's
+    /// own constants.
     #[test]
     fn local_selectors_are_pinned() {
         for (signature, expected) in [
@@ -1252,60 +1151,8 @@ mod tests {
             let found = format!("0x{}", hex::encode(selector(signature)));
             assert_eq!(found, expected, "for {signature}");
         }
-        for (signature, expected) in [
-            (
-                "RegistryDeployed(address,address,string,string,string)",
-                "0xf4b5c87afebf8726b6bcc7e82c820be7557069b4f32a003e37772dd4d67cd576",
-            ),
-            (
-                "RecordAdded(bytes32,uint256,string,uint8,string,address)",
-                "0x0024919acb3ad6f0be467a901b1e780b3d21245c92d17015954313ee46a28005",
-            ),
-            (
-                "RecordStatusUpdated(bytes32,uint256,string)",
-                "0x7735f518b96096d1410ef5122b09bdb190e8d94e93e6896cbeff28f034ea883c",
-            ),
-            (
-                "RoleGranted(bytes32,address,bytes32)",
-                "0xd61bf855a7ed7c857a0c46025807cab964fad9226a03392763af3e0c57ea4ae2",
-            ),
-            (
-                "RoleRevoked(bytes32,address,bytes32)",
-                "0x3e24446ed0a47b5a935b76dac730872c525ce8eff3f3e5c159b83e0a7f0bd40d",
-            ),
-        ] {
-            let topic0 = keccak256(signature.as_bytes());
-            assert_eq!(
-                format!("0x{}", hex::encode(topic0)),
-                expected,
-                "for {signature}"
-            );
-            assert!(REGISTRY.event(&topic0).is_some(), "{signature} registered");
-        }
     }
 
-    /// The anchoring precompile is this chain's own, and it decodes through
-    /// the bindings now rather than a hand-written signature — with the
-    /// arguments the chain actually indexes.
-    #[test]
-    fn anchoring_decodes_through_the_bindings() {
-        // A registry forwards this call under the precompile's own signature,
-        // so both declare it and the selector is genuinely shared: whichever
-        // ABI answers, the decode is the same.
-        let (_, function) = REGISTRY
-            .function(&selector("appendLeaf(bytes32,bytes)"))
-            .expect("appendLeaf registered");
-        assert_eq!(function_signature(function), "appendLeaf(bytes32,bytes)");
-
-        // The namespace and the leaf index are indexed, so the decoder reads
-        // them from topics; getting that wrong would misplace every value.
-        let (contract, appended) = REGISTRY
-            .event(&keccak256(LEAF_APPENDED_SIGNATURE.as_bytes()))
-            .expect("LeafAppended registered");
-        assert_eq!(contract, "anchoring");
-        let indexed: Vec<bool> = appended.inputs.iter().map(|i| i.indexed).collect();
-        assert_eq!(indexed, [true, true, false, false, false]);
-    }
     use ethers_core::abi::encode as abi_encode;
 
     /// Deriving stops a topic being mistyped; pinning the values stops a
@@ -1324,18 +1171,6 @@ mod tests {
             (
                 &*APPROVAL_TOPIC,
                 "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925",
-            ),
-            (
-                &*LEAF_APPENDED_TOPIC,
-                "0x43a24f34ff55c61c25ca8f226ce1e940c9bc4ca4ef98253d9780a3cf29aa2262",
-            ),
-            (
-                &*LEAVES_APPENDED_TOPIC,
-                "0xa643a7916be4114a8d4f887b0606856c1f49b02a0a4374c775283987c1e12c2c",
-            ),
-            (
-                &*REGISTRY_DEPLOYED_TOPIC,
-                "0xf4b5c87afebf8726b6bcc7e82c820be7557069b4f32a003e37772dd4d67cd576",
             ),
         ] {
             assert_eq!(topic, expected);

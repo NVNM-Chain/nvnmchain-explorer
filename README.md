@@ -21,6 +21,7 @@ codebase is validated against. Point it anywhere with `NVNM_RPC` (the legacy
 ## Quick start
 
 ```bash
+git submodule update --init contracts   # the anchoring ABI is compiled in from it
 cargo run --release
 ```
 
@@ -139,9 +140,8 @@ The indexer is built for a sub-second chain:
 | `INDEX_CONCURRENCY` | `32` | Blocks fetched in parallel |
 | `NATIVE_SYMBOL` | `OM` | Symbol shown for native (burnt/gas) amounts |
 | `STATS_INTERVAL_SECONDS` | `5` | How often the dashboard stats are recomputed |
-| `ANCHORING_URL` | unset | Base URL of the app that decodes anchored payloads ([Anchoring](#anchoring)) |
-| `REGISTRY_FACTORY` | unset | `RegistryFactory` whose deployments label namespaces ([Anchoring](#anchoring)) |
 | `SIGNATURE_LOOKUP_URL` | OpenChain | Signature directory for selectors no built-in ABI declares; set empty to disable ([Decoding](#decoding)) |
+| `NAME_SEARCH_URL` | unset | nvnmchain-anchoring's registry name index, so the search box takes any part of a name |
 | `RUST_LOG` | `nvnmchain_explorer=info` | Log verbosity |
 
 ## Routes
@@ -155,9 +155,9 @@ The indexer is built for a sub-second chain:
 | `/address/{addr}` | Address info (transactions, transfers, holdings, contract) |
 | `/token/{addr}` | Token metadata, transfers, and holders |
 | `/tokens` | Token list |
-| `/anchoring` | Namespaces that have appended, plus the latest appends |
-| `/anchoring/{namespace}` | A namespace's tree, and the appends that built it |
-| `/anchoring/{namespace}/{index}` | One leaf: what it committed to, and the append that put it there |
+| `/anchoring` | Anchoring registries; `?q=` finds an id, an exact name or a checksum |
+| `/anchoring/{registry}` | A registry and the latest version of each record |
+| `/anchoring/{registry}/{record}` | A record's versions |
 | `/search?q=...` | Smart redirect (block#/tx/address/token auto-detection) |
 | `/api/search?q=...` | Suggestions for the search box, answered from the index |
 | `/api/events` | SSE live feed — pushes each newly indexed tip block (drives the home page's streaming "Latest Blocks" panel) |
@@ -180,9 +180,17 @@ rather than silently failing to decode. The few declarations with no binding
 are Solidity signatures at the top of `src/decoder.rs`: a typo there does not
 parse, and tests pin the selectors they hash to.
 
-Multicall3, Permit2 and CreateX are not Tempo's, so no binding carries them,
-but they sit at canonical addresses and are called constantly. Their ABIs
-are the JSON under `abi/`, compiled in.
+Multicall3, Permit2, CreateX and the anchoring contract at `0x…0a00` are not
+Tempo's, so no binding carries them. The first three are vendored JSON under
+`abi/`. Anchoring comes from the nvnmchain-contracts submodule at `contracts/`,
+which generates `layout/anchoring.abi.json` beside the bytecode Tempo's genesis
+uses, so the explorer cannot decode against an ABI the contract no longer has.
+
+The anchoring pages read that contract over RPC, not the index: the corpus it
+was seeded with at genesis emitted no events. So does the search box, for a whole
+registry name or a record's checksum — all the contract matches. Any part of a name
+matches only in nvnmchain-anchoring's index: set `NAME_SEARCH_URL` and the box takes it
+from there, at a request per keystroke.
 
 Each decoded log is also said in words, from the phrasing table in
 `src/summary.rs`, and the transaction page leads with that sentence. Two tests
@@ -194,36 +202,6 @@ A selector nothing declares is looked up once in a public signature directory
 when it hashes to the selector it was offered for, and is badged as the
 stranger's name it is. Set `SIGNATURE_LOOKUP_URL=` (empty) and the explorer
 talks to no third party.
-
-### Anchoring
-
-The precompile keeps one Merkle Mountain Range per caller, never the payloads.
-So these pages show the log that built each tree: which leaves arrived, under
-whom, in what order, and the root each append left. The nav entry appears once
-the chain has appended something; the routes answer either way.
-
-A leaf never moves, so an index has one append and one payload, for good. A
-batch is one row over the span it added and carries no commitment of its own,
-since its leaves reach the chain as the roots of subtrees.
-
-What a payload *means* belongs to the application that wrote it. Set
-`ANCHORING_URL` to whatever reads those envelopes — for the registry ones,
-[nvnmchain-anchoring](https://github.com/mmsqe/nvnmchain-anchoring) `serve` —
-and a registry's pages link out to its `records` and `roles` there. Only a
-namespace the factory announced gets the link, since anyone may append under
-their own address and the decoder 404s for one it has no registry for.
-
-Set `REGISTRY_FACTORY` to the deployed `RegistryFactory` to label the namespaces
-it deployed with their registry name. Deployments are indexed either way, so
-setting it later needs no re-sync; unset, nothing is trusted as a registry.
-
-One `Registry` is deployed per registry — the precompile partitions by caller,
-so the address *is* the namespace — at an address no table could hold in
-advance. `RegistryDeployed` is what says which addresses are registries, so
-their pages show the `Registry` interface and the factory's shows its own.
-A registry's log decodes here too: records restate what `LeafAppended` already
-carries, and `RoleGranted`/`RoleRevoked` are the whole record of a role, which
-is never a leaf.
 
 ## Indexer
 
@@ -258,7 +236,8 @@ cargo test --test live_rpc
 `tests/pages.rs` boots the HTTP API over a temp SQLite database and renders the
 real templates, so a context key a handler stops sending fails a test rather
 than a page view. Nothing in it reaches the network: the RPC points at a closed
-port and the signature directory is stubbed.
+port and the signature directory is stubbed. `tests/anchoring.rs` does the same
+over a stub node that answers like the anchoring contract.
 
 The live tests hit the RPC: they assert the chain id, fetch and index recent
 blocks into a temp SQLite DB, and boot the HTTP API to verify the JSON
@@ -278,12 +257,14 @@ src/
   summary.rs    what a transaction did, in a sentence
   memo.rs       TIP-20 transfer memos
   signatures.rs names for selectors no built-in ABI declares
+  name_search.rs  registry names from nvnmchain-anchoring, when one is configured
   tempo_address.rs  TIP-1022 virtual addresses
   contracts.rs  precompile / token labels
+  anchoring.rs  the anchoring contract's views
   tokens.rs     token metadata + formatting
   indexer.rs    background indexing
   web.rs        axum routes + template helpers
-abi/            ABIs for contracts that are not Tempo's
+abi/            ABIs for contracts no Tempo binding carries
 templates/      Tera templates
 tests/          unit + page tests, and live RPC integration tests
 ```

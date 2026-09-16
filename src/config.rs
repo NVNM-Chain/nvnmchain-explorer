@@ -26,14 +26,6 @@ pub struct Settings {
     pub batch_size: u64,
     /// Max blocks fetched in parallel by the indexer.
     pub index_concurrency: usize,
-    /// The anchoring indexer's UI, when one is deployed. A leaf's payload means
-    /// something to an application, not to a chain explorer, so the pages link
-    /// out rather than decoding envelopes here.
-    pub anchoring_url: Option<String>,
-    /// The RegistryFactory whose deployments label namespaces as registries.
-    /// Unset, namespaces stay bare addresses — deployments are still indexed,
-    /// only unlabelled, so setting this later needs no re-sync.
-    pub registry_factory: Option<String>,
     /// Symbol shown for the native gas/currency token.
     pub native_symbol: String,
     /// Seconds between background recomputes of the home-page stats blob.
@@ -42,6 +34,8 @@ pub struct Settings {
     /// Answers are cached in the database, misses included. `None` disables it
     /// — the explorer then never talks to a third party.
     pub signature_lookup_url: Option<String>,
+    /// nvnmchain-anchoring's registry name index, which is what matches half a name.
+    pub name_search_url: Option<String>,
 }
 
 /// OpenChain's signature directory, queried at most once per selector per
@@ -84,23 +78,6 @@ fn env_f64(key: &str, default: f64) -> f64 {
         .unwrap_or(default)
 }
 
-/// The configured RegistryFactory, normalised to the form the stored rows use.
-/// Anything that is not an address is refused loudly: it would otherwise store
-/// as bytes matching nothing, and the operator would see an explorer that runs
-/// perfectly while labelling nothing.
-fn registry_factory() -> Option<String> {
-    let raw = env::var("REGISTRY_FACTORY").ok()?;
-    let addr = raw.trim();
-    if addr.is_empty() {
-        return None;
-    }
-    if !crate::decoder::is_valid_address(addr) {
-        tracing::warn!("REGISTRY_FACTORY {addr:?} is not an address; registries stay unlabelled");
-        return None;
-    }
-    Some(crate::decoder::checksum_address(addr))
-}
-
 impl Settings {
     pub fn from_env() -> Self {
         Self {
@@ -118,19 +95,24 @@ impl Settings {
             poll_seconds: env_f64("INDEX_POLL_SECONDS", 1.0),
             batch_size: env_u64("INDEX_BATCH", 32),
             index_concurrency: env_usize("INDEX_CONCURRENCY", 32),
-            anchoring_url: env::var("ANCHORING_URL")
-                .ok()
-                .filter(|url| !url.trim().is_empty()),
-            registry_factory: registry_factory(),
             native_symbol: env_or("NATIVE_SYMBOL", "NVNM"),
             stats_interval_seconds: env_f64("STATS_INTERVAL_SECONDS", 5.0),
             signature_lookup_url: signature_lookup_url(),
+            name_search_url: trimmed("NAME_SEARCH_URL"),
         }
     }
 }
 
 /// The signature directory to consult, or `None` when the operator has turned
 /// the lookup off with an empty `SIGNATURE_LOOKUP_URL`.
+/// An optional URL from the environment: unset or blank is `None`.
+fn trimmed(key: &str) -> Option<String> {
+    env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 fn signature_lookup_url() -> Option<String> {
     match env::var("SIGNATURE_LOOKUP_URL") {
         Ok(url) if url.trim().is_empty() => None,

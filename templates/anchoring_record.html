@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% import "_macros.html" as ui %}
+{% block title %}Record {{ latest.registryId }}/{{ latest.recordId }} – nvnmchain Explorer{% endblock %}
+{% block content %}
+
+<div class="mb-6">
+    <div class="text-xs text-faint mb-1">
+        <a href="/anchoring" class="hover:text-blue-300">Anchoring</a>
+        <span class="mx-1">/</span>
+        <a href="/anchoring/{{ latest.registryId }}" class="hover:text-blue-300">Registry #{{ latest.registryId }}</a>
+        <span class="mx-1">/</span>
+        <span>Record</span>
+    </div>
+    <div class="flex items-center gap-3 flex-wrap">
+        <h1 class="text-2xl font-extrabold tracking-tight">Record #{{ latest.recordId }}</h1>
+        <span class="badge">{{ latest.status }}</span>
+        <span class="badge badge-info">{{ latest.index }} versions</span>
+    </div>
+</div>
+
+<div class="card mb-6">
+    <div class="card-body space-y-3.5">
+        <div class="kv-row">
+            <div class="kv-label">Checksum</div>
+            <div class="kv-value mono text-xs">{{ latest.checksum }} {{ ui::copy(text=latest.checksum, label="Copy checksum") }}</div>
+        </div>
+        <div class="kv-row">
+            <div class="kv-label">Algorithm</div>
+            <div class="kv-value">{{ latest.checksumAlgo | fallback(value="—") }}</div>
+        </div>
+    </div>
+</div>
+
+<h2 class="section-title mb-2">Versions</h2>
+<div class="card overflow-x-auto">
+    <div class="min-w-[760px]">
+        <div class="flex table-header">
+            <div class="w-20 px-3">Version</div>
+            <div class="flex-1 px-3">URI · metadata</div>
+            <div class="w-28 px-3">Status</div>
+            <div class="w-56 px-3 text-right">Anchored</div>
+        </div>
+        {% for version in versions %}
+        <div class="t-row flex text-xs items-center">
+            <div class="w-20 px-3 py-3 mono">v{{ version.index }}{% if version.isLatest %} <span class="badge badge-success">latest</span>{% endif %}</div>
+            <div class="flex-1 px-3 py-3 min-w-0">
+                <span class="block truncate" title="{{ version.uri }}">{{ version.uri | fallback(value="—") }}</span>
+                {% if version.metadata %}<span class="block truncate mono text-faint" title="{{ version.metadata }}">{{ version.metadata }}</span>{% endif %}
+            </div>
+            <div class="w-28 px-3 py-3"><span class="badge">{{ version.status }}</span></div>
+            <div class="w-56 px-3 py-3 text-right text-faint">{{ version.timestamp }}</div>
+        </div>
+        {% endfor %}
+    </div>
+</div>
+
+{{ ui::pager(page=page, total_pages=total_pages) }}
+
+{% endblock %}

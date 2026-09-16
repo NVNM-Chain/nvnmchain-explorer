@@ -66,15 +66,6 @@ enum Slot {
     Hex(&'static str),
     /// A `bytes32` role, by name when it is one of the known ones.
     Role(&'static str),
-    /// A registry role's scope: the whole registry, or one record.
-    Scope(&'static str),
-    /// A span of leaves, `#first–last`, from a first index and the count after it.
-    Span {
-        first: &'static str,
-        count: &'static str,
-    },
-    /// A `RecordCategory`, which crosses the ABI as its `uint8` ordinal.
-    Category(&'static str),
 }
 
 /// How one event reads. `action` opens the sentence and names a failure
@@ -809,83 +800,80 @@ static PHRASES: &[Phrase] = &[
         &[Slot::Word("in word"), Slot::Value("word")],
     )
     .notes(&[("Owner", Slot::Account("owner"))]),
-    // ---- Chain-local ------------------------------------------------------
+    // ---- Anchoring (0x…0a00) ----------------------------------------------
     phrase(
-        "LeafAppended(address,uint256,bytes32,bytes32[],bytes)",
-        "leaf appended",
-        "Append Leaf",
-        &[Slot::Hex("commitment"), Slot::Word("as leaf"), Slot::Value("index")],
-    )
-    .notes(&[("Namespace", Slot::Account("namespace"))]),
-    // A batch's rows never reach the chain one at a time, so where the leaf
-    // above names what it committed to, this can only say how many arrived.
-    phrase(
-        "LeavesAppended(address,uint256,uint256,(bytes32,uint8)[],bytes32[],bytes)",
-        "leaves appended",
-        "Append Leaves",
-        &[Slot::Span {
-            first: "firstLeaf",
-            count: "count",
-        }],
-    )
-    .notes(&[("Namespace", Slot::Account("namespace"))]),
-    phrase(
-        "RegistryDeployed(address,address,string,string,string)",
-        "registry deployed",
-        "Deploy Registry",
+        "AddRegistry(address,uint64,string)",
+        "registry added",
+        "Add Registry",
         &[Slot::Value("name")],
     )
-    .notes(&[
-            ("Registry", Slot::Account("registry")),
-            ("Creator", Slot::Account("creator")),
-        ]),
-    // A registry's own log. Records read as `LeafAppended` above too, in the
-    // precompile's terms; roles read nowhere else, since they are not leaves.
+    .notes(&[("Registry", Slot::Value("registryId"))]),
     phrase(
-        "RecordAdded(bytes32,uint256,string,uint8,string,address)",
+        "AddRecord(address,uint64,uint64,uint64,string)",
         "record added",
         "Add Record",
         &[
             Slot::Word("version"),
             Slot::Value("index"),
             Slot::Word("of"),
-            Slot::Hex("checksum"),
+            Slot::Value("checksum"),
         ],
     )
     .notes(&[
-        ("Category", Slot::Category("category")),
-        ("Data pointer", Slot::Value("dataPointer")),
-        ("Author", Slot::Account("author")),
+        ("Registry", Slot::Value("registryId")),
+        ("Record", Slot::Value("recordId")),
     ]),
     phrase(
-        "RecordStatusUpdated(bytes32,uint256,string)",
+        "UpdateRecordStatus(address,uint64,uint64,uint64,string)",
         "record status updated",
         "Update Record Status",
         &[Slot::Value("status"), Slot::Word("on version"), Slot::Value("index")],
     )
-    .notes(&[("Record", Slot::Hex("checksumHash"))]),
+    .notes(&[
+        ("Registry", Slot::Value("registryId")),
+        ("Record", Slot::Value("recordId")),
+    ]),
     phrase(
-        "RoleGranted(bytes32,address,bytes32)",
+        "GrantRole(address,uint64,string,address,string)",
         "role granted",
         "Grant Role",
-        &[
-            Slot::Role("role"),
-            Slot::Word("to"),
-            Slot::Account("account"),
-        ],
+        &[Slot::Value("role"), Slot::Word("to"), Slot::Account("account")],
     )
-    .notes(&[("Scope", Slot::Scope("checksumHash"))]),
+    .notes(&[
+        ("Registry", Slot::Value("registryId")),
+        ("Record", Slot::Value("checksum")),
+    ]),
     phrase(
-        "RoleRevoked(bytes32,address,bytes32)",
+        "RevokeRole(address,uint64,string,address,string)",
         "role revoked",
         "Revoke Role",
-        &[
-            Slot::Role("role"),
-            Slot::Word("from"),
-            Slot::Account("account"),
-        ],
+        &[Slot::Value("role"), Slot::Word("from"), Slot::Account("account")],
     )
-    .notes(&[("Scope", Slot::Scope("checksumHash"))]),
+    .notes(&[
+        ("Registry", Slot::Value("registryId")),
+        ("Record", Slot::Value("checksum")),
+    ]),
+    // The module admin multisig: a call to the anchoring contract proposed by one owner,
+    // confirmed by another, and run once the second confirmation lands.
+    phrase(
+        "Proposed(uint256,address,bytes)",
+        "proposal made",
+        "Propose",
+        &[Slot::Word("by"), Slot::Account("owner")],
+    )
+    .notes(&[("Proposal", Slot::Value("id"))]),
+    phrase(
+        "Confirmed(uint256,address,uint8)",
+        "proposal confirmed",
+        "Confirm",
+        &[Slot::Word("by"), Slot::Account("owner")],
+    )
+    .notes(&[
+        ("Proposal", Slot::Value("id")),
+        ("Confirmations", Slot::Value("confirmations")),
+    ]),
+    phrase("Executed(uint256,bytes)", "proposal executed", "Execute", &[])
+        .notes(&[("Proposal", Slot::Value("id"))]),
 ];
 
 // ---------------------------------------------------------------------------
@@ -902,43 +890,14 @@ const KNOWN_ROLES: &[&str] = &[
 ];
 
 /// What a `bytes32` role says it is. TIP-20 hashes its role names, so a word is
-/// matched against the ones this explorer knows; a registry role *is* its name
-/// (`bytes32 constant ROLE_ADMIN = "admin"`), so the word carries it.
+/// matched against the ones this explorer knows.
 fn role_name(word: &str) -> Option<String> {
     let hashed = word.to_lowercase();
     KNOWN_ROLES
         .iter()
         .find(|role| keccak_hex(role.as_bytes()) == hashed)
         .map(|role| (*role).to_string())
-        .or_else(|| short_string(word))
 }
-
-/// A `bytes32` holding a right-padded ASCII literal, the way Solidity encodes a
-/// `bytes32` constant written as a string. The text has to be the whole non-zero
-/// prefix and printable throughout, or a hash whose tail happens to be zeroes
-/// would read as mojibake.
-fn short_string(word: &str) -> Option<String> {
-    let word = word.trim();
-    let raw = hex::decode(word.strip_prefix("0x").unwrap_or(word))
-        .ok()
-        .filter(|raw| raw.len() == 32)?;
-    let (text, padding) = raw.split_at(raw.iter().position(|b| *b == 0).unwrap_or(raw.len()));
-    (!text.is_empty()
-        && padding.iter().all(|b| *b == 0)
-        && text.iter().all(|b| b.is_ascii_graphic() || *b == b' '))
-    .then(|| String::from_utf8_lossy(text).into_owned())
-}
-
-/// The `RecordCategory` ordinals, which reach the log as a bare `uint8`. An
-/// unknown one means the contract gained a variant, and the number stands until
-/// this list catches up.
-const RECORD_CATEGORIES: &[&str] = &[
-    "Unspecified",
-    "Private markets diligence",
-    "Regulated bank underwriting",
-    "Multi-party clinical trials",
-    "Agentic AI",
-];
 
 // ---------------------------------------------------------------------------
 // Known events
@@ -1014,30 +973,6 @@ fn render_slot(slot: &Slot, event: &DecodedEvent, tokens: &Tokens) -> Option<Str
         Slot::Role(name) => {
             let word = event.param(name)?;
             role_name(word).unwrap_or_else(|| truncate(word))
-        }
-        Slot::Scope(name) => {
-            let word = event.param(name)?;
-            // A registry-scoped role is announced under an empty checksum's hash.
-            if word.to_lowercase() == keccak_hex(b"") {
-                "the whole registry".to_string()
-            } else {
-                format!("record {}", truncate(word))
-            }
-        }
-        Slot::Category(name) => {
-            let ordinal = event.param(name)?;
-            ordinal
-                .parse::<usize>()
-                .ok()
-                .and_then(|i| RECORD_CATEGORIES.get(i))
-                .map_or_else(|| ordinal.to_string(), |category| (*category).to_string())
-        }
-        Slot::Span { first, count } => {
-            let first = event.param(first)?;
-            match (first.parse::<u64>(), event.param(count)?.parse::<u64>()) {
-                (Ok(from), Ok(to)) if to > from + 1 => format!("#{from}–{}", to - 1),
-                _ => format!("#{first}"),
-            }
         }
     })
 }
@@ -1447,7 +1382,6 @@ mod tests {
     use super::*;
     use crate::decoder::decode_event;
     use crate::decoder::{event_signature, REGISTRY};
-    use ethers_core::abi::Token as EthersToken;
     use serde_json::json;
 
     fn token_map() -> Tokens {
@@ -1483,157 +1417,6 @@ mod tests {
     fn say(log: &serde_json::Value, sender: Option<&str>) -> KnownEvent {
         let decoded = decode_event(log).expect("decoded");
         known_event(&decoded, 0, &token_map(), sender).expect("phrased")
-    }
-
-    /// A `bytes32` holding a Solidity string literal, right-padded as the
-    /// compiler lays one out.
-    fn word_of(text: &str) -> Vec<u8> {
-        let mut word = vec![0u8; 32];
-        word[..text.len()].copy_from_slice(text.as_bytes());
-        word
-    }
-
-    /// A registry's log, in the shape a receipt carries it: `signature` names
-    /// the event, `topics` are its indexed arguments, `data` the rest.
-    fn registry_log(signature: &str, topics: &[String], data: &[EthersToken]) -> serde_json::Value {
-        let mut all = vec![keccak_hex(signature.as_bytes())];
-        all.extend(topics.iter().cloned());
-        json!({
-            "address": "0x4444444444444444444444444444444444444444",
-            "topics": all,
-            "data": format!("0x{}", hex::encode(ethers_core::abi::encode(data))),
-            "logIndex": "0x0",
-        })
-    }
-
-    /// The same, emitted by the anchoring precompile rather than a registry.
-    fn precompile_log(
-        signature: &str,
-        topics: &[String],
-        data: &[EthersToken],
-    ) -> serde_json::Value {
-        let mut log = registry_log(signature, topics, data);
-        log["address"] = json!(crate::anchoring::ANCHORING_ADDRESS);
-        log
-    }
-
-    /// One `RoleGranted`/`RoleRevoked`, said in words.
-    fn role_event(signature: &str, scope: &str, role: &str) -> KnownEvent {
-        let account = "0x2222222222222222222222222222222222222222";
-        say(
-            &registry_log(
-                signature,
-                &[keccak_hex(scope.as_bytes()), topic(account)],
-                &[EthersToken::FixedBytes(word_of(role))],
-            ),
-            None,
-        )
-    }
-
-    /// A record version says which version of what, and the classification the
-    /// contract takes as an enum reaches the log as a bare ordinal.
-    #[test]
-    fn a_record_version_names_its_category_and_author() {
-        let checksum = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-        let author = "0x1111111111111111111111111111111111111111";
-        let event = say(
-            &registry_log(
-                "RecordAdded(bytes32,uint256,string,uint8,string,address)",
-                &[keccak_hex(checksum.as_bytes()), topic(author)],
-                &[
-                    EthersToken::Uint(2.into()),
-                    EthersToken::String(checksum.into()),
-                    EthersToken::Uint(1.into()),
-                    EthersToken::String("ipfs://bafy".into()),
-                ],
-            ),
-            None,
-        );
-        assert_eq!(event.kind, "record added");
-        assert_eq!(event.headline, "Add Record version 2 of e3b0c4…b855");
-        assert_eq!(
-            event.details,
-            vec![
-                ("Category".into(), "Private markets diligence".into()),
-                ("Data pointer".into(), "ipfs://bafy".into()),
-                ("Author".into(), "0x1111…1111".into()),
-            ]
-        );
-    }
-
-    /// Where a batch of leaves starts is indexed and how many is not, so the
-    /// headline is read from both a topic and the data.
-    #[test]
-    fn a_batch_of_leaves_says_how_many_and_where_they_start() {
-        // The precompile's, not a registry's: a batch's rows never reach the
-        // chain one at a time, so the count and the span are all it can say.
-        let namespace = format!("0x{}", "a1".repeat(20));
-        let event = say(
-            &precompile_log(
-                "LeavesAppended(address,uint256,uint256,(bytes32,uint8)[],bytes32[],bytes)",
-                &[
-                    format!(
-                        "0x{}{}",
-                        "00".repeat(12),
-                        namespace.trim_start_matches("0x")
-                    ),
-                    format!("0x{:064x}", 0),
-                ],
-                &[
-                    EthersToken::Uint(1013.into()),
-                    EthersToken::Array(vec![]), // chunks
-                    EthersToken::Array(vec![]), // peaks
-                    EthersToken::Bytes(vec![]),
-                ],
-            ),
-            None,
-        );
-        assert_eq!(event.kind, "leaves appended");
-        assert_eq!(event.headline, "Append Leaves #0–1012");
-        assert_eq!(
-            event.details,
-            vec![("Namespace".into(), "0xA1A1…a1a1".into())]
-        );
-    }
-
-    /// A registry role *is* its name, and `keccak256("")` is the scope meaning
-    /// the whole registry rather than one record.
-    #[test]
-    fn a_registry_role_reads_by_name_and_scope() {
-        let granted = role_event("RoleGranted(bytes32,address,bytes32)", "", "admin");
-        assert_eq!(granted.headline, "Grant Role admin to 0x2222…2222");
-        assert_eq!(
-            granted.details,
-            vec![("Scope".into(), "the whole registry".into())]
-        );
-
-        let revoked = role_event(
-            "RoleRevoked(bytes32,address,bytes32)",
-            "sha256:ab",
-            "editor",
-        );
-        assert_eq!(revoked.headline, "Revoke Role editor from 0x2222…2222");
-        let (label, scope) = &revoked.details[0];
-        assert_eq!(label, "Scope");
-        assert!(scope.starts_with("record 0x"), "{scope}");
-    }
-
-    /// Only a whole printable prefix followed by nothing but padding is a
-    /// literal — a hash that happens to end in a zero byte is not.
-    #[test]
-    fn only_a_padded_literal_reads_as_one() {
-        let hexed = |word: &[u8]| format!("0x{}", hex::encode(word));
-        assert_eq!(
-            short_string(&hexed(&word_of("admin"))).as_deref(),
-            Some("admin")
-        );
-        assert_eq!(short_string(&keccak_hex(b"")), None);
-        assert_eq!(short_string(&hexed(&[0u8; 32])), None);
-        // Printable, padded — but the padding is not at the end.
-        let mut word = [0x41u8; 32];
-        word[4] = 0;
-        assert_eq!(short_string(&hexed(&word)), None);
-        assert_eq!(short_string("0xdeadbeef"), None);
     }
 
     /// The headline sentence the whole feature exists for.

@@ -22,7 +22,7 @@ use tera::Tera;
 use tokio::sync::{broadcast, watch};
 use tower_http::cors::CorsLayer;
 
-use crate::anchoring::{decode_envelope, envelope_kind, is_self_verifying};
+use crate::anchoring;
 use crate::config::Settings;
 use crate::contracts::{
     abis_for_address, get_contract_name, get_precompile_name, identify_address, is_contract,
@@ -34,6 +34,7 @@ use crate::decoder::{
     event_signature, extract_balance_changes, extract_calls, flatten_trace, function_signature,
     keccak_hex, revert_data_in, DecodedEvent, REGISTRY,
 };
+use crate::name_search;
 use crate::rpc::ChainRpc;
 use crate::signatures;
 use crate::summary::{build_summary, known_events, Failure, TokenDisplay, Tokens};
@@ -128,11 +129,8 @@ fn page_ctx_for(
         serde_json::to_value(latest_block).unwrap_or(Value::Null),
     );
     map.insert("native_symbol".into(), json!(state.cfg.native_symbol));
-    map.insert("anchoring_url".into(), json!(state.cfg.anchoring_url));
     // The search box echoes it; only the search page has one to echo.
     map.insert("query".into(), json!(""));
-    // From the stats blob, so the nav's anchoring gate costs no query.
-    map.insert("has_anchors".into(), json!(has_anchors(state)));
     merge_into(&mut map, extra);
     Value::Object(map)
 }
@@ -145,19 +143,6 @@ fn merge_into(map: &mut serde_json::Map<String, Value>, extra: Value) {
             map.insert(k, v);
         }
     }
-}
-
-/// Whether the chain has ever anchored, which is all the nav needs to know.
-/// Read from the stats blob rather than the database — this runs on every
-/// render — so the tab can lag the first anchor by one stats tick.
-fn has_anchors(state: &AppState) -> bool {
-    state
-        .stats
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .get("has_anchors")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
 }
 
 /// The keys a transaction row draws, for the listings that share its markup.
@@ -357,38 +342,12 @@ async fn contract_code(state: &AppState, address: &str) -> Value {
     })
 }
 
-/// The configured factory's registry at `address`, if that is what it is.
-/// With no factory configured, nothing is.
-fn registry_of(state: &AppState, address: &str) -> Option<Value> {
-    let factory = state.cfg.registry_factory.as_deref()?;
-    db::get_registry(&state.db, factory, address)
-}
-
-/// The registry ABIs, when this address is a registry or the factory that
-/// deployed it. A registry is an ordinary deployment, so no table of canonical
-/// addresses can name it: `RegistryDeployed` says which addresses are
-/// registries, and `REGISTRY_FACTORY` whose word to take for it.
-fn registry_abis(state: &AppState, address: &str) -> &'static [&'static str] {
-    let factory = state.cfg.registry_factory.as_deref();
-    if factory.is_some_and(|factory| address.eq_ignore_ascii_case(factory)) {
-        &["registry_factory"]
-    } else if registry_of(state, address).is_some() {
-        &["registry"]
-    } else {
-        &[]
-    }
-}
-
 /// What an address exposes: the ABIs the explorer knows for it, split into
 /// reads and writes, plus its events. Empty for an unknown address.
-fn contract_interface(state: &AppState, address: &str) -> Value {
-    let names: Vec<&'static str> = abis_for_address(address)
-        .iter()
-        .chain(registry_abis(state, address))
-        .copied()
-        .collect();
+fn contract_interface(address: &str) -> Value {
+    let names = abis_for_address(address);
     let (mut reads, mut writes, mut events) = (Vec::new(), Vec::new(), Vec::new());
-    for name in &names {
+    for name in names {
         let Some(contract) = REGISTRY.contract(name) else {
             continue;
         };
@@ -1519,17 +1478,13 @@ pub async fn address_page(
     // The Contract tab: the interface the explorer knows, the TIP-20 metadata
     // when there is any, and the deployed bytecode. Only the code costs an RPC
     // round trip, and only when that tab is open.
-    let interface = contract_interface(&state, &checksummed);
+    let interface = contract_interface(&checksummed);
     let has_interface = interface["abis"].as_array().is_some_and(|a| !a.is_empty());
 
     let addr_info = identify_address(&checksummed);
     let is_token_addr = db::get_token_metadata(&state.db, &checksummed).is_some()
         || crate::contracts::is_tip20_token(&checksummed);
-    // Knowing an interface for an address is knowing it is a contract — the
-    // only thing that says so for a registry, which is in no table of addresses.
-    let kind = if addr_info.kind == "eoa"
-        && (is_contract(&checksummed) || is_token_addr || has_interface)
-    {
+    let kind = if addr_info.kind == "eoa" && (is_contract(&checksummed) || is_token_addr) {
         "contract"
     } else {
         addr_info.kind.as_str()
@@ -1686,8 +1641,132 @@ pub async fn tokens_page(
 // Anchoring
 // ---------------------------------------------------------------------------
 
-/// An address-shaped path segment that is not an address — a namespace, a
-/// token, an account — said the way the client asked to hear it.
+/// The anchoring contract's registries, newest first; or, given `q`, the registries with that
+/// exact name and the records with that checksum. A browser asking for an id is sent to it.
+pub async fn anchoring_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let q = query.get("q").map_or("", |q| q.trim());
+    if !q.is_empty() && q.chars().all(|c| c.is_ascii_digit()) && !wants_json(&headers, &query) {
+        return Redirect::to(&format!("/anchoring/{q}")).into_response();
+    }
+    let page = page_param(&query);
+    let found = if q.is_empty() {
+        anchoring::registries(&state.rpc, page.into(), PER_PAGE.into())
+            .await
+            .map(|(registries, total)| {
+                json!({
+                    "registries": registries,
+                    "total": total,
+                    "page": page,
+                    "total_pages": total_pages(total as i64, PER_PAGE),
+                })
+            })
+    } else {
+        anchoring::lookup(&state.rpc, q)
+            .await
+            .map(|(named, records)| json!({"registries": named, "records": records}))
+    };
+    match found {
+        Ok(mut extra) => {
+            extra["address"] = json!(anchoring::ADDRESS);
+            extra["q"] = json!(q);
+            let ctx = page_ctx(&state, extra);
+            html_or_json(&state, &headers, &query, "anchoring.html", &ctx)
+        }
+        Err(e) => node_failed(&state, &headers, &query, e),
+    }
+}
+
+/// One registry, and the latest version of each of its records, newest first.
+pub async fn anchoring_registry_page(
+    State(state): State<AppState>,
+    Path(registry_id): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let Ok(id) = registry_id.parse::<u64>() else {
+        return not_found(&state, &headers, &query, "Registry", &registry_id);
+    };
+    let page = page_param(&query);
+    match anchoring::registry(&state.rpc, id, page.into(), PER_PAGE.into()).await {
+        Ok(Some((registry, records, total))) => {
+            let ctx = page_ctx(
+                &state,
+                json!({
+                    "registry": registry,
+                    "records": records,
+                    "total": total,
+                    "page": page,
+                    "total_pages": total_pages(total as i64, PER_PAGE),
+                }),
+            );
+            html_or_json(&state, &headers, &query, "anchoring_registry.html", &ctx)
+        }
+        Ok(None) => not_found(&state, &headers, &query, "Registry", &registry_id),
+        Err(e) => node_failed(&state, &headers, &query, e),
+    }
+}
+
+/// One record: its latest version, and every version newest first.
+pub async fn anchoring_record_page(
+    State(state): State<AppState>,
+    Path((registry_id, record_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let id = format!("{registry_id}/{record_id}");
+    let (Ok(registry_id), Ok(record_id)) = (registry_id.parse::<u64>(), record_id.parse::<u64>())
+    else {
+        return not_found(&state, &headers, &query, "Record", &id);
+    };
+    let page = page_param(&query);
+    match anchoring::record(
+        &state.rpc,
+        registry_id,
+        record_id,
+        page.into(),
+        PER_PAGE.into(),
+    )
+    .await
+    {
+        Ok(Some((latest, versions))) => {
+            let ctx = page_ctx(
+                &state,
+                json!({
+                    "latest": latest,
+                    "versions": versions,
+                    "page": page,
+                    "total_pages": total_pages(latest.index as i64, PER_PAGE),
+                }),
+            );
+            html_or_json(&state, &headers, &query, "anchoring_record.html", &ctx)
+        }
+        Ok(None) => not_found(&state, &headers, &query, "Record", &id),
+        Err(e) => node_failed(&state, &headers, &query, e),
+    }
+}
+
+/// A page the node answers rather than the index, when the node did not.
+fn node_failed(
+    state: &AppState,
+    headers: &HeaderMap,
+    query: &HashMap<String, String>,
+    err: anyhow::Error,
+) -> Response {
+    tracing::warn!("anchoring read failed: {err:#}");
+    let page = if wants_json(headers, query) {
+        Json(json!({"error": format!("{err:#}")})).into_response()
+    } else {
+        render_html(&state.tera, "500.html", &page_ctx(state, json!({})))
+    };
+    (StatusCode::BAD_GATEWAY, page).into_response()
+}
+
+/// An address-shaped path segment that is not an address — a token, an
+/// account — said the way the client asked to hear it.
 fn invalid_address(
     state: &AppState,
     headers: &HeaderMap,
@@ -1704,132 +1783,6 @@ fn invalid_address(
     } else {
         not_found_html(state, kind, address, "Invalid address")
     }
-}
-
-/// Namespaces that have anchored something, plus the latest commitments
-/// chain-wide.
-pub async fn anchoring_page(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<HashMap<String, String>>,
-) -> Response {
-    let page = page_param(&query);
-    // Commitments head the page, namespaces fill the table — one row each.
-    let (namespace_count, total) = db::count_anchored_summary(&state.db);
-    // The panel is the same on every page; only the first one shows it.
-    let recent = if page == 1 {
-        db::get_recent_anchored(&state.db, 10)
-    } else {
-        Vec::new()
-    };
-    let ctx = page_ctx(
-        &state,
-        json!({
-            "namespaces": db::get_anchored_namespaces(&state.db, state.cfg.registry_factory.as_deref(), page, PER_PAGE),
-            "recent": recent,
-            "total": total,
-            "page": page,
-            "total_pages": total_pages(namespace_count, PER_PAGE),
-        }),
-    );
-    html_or_json(&state, &headers, &query, "anchoring.html", &ctx)
-}
-
-/// One namespace's appends, newest first, over the tree they built.
-pub async fn anchoring_namespace_page(
-    State(state): State<AppState>,
-    Path(namespace): Path<String>,
-    headers: HeaderMap,
-    Query(query): Query<HashMap<String, String>>,
-) -> Response {
-    let checksummed = checksum_address(&namespace);
-    if !is_valid_address(&checksummed) {
-        return invalid_address(&state, &headers, &query, "Namespace", &namespace);
-    }
-    let namespace = checksummed;
-    let page = page_param(&query);
-    // Each row's envelope tag, read off its first word: a record leaf reads apart from a
-    // status leaf without decoding either.
-    let appends: Vec<Value> = db::get_namespace_appends(&state.db, &namespace, page, PER_PAGE)
-        .into_iter()
-        .map(|row| {
-            let kind = envelope_kind(&row.metadata);
-            let mut value = json!(row);
-            if let (Some(object), Some(kind)) = (value.as_object_mut(), kind) {
-                object.insert("kind".into(), json!(kind));
-            }
-            value
-        })
-        .collect();
-    // Labelled when the configured factory deployed this namespace.
-    let registry = registry_of(&state, &namespace);
-    let (leaves, root) = db::get_namespace_mmr(&state.db, &namespace);
-    let ctx = page_ctx(
-        &state,
-        json!({
-            "namespace": namespace,
-            "registry": registry,
-            "appends": appends,
-            "leaves": leaves,
-            "root": root,
-            "page": page,
-            "total_pages": total_pages(db::count_namespace_appends(&state.db, &namespace), PER_PAGE),
-        }),
-    );
-    html_or_json(&state, &headers, &query, "anchoring_namespace.html", &ctx)
-}
-
-/// One leaf: the append that put it there, and what it committed to.
-///
-/// A leaf never changes, so there is no history to page — one append and one
-/// payload, for good.
-pub async fn anchoring_leaf_page(
-    State(state): State<AppState>,
-    Path((namespace, index)): Path<(String, String)>,
-    headers: HeaderMap,
-    Query(query): Query<HashMap<String, String>>,
-) -> Response {
-    let checksummed = checksum_address(&namespace);
-    if !is_valid_address(&checksummed) {
-        return invalid_address(&state, &headers, &query, "Namespace", &namespace);
-    }
-    let namespace = checksummed;
-    let Ok(index) = index.parse::<i64>() else {
-        return not_found(&state, &headers, &query, "Leaf", &index);
-    };
-    let Some(append) = db::get_leaf(&state.db, &namespace, index) else {
-        return not_found(&state, &headers, &query, "Leaf", &index.to_string());
-    };
-    // Anyone may append under their own address, and the decoder answers per
-    // registry — 404 for an address the factory never announced — so an
-    // unlabelled namespace gets no link rather than one that leads nowhere.
-    let registry = registry_of(&state, &namespace);
-    // A batch's rows never reached the chain one at a time, so it carries no
-    // commitment, and nothing hashes to an empty one.
-    let self_verifying = is_self_verifying(&append.commitment, &append.metadata);
-    // The envelope's fields, named, when the payload leads with a tag we know; the raw
-    // bytes stay on the page either way.
-    let envelope = decode_envelope(&append.metadata).map(|(kind, fields)| {
-        json!({
-            "kind": kind,
-            "fields": fields
-                .into_iter()
-                .map(|(name, value)| json!({"name": name, "value": value}))
-                .collect::<Vec<_>>(),
-        })
-    });
-    let ctx = page_ctx(
-        &state,
-        json!({
-            "namespace": namespace,
-            "registry": registry,
-            "index": index,
-            "self_verifying": self_verifying,
-            "envelope": envelope,
-            "append": append,
-        }),
-    );
-    html_or_json(&state, &headers, &query, "anchoring_leaf.html", &ctx)
 }
 
 /// One destination the search box can send the reader to.
@@ -1887,7 +1840,15 @@ pub async fn search_page(
         return Redirect::to("/").into_response();
     }
 
-    let found = resolve_search(&state.db, &q);
+    let found = match resolve_search(&state.db, &q) {
+        found @ Some(_) => found,
+        // A registry's name and a record's checksum are the contract's state, which no
+        // index here holds, so they are only known by asking it.
+        None => anchoring_hits(&state, &q, 1)
+            .await
+            .first()
+            .map(|hit| destination(hit.kind, &hit.id, hit.url.clone())),
+    };
 
     if wants_json(&headers, &query) {
         return Json(json!({"query": q, "match": found})).into_response();
@@ -1905,11 +1866,71 @@ pub async fn search_page(
 }
 
 /// Enough suggestions to be useful, few enough to read without scrolling.
+/// Somewhere the anchoring contract can send the reader.
+struct Hit {
+    kind: &'static str,
+    id: String,
+    url: String,
+    label: String,
+    sublabel: String,
+}
+
+impl Hit {
+    fn registry(id: u64, name: String) -> Self {
+        Self {
+            kind: "registry",
+            id: id.to_string(),
+            url: format!("/anchoring/{id}"),
+            label: name,
+            sublabel: format!("Registry #{id}"),
+        }
+    }
+
+    fn record(record: &anchoring::Record) -> Self {
+        Self {
+            kind: "record",
+            id: record.checksum.clone(),
+            url: format!("/anchoring/{}/{}", record.registryId, record.recordId),
+            label: record.checksum.clone(),
+            sublabel: format!("Record in registry #{}", record.registryId),
+        }
+    }
+}
+
+/// What the contract knows about `q`, best first: a registry by its whole name, a record by
+/// its checksum, then registries whose name contains it, which only the index beside the
+/// chain matches. Empty when neither knows it, or cannot be reached.
+async fn anchoring_hits(state: &AppState, q: &str, limit: usize) -> Vec<Hit> {
+    let mut hits = Vec::new();
+    if let Ok((registries, records)) = anchoring::lookup(&state.rpc, q).await {
+        hits.extend(
+            registries
+                .iter()
+                .map(|r| Hit::registry(r.id, r.name.clone())),
+        );
+        hits.extend(records.iter().map(Hit::record));
+    }
+    if hits.len() < limit {
+        if let Some(base) = state.cfg.name_search_url.as_deref() {
+            for named in name_search::matching(state.rpc.http_client(), base, q, limit).await {
+                let hit = Hit::registry(named.id, named.name);
+                if !hits.iter().any(|seen| seen.url == hit.url) {
+                    hits.push(hit);
+                }
+            }
+        }
+    }
+    hits.truncate(limit);
+    hits
+}
+
 const SUGGESTION_LIMIT: usize = 8;
 
 /// Suggestions for what the reader is typing, for the search box.
 ///
-/// Answered from the index — no RPC — so a keystroke costs a few lookups.
+/// Answered from the index, apart from the anchoring contract's registries and records,
+/// which are its state: a name-shaped query asks the contract, and the name index when one
+/// is configured.
 /// Anything that is definitely a hash or an address is offered whether indexed
 /// or not: being told "not found" on the page beats no suggestion at all.
 pub async fn search_suggest(
@@ -2001,20 +2022,8 @@ pub async fn search_suggest(
                 format!("{} · {}", meta.symbol, truncate_hash(&meta.address, 8, 6)),
             ));
         }
-        // A registry goes to its anchoring page, not its address page: the tree is
-        // what a reader came for, and the address differs from chain to chain while
-        // the name does not. With no factory configured there are no registries.
-        if let Some(factory) = state.cfg.registry_factory.as_deref() {
-            for (address, name) in
-                db::search_registries(&state.db, q, factory, SUGGESTION_LIMIT as u32)
-            {
-                results.push(suggestion(
-                    "registry",
-                    format!("/anchoring/{address}"),
-                    name,
-                    truncate_hash(&address, 8, 6),
-                ));
-            }
+        for hit in anchoring_hits(&state, q, SUGGESTION_LIMIT).await {
+            results.push(suggestion(hit.kind, hit.url, hit.label, hit.sublabel));
         }
         for (address, name) in search_named(q, SUGGESTION_LIMIT) {
             results.push(suggestion(
@@ -2317,8 +2326,11 @@ pub fn app(state: AppState) -> Router {
         .route("/token/{address}", get(token_page))
         .route("/tokens", get(tokens_page))
         .route("/anchoring", get(anchoring_page))
-        .route("/anchoring/{namespace}", get(anchoring_namespace_page))
-        .route("/anchoring/{namespace}/{index}", get(anchoring_leaf_page))
+        .route("/anchoring/{registry_id}", get(anchoring_registry_page))
+        .route(
+            "/anchoring/{registry_id}/{record_id}",
+            get(anchoring_record_page),
+        )
         .route("/search", get(search_page))
         .route("/api/search", get(search_suggest))
         // Public explorer: allow cross-origin reads from any site (the wallet

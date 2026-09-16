@@ -18,12 +18,11 @@ use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{info, warn};
 
-use crate::anchoring::ANCHORING_ADDRESS;
 use crate::config::Settings;
 use crate::contracts::RESERVED_TOKENS;
 use crate::db::{self, Db};
 use crate::decoder::{checksum_address, decode_event};
-use crate::models::{AnchoredEvent, BlockBundle, RegistryDeployed, Transaction, TransferEvent};
+use crate::models::{BlockBundle, Transaction, TransferEvent};
 use crate::parse::{parse_block, parse_transaction};
 use crate::rpc::ChainRpc;
 use crate::tokens::{fetch_token_metadata, has_control_chars};
@@ -103,7 +102,7 @@ fn assemble_bundle(raw_block: &Value, receipts: Option<&Value>) -> BlockBundle {
         .map(Vec::as_slice)
         .unwrap_or(&[]);
     let mut txs = Vec::with_capacity(raw_txs.len());
-    let mut rows = ReceiptRows::default();
+    let mut transfers = Vec::new();
     let mut next_log_index = 0u64;
 
     for tx_data in raw_txs {
@@ -121,7 +120,7 @@ fn assemble_bundle(raw_block: &Value, receipts: Option<&Value>) -> BlockBundle {
             tx.raw = Some(format!("0x{}", hex::encode(buf)));
         }
         if let Some(receipt) = receipt_by_hash.get(tx_hash) {
-            apply_receipt(&mut tx, receipt, &mut rows, &mut next_log_index);
+            apply_receipt(&mut tx, receipt, &mut transfers, &mut next_log_index);
         }
         txs.push(tx);
     }
@@ -129,10 +128,8 @@ fn assemble_bundle(raw_block: &Value, receipts: Option<&Value>) -> BlockBundle {
     BlockBundle {
         block,
         txs,
-        transfers: rows.transfers,
-        anchored: rows.anchored,
+        transfers,
         tokens: Vec::new(),
-        registries: rows.registries,
     }
 }
 
@@ -318,16 +315,6 @@ async fn attach_token_metadata(
     }
 }
 
-/// The rows a block's receipts contribute, accumulated across its transactions:
-/// three outputs of one walk over the logs, so the walk is handed one place to
-/// put them.
-#[derive(Default)]
-struct ReceiptRows {
-    transfers: Vec<TransferEvent>,
-    anchored: Vec<AnchoredEvent>,
-    registries: Vec<RegistryDeployed>,
-}
-
 /// Copy onto a transaction what only its receipt knows.
 fn apply_receipt_fields(tx: &mut Transaction, receipt: &Value) {
     tx.receipt_data = Some(serde_json::to_string(receipt).unwrap_or_else(|_| "{}".into()));
@@ -392,45 +379,18 @@ fn derive_fee_from_transfer(tx: &mut Transaction, log: &Value, to: &str, amount:
     }
 }
 
-/// Index one receipt log: anything the explorer stores per log lands in `rows`,
-/// and a transfer may also tell the transaction what it was charged.
-fn index_log(tx: &mut Transaction, log: &Value, log_index: i64, rows: &mut ReceiptRows) {
-    // Only the precompile's own log carries a trustworthy namespace: the caller
-    // it records is the sender it saw, which a contract emitting the same
-    // signature could claim to be anyone. Rejected before decoding, so an
-    // impostor's payload is never worth decoding.
-    let topic0 = log.pointer("/topics/0").and_then(Value::as_str);
+/// Index one receipt log: a transfer lands in `transfers`, and may also tell the
+/// transaction what it was charged.
+fn index_log(
+    tx: &mut Transaction,
+    log: &Value,
+    log_index: i64,
+    transfers: &mut Vec<TransferEvent>,
+) {
     let emitter = log.get("address").and_then(Value::as_str).unwrap_or("");
-    if matches!(topic0, Some(t) if t == *crate::decoder::LEAF_APPENDED_TOPIC
-                                || t == *crate::decoder::LEAVES_APPENDED_TOPIC)
-        && !emitter.eq_ignore_ascii_case(ANCHORING_ADDRESS)
-    {
-        return;
-    }
-
     let Some(decoded) = decode_event(log) else {
         return;
     };
-    // Both anchoring events are matched on topic0 rather than the decoded
-    // display name, which is a UI label: renaming one must not silently stop
-    // indexing it.
-    if decoded.topic0 == *crate::decoder::REGISTRY_DEPLOYED_TOPIC {
-        // The emitting factory rides in the row — reads decide which factory to
-        // trust, the way transfer rows record their token.
-        if let Some(event) = registry_deployed(&decoded, tx) {
-            rows.registries.push(event);
-        }
-        return;
-    }
-    if decoded.topic0 == *crate::decoder::LEAF_APPENDED_TOPIC
-        || decoded.topic0 == *crate::decoder::LEAVES_APPENDED_TOPIC
-    {
-        match anchored_event(&decoded, tx, log_index) {
-            Some(event) => rows.anchored.push(event),
-            None => warn!("undecodable append log {log_index} in {}", tx.hash),
-        }
-        return;
-    }
     // Transfers, so the address and token transfer tabs have data.
     if !matches!(
         decoded.name.as_deref(),
@@ -447,7 +407,7 @@ fn index_log(tx: &mut Transaction, log: &Value, log_index: i64, rows: &mut Recei
     if from.is_empty() || to.is_empty() || amount.is_empty() {
         return;
     }
-    rows.transfers.push(TransferEvent {
+    transfers.push(TransferEvent {
         id: 0,
         tx_hash: tx.hash.clone(),
         block_number: tx.block_number,
@@ -464,7 +424,7 @@ fn index_log(tx: &mut Transaction, log: &Value, log_index: i64, rows: &mut Recei
 fn apply_receipt(
     tx: &mut Transaction,
     receipt: &Value,
-    rows: &mut ReceiptRows,
+    transfers: &mut Vec<TransferEvent>,
     next_log_index: &mut u64,
 ) {
     apply_receipt_fields(tx, receipt);
@@ -484,95 +444,8 @@ fn apply_receipt(
             .filter(|n| *n >= 0)
             .unwrap_or(*next_log_index as i64);
         *next_log_index = (*next_log_index).max(log_index as u64 + 1);
-        index_log(tx, log, log_index, rows);
+        index_log(tx, log, log_index, transfers);
     }
-}
-
-/// One decoded append as a storable row, or `None` when the log does not carry
-/// what the row is keyed on.
-///
-/// Both shapes land here. `LeafAppended` is one leaf at `index`, carrying what
-/// it committed to; `LeavesAppended` is a span from `firstLeaf` to `count`,
-/// whose leaves reach the chain as the roots of subtrees and so have no
-/// commitment of their own.
-pub fn anchored_event(
-    decoded: &crate::decoder::DecodedEvent,
-    tx: &Transaction,
-    log_index: i64,
-) -> Option<AnchoredEvent> {
-    let arg = |name: &str| decoded.param(name);
-    // `0x` + 64 hex digits. A truncated log decodes to a short or empty value,
-    // which would store a word the chain never wrote.
-    let word = |value: &str| (value.len() == 66).then(|| value.to_string());
-    // The root is not in the log: it is what the peaks bag to.
-    let root = crate::anchoring::bag(&peaks(arg("peaks")?)?);
-    let batch = decoded.topic0 == *crate::decoder::LEAVES_APPENDED_TOPIC;
-    let (index, leaves, commitment) = if batch {
-        // `count` is the tree's size after the append, not the size of the
-        // batch, so what it added is the distance from where it started. A
-        // batch that added nothing, or went backwards, is not one this wrote.
-        let first: i64 = arg("firstLeaf")?.parse().ok()?;
-        let after: i64 = arg("count")?.parse().ok()?;
-        (
-            first,
-            after.checked_sub(first).filter(|n| *n > 0)?,
-            String::new(),
-        )
-    } else {
-        (arg("index")?.parse().ok()?, 1, word(arg("commitment")?)?)
-    };
-    Some(AnchoredEvent {
-        tx_hash: tx.hash.clone(),
-        block_number: tx.block_number,
-        log_index,
-        namespace: checksum_address(arg("namespace")?),
-        index,
-        leaves,
-        commitment,
-        root,
-        metadata: arg("metadata").unwrap_or("0x").to_string(),
-        timestamp: tx.timestamp,
-        created_at: db::now_ts(),
-    })
-}
-
-/// The peaks as the decoder renders a `bytes32[]`: `[0x…, 0x…]`, or `[]`. A
-/// peak that is not a whole word is a truncated log, and `None`.
-fn peaks(rendered: &str) -> Option<Vec<[u8; 32]>> {
-    rendered
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .split(',')
-        .map(str::trim)
-        .filter(|peak| !peak.is_empty())
-        .map(|peak| hex::decode(peak.strip_prefix("0x")?).ok()?.try_into().ok())
-        .collect()
-}
-
-/// One decoded `RegistryDeployed` log as a storable row, or `None` when it does
-/// not carry its addresses — a row keyed on a malformed address would be
-/// unreachable, and an empty factory would match the "no factory configured"
-/// read. Strings decode leniently: an empty name labels as empty rather than
-/// dropping the registry from the listing.
-pub fn registry_deployed(
-    decoded: &crate::decoder::DecodedEvent,
-    tx: &Transaction,
-) -> Option<RegistryDeployed> {
-    let arg = |name: &str| decoded.param(name).map(str::to_string);
-    let address = |name: &str| arg(name).filter(|a| crate::decoder::is_valid_address(a));
-    let factory = checksum_address(&decoded.contract);
-    if !crate::decoder::is_valid_address(&factory) {
-        return None;
-    }
-    Some(RegistryDeployed {
-        factory,
-        registry: address("registry")?,
-        creator: address("creator")?,
-        name: arg("name").unwrap_or_default(),
-        description: arg("description").unwrap_or_default(),
-        block_number: tx.block_number,
-        created_at: db::now_ts(),
-    })
 }
 
 /// Fetch + persist one block (used by tests and simple callers).
@@ -659,14 +532,6 @@ fn repair_derived_tables(db: &Db) {
         let conn = db::lock(db);
         if let Err(e) = db::sync_holder_counts(&conn) {
             warn!("holder count sync failed: {e:#}");
-        }
-    }
-    // Seed the /anchoring summary for databases that predate it; after this
-    // each block maintains it incrementally.
-    let conn = db::lock(db);
-    if db::anchored_summary_is_stale(&conn) {
-        if let Err(e) = db::sync_anchored_namespaces(&conn) {
-            warn!("anchored namespace sync failed: {e:#}");
         }
     }
 }
@@ -1171,9 +1036,6 @@ fn compute_and_store_stats(db: &Db) -> Result<Value> {
     } else {
         0.0
     };
-    // Rides along so the nav's anchoring gate is a memory read on every page
-    // view rather than a query. One tick of lag on the tab appearing.
-    let has_anchors = db::table_has_rows(&conn, "anchored_namespaces");
 
     let stats = serde_json::json!({
         "latest_block": latest_block,
@@ -1187,7 +1049,6 @@ fn compute_and_store_stats(db: &Db) -> Result<Value> {
         "gas_util_pct": gas_util_pct,
         "chain_head": chain_head,
         "index_pct": index_pct,
-        "has_anchors": has_anchors,
         "updated_at": now,
     });
     // Still written to kv: it seeds the in-memory copy across a restart.
@@ -1199,82 +1060,6 @@ fn compute_and_store_stats(db: &Db) -> Result<Value> {
 mod tests {
     use super::*;
     use crate::decoder::TRANSFER_TOPIC;
-
-    /// A `LeafAppended` log as a node reports it, from `emitter`.
-    fn anchored_log(emitter: &str, caller: &str) -> Value {
-        let (commitment, root) = ("22".repeat(32), "33".repeat(32));
-        json!({
-            "address": emitter,
-            "topics": [
-                crate::decoder::LEAF_APPENDED_TOPIC.as_str(),
-                format!("0x{}{}", "00".repeat(12), caller),
-                format!("0x{:064x}", 0),
-            ],
-            // abi.encode(commitment, bytes32[] peaks, bytes metadata): the
-            // root as the one peak, and no metadata.
-            "data": format!(
-                "0x{commitment}{:064x}{:064x}{:064x}{root}{:064x}",
-                3 * 32, 5 * 32, 1, 0
-            ),
-            "logIndex": "0x0",
-        })
-    }
-
-    fn tx_with_logs(logs: Vec<Value>) -> (Transaction, Vec<AnchoredEvent>) {
-        let mut tx = Transaction {
-            hash: format!("0x{}", "ab".repeat(32)),
-            block_number: 7,
-            position: 0,
-            from_addr: format!("0x{}", "33".repeat(20)),
-            to_addr: Some(ANCHORING_ADDRESS.to_string()),
-            status: 1,
-            gas_used: 0,
-            base_fee: "0".into(),
-            contract_address: None,
-            fee_token: None,
-            fee_amount: "0".into(),
-            input: "0x".into(),
-            raw: None,
-            trace_data: None,
-            receipt_data: None,
-            timestamp: 1_700,
-            created_at: 0,
-        };
-        let receipt = json!({"status": "0x1", "logs": logs});
-        let mut rows = ReceiptRows::default();
-        let mut next_log_index = 0u64;
-        apply_receipt(&mut tx, &receipt, &mut rows, &mut next_log_index);
-        (tx, rows.anchored)
-    }
-
-    #[test]
-    fn only_the_precompiles_own_anchored_logs_are_indexed() {
-        // The whole trust argument for a namespace: the precompile reports the
-        // caller it actually saw. Any contract can emit the same signature.
-        let caller = "44".repeat(20);
-        let (_, anchored) = tx_with_logs(vec![anchored_log(ANCHORING_ADDRESS, &caller)]);
-        assert_eq!(anchored.len(), 1, "the precompile's own log is an anchor");
-        assert_eq!(anchored[0].namespace, checksum_address(&caller));
-
-        let impostor = format!("0x{}", "cc".repeat(20));
-        let (_, anchored) = tx_with_logs(vec![anchored_log(&impostor, &caller)]);
-        assert!(
-            anchored.is_empty(),
-            "a claimed namespace is not a namespace"
-        );
-    }
-
-    #[test]
-    fn the_precompile_is_recognised_however_its_address_is_spelled() {
-        // The gate compares addresses, not spellings: a node reporting the
-        // log address in lowercase still gets its anchors indexed.
-        let caller = "44".repeat(20);
-        let (_, anchored) = tx_with_logs(vec![anchored_log(
-            &ANCHORING_ADDRESS.to_lowercase(),
-            &caller,
-        )]);
-        assert_eq!(anchored.len(), 1);
-    }
 
     fn chunks(from: u64, to: u64, batch: u64) -> Vec<RangeInclusive<u64>> {
         block_chunks(from, to, batch).collect()

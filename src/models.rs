@@ -94,24 +94,6 @@ pub struct Transaction {
     pub created_at: i64,
 }
 
-/// One `RegistryDeployed` log: a registry contract coming into existence. The
-/// emitting factory is recorded rather than filtered at ingest — like transfers,
-/// any factory's log lands here, and reads trust only the configured one.
-///
-/// The event's third string (free-form registry metadata) is deliberately not
-/// a field: no page shows it, and it stays readable in the log.
-#[derive(Debug, Clone, Serialize)]
-pub struct RegistryDeployed {
-    pub factory: String,
-    /// The deployed registry — the namespace its anchors will live in.
-    pub registry: String,
-    pub creator: String,
-    pub name: String,
-    pub description: String,
-    pub block_number: i64,
-    pub created_at: i64,
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct TokenMetadata {
     pub address: String,
@@ -136,31 +118,6 @@ pub struct ContractLabel {
     pub created_at: i64,
 }
 
-/// One append to a namespace's tree: a leaf of its own, or the span a batch
-/// added. The precompile keeps only the tree, never what went into it, so these
-/// rows are the whole record of what built it.
-#[derive(Debug, Clone, Serialize)]
-pub struct AnchoredEvent {
-    pub tx_hash: String,
-    pub block_number: i64,
-    pub log_index: i64,
-    /// The calling address, which is the namespace the leaves live in.
-    pub namespace: String,
-    /// Where this append started: the leaf's own index, or a batch's first.
-    pub index: i64,
-    /// How many leaves it added — one, or the batch's size.
-    pub leaves: i64,
-    /// What a single leaf committed to. Empty for a batch, whose leaves reach
-    /// the chain as the roots of subtrees and never one at a time.
-    pub commitment: String,
-    /// The MMR root the append left behind.
-    pub root: String,
-    /// The emitted payload, never stored on chain (`0x…`).
-    pub metadata: String,
-    pub timestamp: i64,
-    pub created_at: i64,
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct TransferEvent {
     pub id: i64,
@@ -176,14 +133,11 @@ pub struct TransferEvent {
 }
 
 /// One block and everything indexed alongside it: its transactions, the
-/// transfers and anchored commitments their receipts carried, metadata for
-/// newly seen tokens, and any registries deployed.
+/// transfers their receipts carried, and metadata for newly seen tokens.
 #[derive(Debug, Clone)]
 pub struct BlockBundle {
     pub block: Block,
     pub txs: Vec<Transaction>,
     pub transfers: Vec<TransferEvent>,
-    pub anchored: Vec<AnchoredEvent>,
     pub tokens: Vec<crate::tokens::TokenMeta>,
-    pub registries: Vec<RegistryDeployed>,
 }

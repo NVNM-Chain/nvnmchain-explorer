@@ -15,6 +15,7 @@ COPY src ./src
 COPY templates ./templates
 # Compiled in via include_str!; the runtime image does not need a copy.
 COPY abi ./abi
+COPY contracts/layout ./contracts/layout
 RUN cargo build --release --locked
 
 # stable (trixie) glibc >= whatever rust:1.97-slim ships, so the binary runs

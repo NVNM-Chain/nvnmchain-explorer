@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% import "_macros.html" as ui %}
+{% block title %}{{ registry.name }} – nvnmchain Explorer{% endblock %}
+{% block content %}
+
+<div class="mb-6">
+    <div class="text-xs text-faint mb-1">
+        <a href="/anchoring" class="hover:text-blue-300">Anchoring</a>
+        <span class="mx-1">/</span>
+        <span>Registry</span>
+    </div>
+    <div class="flex items-center gap-3 flex-wrap">
+        <h1 class="text-2xl font-extrabold tracking-tight break-all">{{ registry.name }}</h1>
+        <span class="badge badge-info">#{{ registry.id }}</span>
+        <span class="badge">{{ total }} records</span>
+    </div>
+    {% if registry.description %}<p class="text-sm text-dim mt-1">{{ registry.description }}</p>{% endif %}
+</div>
+
+<div class="card mb-6">
+    <div class="card-body space-y-3.5">
+        <div class="kv-row">
+            <div class="kv-label">Creator</div>
+            <div class="kv-value mono text-xs">{{ registry.creator }}</div>
+        </div>
+        <div class="kv-row">
+            <div class="kv-label">Created</div>
+            <div class="kv-value">{{ registry.createdAt }}</div>
+        </div>
+        <div class="kv-row">
+            <div class="kv-label">Metadata</div>
+            <div class="kv-value mono text-xs">{{ registry.metadata | fallback(value="—") }}</div>
+        </div>
+    </div>
+</div>
+
+<h2 class="section-title mb-2">Records <span class="text-faint font-normal">· the latest version of each</span></h2>
+<div class="card overflow-x-auto">
+    <div class="min-w-[760px]">
+        <div class="flex table-header">
+            <div class="w-24 px-3">Record</div>
+            <div class="flex-1 px-3">Checksum</div>
+            <div class="w-28 px-3">Status</div>
+            <div class="w-20 px-3 text-right">Versions</div>
+            <div class="w-56 px-3 text-right">Anchored</div>
+        </div>
+        {% for record in records %}
+        <div class="t-row flex text-xs items-center">
+            <div class="w-24 px-3 py-3 mono"><a href="/anchoring/{{ registry.id }}/{{ record.recordId }}" class="text-blue-400 hover:text-blue-300">{{ record.recordId }}</a></div>
+            <div class="flex-1 px-3 py-3 mono truncate" title="{{ record.checksumAlgo }}">{{ record.checksum }}</div>
+            <div class="w-28 px-3 py-3"><span class="badge">{{ record.status }}</span></div>
+            <div class="w-20 px-3 py-3 text-right text-dim">{{ record.index }}</div>
+            <div class="w-56 px-3 py-3 text-right text-faint">{{ record.timestamp }}</div>
+        </div>
+        {% else %}
+        <div class="card-body text-center text-dim text-sm py-10">This registry has no records</div>
+        {% endfor %}
+    </div>
+</div>
+
+{{ ui::pager(page=page, total_pages=total_pages) }}
+
+{% endblock %}

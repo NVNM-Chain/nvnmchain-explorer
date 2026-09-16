@@ -156,6 +156,39 @@ fn decode_transfer_event() {
     assert_eq!(event.params[1].value, checksum_address(&to));
 }
 
+/// The anchoring contract decodes under the selector and topic0 the chain's precompile had.
+#[test]
+fn decode_the_anchoring_contract() {
+    // (registryId 3, recordId 1, index 2, status "Revoked"), as both the call and the event carry it.
+    let status = hex::encode(format!("{:\0<32}", "Revoked"));
+    let args = format!(
+        "{:064x}{:064x}{:064x}{:064x}{:064x}{status}",
+        3, 1, 2, 0x80, 7
+    );
+
+    let call = decode_function_call(&format!("0x97b40c25{args}")).expect("decoded");
+    assert_eq!(
+        call.signature.as_deref(),
+        Some("updateRecordStatus(uint64,uint64,uint64,string)")
+    );
+    assert_eq!(call.params[3].value, "Revoked");
+
+    let caller = format!("0x{}", "11".repeat(20));
+    let log = json!({
+        "address": "0x0000000000000000000000000000000000000a00",
+        "topics": [
+            "0xd7b75457d41293eab4829975c951ce8c53106866f0c429d175fc6c91cdad5ade",
+            format!("0x{}{}", "00".repeat(12), "11".repeat(20)),
+        ],
+        "data": format!("0x{args}"),
+        "logIndex": "0x0",
+    });
+    let event = decode_event(&log).expect("decoded event");
+    assert_eq!(event.name.as_deref(), Some("UpdateRecordStatus"));
+    assert_eq!(event.params[0].value, checksum_address(&caller));
+    assert_eq!(event.params[4].value, "Revoked");
+}
+
 #[test]
 fn flatten_trace_nested() {
     let trace = json!({
@@ -440,45 +473,30 @@ fn fresh_schema_has_all_columns() {
 }
 
 #[test]
-fn a_database_on_the_old_registry_key_is_rekeyed() {
-    // `registries` shipped keyed on address alone, which let any contract's
-    // RegistryDeployed log replace a trusted factory's row. Existing databases
-    // carry that key until init_db drops it.
+fn a_database_with_the_anchoring_tables_loses_them() {
+    // They indexed the anchoring precompile, which the chain no longer has.
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("legacy.db");
     let legacy = rusqlite::Connection::open(&path).expect("open");
     legacy
         .execute_batch(
-            "CREATE TABLE registries (
-                 address BLOB PRIMARY KEY,
-                 factory BLOB NOT NULL,
-                 creator BLOB NOT NULL,
-                 name TEXT NOT NULL DEFAULT '',
-                 description TEXT NOT NULL DEFAULT '',
-                 block_number INTEGER NOT NULL,
-                 log_index INTEGER NOT NULL DEFAULT 0,
-                 timestamp INTEGER NOT NULL DEFAULT 0,
-                 created_at INTEGER NOT NULL DEFAULT 0
-             );",
+            "CREATE TABLE anchored_events (id INTEGER PRIMARY KEY);
+             CREATE TABLE anchored_namespaces (namespace BLOB PRIMARY KEY);
+             CREATE TABLE registries (address BLOB NOT NULL, factory BLOB NOT NULL);",
         )
         .expect("legacy schema");
     drop(legacy);
 
-    let key_columns = |conn: &rusqlite::Connection| -> i64 {
-        conn.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('registries') WHERE pk > 0",
+    let conn = nvnmchain_explorer::db::init_db(path.to_str().unwrap()).expect("init_db");
+    let left: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table'
+             AND name IN ('anchored_events', 'anchored_namespaces', 'registries')",
             [],
             |r| r.get(0),
         )
-        .expect("pragma")
-    };
-    let conn = nvnmchain_explorer::db::init_db(path.to_str().unwrap()).expect("init_db");
-    assert_eq!(key_columns(&conn), 2, "rekeyed on (address, factory)");
-    drop(conn);
-
-    // ...and opening it again leaves the rekeyed table alone.
-    let conn = nvnmchain_explorer::db::init_db(path.to_str().unwrap()).expect("reopen");
-    assert_eq!(key_columns(&conn), 2, "the migration does not repeat");
+        .expect("table lookup");
+    assert_eq!(left, 0);
 }
 
 #[test]
@@ -581,9 +599,7 @@ fn blob_hex_round_trip() {
         block,
         txs: vec![tx],
         transfers: vec![],
-        anchored: vec![],
         tokens: vec![],
-        registries: vec![],
     };
     db::save_block_bundle(&db, &bundle).expect("save bundle");
 
@@ -654,9 +670,7 @@ fn duplicate_bundle_is_idempotent() {
         block,
         txs: vec![tx],
         transfers: vec![transfer],
-        anchored: vec![],
         tokens: vec![],
-        registries: vec![],
     };
     db::save_block_bundle(&db, &bundle).expect("first save");
     db::save_block_bundle(&db, &bundle).expect("duplicate save");
@@ -725,9 +739,7 @@ fn indexed_transfer_reads_back_through_every_listing() {
         block,
         txs: vec![tx.clone()],
         transfers: vec![transfer],
-        anchored: vec![],
         tokens: vec![meta],
-        registries: vec![],
     };
     db::save_block_bundle(&db, &bundle).expect("save bundle");
 
@@ -843,9 +855,7 @@ fn blob_storage_queries_match_text_params() {
         block,
         txs: vec![tx],
         transfers: vec![transfer],
-        anchored: vec![],
         tokens: vec![meta],
-        registries: vec![],
     };
     db::save_block_bundle(&db, &bundle).expect("save bundle");
 
@@ -914,10 +924,6 @@ fn huge_page_numbers_do_not_panic() {
         db::get_token_transfers(&db, &format!("0x{}", "aa".repeat(20)), u32::MAX, 25).is_empty()
     );
     assert!(db::get_all_tokens(&db, u32::MAX, 25).is_empty());
-    let ns = format!("0x{}", "cc".repeat(20));
-    assert!(db::get_anchored_namespaces(&db, None, u32::MAX, 25).is_empty());
-    assert!(db::get_namespace_appends(&db, &ns, u32::MAX, 25).is_empty());
-    assert!(db::get_leaf(&db, &ns, i64::MAX).is_none());
 }
 
 /// `authorizeKey(keyId, WebAuthn, KeyRestrictions{expiry, enforceLimits, one

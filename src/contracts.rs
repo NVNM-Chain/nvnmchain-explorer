@@ -63,7 +63,6 @@ fn precompile_labels() -> &'static HashMap<String, String> {
                 "0xC077e00000000000000000000000000000000000",
                 "Current Committee",
             ),
-            (crate::anchoring::ANCHORING_ADDRESS, "Anchoring"),
         ];
         pairs
             .iter()
@@ -72,10 +71,9 @@ fn precompile_labels() -> &'static HashMap<String, String> {
     })
 }
 
-/// Contracts that are not Tempo's own but are deployed at canonical addresses
-/// everywhere, including here. Kept apart from the precompiles: they are
-/// ordinary contracts, and calling them precompiles would misreport what they
-/// are on their own page.
+/// Ordinary contracts at fixed addresses: canonical deployments, and the two this chain places
+/// in genesis, the anchoring contract and its module admin. Kept apart from the precompiles,
+/// which they are not.
 fn deployed_contracts() -> &'static HashMap<String, String> {
     static MAP: OnceLock<HashMap<String, String>> = OnceLock::new();
     MAP.get_or_init(|| {
@@ -83,6 +81,8 @@ fn deployed_contracts() -> &'static HashMap<String, String> {
             ("0xcA11bde05977b3631167028862bE2a173976CA11", "Multicall3"),
             ("0x000000000022D473030F116dDEE9F6B43aC78BA3", "Permit2"),
             ("0xba5Ed099633D3B313e4D5F7bdc1305d3c28ba5Ed", "CreateX"),
+            ("0x0000000000000000000000000000000000000a00", "Anchoring"),
+            ("0x0582bfb2e8561d48636e78f0e6b139d5a842be8f", "Module Admin"),
         ]
         .iter()
         .map(|(a, label)| (checksum_address(a), label.to_string()))
@@ -172,7 +172,7 @@ pub fn identify_address(addr: &str) -> AddressInfo {
     }
 }
 
-/// The name of a canonical deployed contract (Multicall3, Permit2, CreateX).
+/// The name of a contract at a fixed address (Multicall3, Permit2, CreateX, Anchoring, Module Admin).
 pub fn deployed_contract_name(addr: &str) -> Option<String> {
     deployed_contracts().get(&checksum_address(addr)).cloned()
 }
@@ -243,15 +243,16 @@ pub fn abis_for_address(addr: &str) -> &'static [&'static str] {
         ),
         ("0x000000000022d473030f116ddee9f6b43ac78ba3", &["permit2"]),
         ("0xba5ed099633d3b313e4d5f7bdc1305d3c28ba5ed", &["createx"]),
+        ("0x0000000000000000000000000000000000000a00", &["anchoring"]),
+        (
+            "0x0582bfb2e8561d48636e78f0e6b139d5a842be8f",
+            &["module_admin"],
+        ),
     ];
 
     let lowered = addr.trim().to_lowercase();
     if let Some((_, abis)) = BY_ADDRESS.iter().find(|(a, _)| *a == lowered) {
         return abis;
-    }
-    // Not in the table above because the address is a constant, not a literal.
-    if lowered == crate::anchoring::ANCHORING_ADDRESS.to_lowercase() {
-        return &["anchoring"];
     }
     // Every TIP-20 is the same interface at a different address.
     if is_tip20_token(&lowered) {
@@ -319,6 +320,29 @@ mod tests {
         }
     }
 
+    /// The module admin's ABI is vendored from the same submodule as the anchoring contract's,
+    /// so the registry decodes the calls the two owners send it and the event it emits when
+    /// the break-glass grant runs.
+    #[test]
+    fn the_module_admin_shows_its_own_interface() {
+        let module_admin = "0x0582bfb2e8561d48636e78f0e6b139d5a842be8f";
+        assert_eq!(abis_for_address(module_admin), ["module_admin"]);
+        assert_eq!(
+            deployed_contract_name(module_admin).as_deref(),
+            Some("Module Admin")
+        );
+        let contract = crate::decoder::REGISTRY
+            .contract("module_admin")
+            .expect("module_admin registered");
+        for function in ["propose", "confirm", "owners"] {
+            assert!(
+                contract.functions().any(|f| f.name == function),
+                "`{function}` missing from the module admin ABI"
+            );
+        }
+        assert!(contract.events().any(|e| e.name == "Executed"));
+    }
+
     /// The lookup must not care how an address is spelled.
     #[test]
     fn abis_are_found_however_the_address_is_spelled() {
@@ -332,20 +356,6 @@ mod tests {
             abis_for_address(&fee_manager.to_uppercase().replace("0X", "0x")),
             ["fee_manager", "fee_amm"]
         );
-    }
-
-    /// The precompile's own interface. The test above only asks that the ABI
-    /// named exists, which passed while this address named the group holding
-    /// the registry factory's event.
-    #[test]
-    fn the_anchoring_precompile_shows_its_own_interface() {
-        let abis = abis_for_address(crate::anchoring::ANCHORING_ADDRESS);
-        assert_eq!(abis, ["anchoring"]);
-        let contract = crate::decoder::REGISTRY
-            .contract("anchoring")
-            .expect("anchoring registered");
-        assert!(contract.functions().any(|f| f.name == "appendLeaf"));
-        assert!(contract.events().any(|e| e.name == "LeafAppended"));
     }
 
     /// A TIP-20 is recognised by its prefix, not by an entry per token.

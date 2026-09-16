@@ -8,6 +8,7 @@ pub mod decoder;
 pub mod indexer;
 pub mod memo;
 pub mod models;
+pub mod name_search;
 pub mod parse;
 pub mod rpc;
 pub mod signatures;

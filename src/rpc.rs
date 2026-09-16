@@ -313,7 +313,6 @@ impl ChainRpc {
         .await
     }
 
-    #[allow(dead_code)]
     pub async fn eth_get_storage_at(
         &self,
         address: &str,

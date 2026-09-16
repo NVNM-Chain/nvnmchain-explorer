@@ -3,70 +3,65 @@
 {% block title %}Anchoring – nvnmchain Explorer{% endblock %}
 {% block content %}
 
-<div class="mb-6">
-    <h1 class="text-2xl font-extrabold tracking-tight">Anchoring</h1>
-    <p class="text-xs text-dim mt-1">{{ total }} appends · the caller is the namespace, so no two trees collide</p>
+<div class="mb-6 flex flex-wrap items-end justify-between gap-4">
+    <div>
+        <h1 class="text-2xl font-extrabold tracking-tight">Anchoring</h1>
+        <p class="text-xs text-dim mt-1">{% if not q %}{{ total }} registries · {% endif %}read from the contract at {{ ui::copy_address(address=address) }}</p>
+    </div>
+    <form action="/anchoring" method="get" class="w-full md:w-96">
+        <input type="text" name="q" value="{{ q }}" class="search-input" placeholder="Registry id, exact name or checksum">
+    </form>
 </div>
 
+{% if q %}<h2 class="section-title mb-2">Registries named “{{ q }}”</h2>{% endif %}
 <div class="card overflow-x-auto mb-6">
-    <div class="min-w-[560px]">
+    <div class="min-w-[720px]">
         <div class="flex table-header">
-            <div class="flex-1 px-3">Namespace</div>
-            <div class="w-24 px-3 text-right">Leaves</div>
-            <div class="w-28 px-3 text-right">Appends</div>
-            <div class="w-28 px-3 text-right">Last block</div>
+            <div class="w-20 px-3">Id</div>
+            <div class="flex-1 px-3">Registry</div>
+            <div class="w-52 px-3">Creator</div>
+            <div class="w-56 px-3 text-right">Created</div>
         </div>
-        {% if namespaces %}
-        {% for ns in namespaces %}
+        {% for registry in registries %}
         <div class="t-row flex text-xs items-center">
-            <div class="flex-1 px-3 py-3 mono truncate">
-                <a href="/anchoring/{{ ns.namespace }}" class="text-blue-400 hover:text-blue-300">{{ truncate_hash(h=ns.namespace, prefix=10, suffix=6) }}</a>{% if ns.name %} <span class="text-xs text-dim" title="deployed by the configured RegistryFactory">{{ ns.name }}</span>{% endif %}
+            <div class="w-20 px-3 py-3 mono"><a href="/anchoring/{{ registry.id }}" class="text-blue-400 hover:text-blue-300">{{ registry.id }}</a></div>
+            <div class="flex-1 px-3 py-3 min-w-0">
+                <a href="/anchoring/{{ registry.id }}" class="text-blue-400 hover:text-blue-300 font-medium block truncate">{{ registry.name }}</a>
+                {% if registry.description %}<span class="text-faint block truncate">{{ registry.description }}</span>{% endif %}
             </div>
-            <div class="w-24 px-3 py-3 text-right text-dim">{{ ns.leaf_count }}</div>
-            <div class="w-28 px-3 py-3 text-right text-dim">{{ ns.anchor_count }}</div>
-            <div class="w-28 px-3 py-3 text-right">
-                <a href="/block/{{ ns.last_block }}" class="text-blue-400 hover:text-blue-300">{{ ns.last_block }}</a>
-            </div>
+            <div class="w-52 px-3 py-3 mono truncate text-dim" title="{{ registry.creator }}">{{ truncate_hash(h=registry.creator, prefix=10, suffix=6) }}</div>
+            <div class="w-56 px-3 py-3 text-right text-faint">{{ registry.createdAt }}</div>
         </div>
-        {% endfor %}
         {% else %}
-        <div class="card-body text-center text-dim text-sm py-10">Nothing anchored yet</div>
-        {% endif %}
+        <div class="card-body text-center text-dim text-sm py-10">{% if q %}No registry has this name{% else %}No registries yet{% endif %}</div>
+        {% endfor %}
     </div>
 </div>
 
-{% if recent %}
-<h2 class="section-title mb-2">Latest appends</h2>
+{% if q %}
+<h2 class="section-title mb-2">Records with checksum “{{ q }}”</h2>
 <div class="card overflow-x-auto">
     <div class="min-w-[720px]">
         <div class="flex table-header">
-            <div class="w-44 px-3">Namespace</div>
-            <div class="w-36 px-3">Leaves</div>
-            <div class="flex-1 px-3">Commitment</div>
-            <div class="w-24 px-3 text-right">Block</div>
-            <div class="w-24 px-3 text-right">Age</div>
+            <div class="w-40 px-3">Record</div>
+            <div class="flex-1 px-3">URI</div>
+            <div class="w-28 px-3">Status</div>
+            <div class="w-56 px-3 text-right">Anchored</div>
         </div>
-        {% for row in recent %}
+        {% for record in records %}
         <div class="t-row flex text-xs items-center">
-            <div class="w-44 px-3 py-3 mono truncate">
-                <a href="/anchoring/{{ row.namespace }}" class="text-blue-400 hover:text-blue-300">{{ truncate_hash(h=row.namespace) }}</a>
-            </div>
-            <div class="w-36 px-3 py-3 mono truncate">
-                <a href="/anchoring/{{ row.namespace }}/{{ row.index }}" class="text-blue-400 hover:text-blue-300">{% if row.leaves == 1 %}#{{ row.index }}{% else %}#{{ row.index }}–{{ row.index + row.leaves - 1 }}{% endif %}</a>
-            </div>
-            {# A batch has no commitment of its own: its leaves reached the chain
-               as the roots of subtrees. #}
-            <div class="flex-1 px-3 py-3 truncate text-dim">{% if row.commitment %}{{ truncate_hash(h=row.commitment, prefix=10, suffix=6) }}{% else %}{{ row.leaves }} in one batch{% endif %}</div>
-            <div class="w-24 px-3 py-3 text-right">
-                <a href="/block/{{ row.block_number }}" class="text-blue-400 hover:text-blue-300">{{ row.block_number }}</a>
-            </div>
-            <div class="w-24 px-3 py-3 text-right text-faint">{{ format_time_ago(timestamp=row.timestamp) }}</div>
+            <div class="w-40 px-3 py-3 mono"><a href="/anchoring/{{ record.registryId }}/{{ record.recordId }}" class="text-blue-400 hover:text-blue-300">{{ record.registryId }} / {{ record.recordId }}</a> <span class="text-faint">v{{ record.index }}</span></div>
+            <div class="flex-1 px-3 py-3 truncate text-dim">{{ record.uri }}</div>
+            <div class="w-28 px-3 py-3"><span class="badge">{{ record.status }}</span></div>
+            <div class="w-56 px-3 py-3 text-right text-faint">{{ record.timestamp }}</div>
         </div>
+        {% else %}
+        <div class="card-body text-center text-dim text-sm py-10">No registry has a record with this checksum</div>
         {% endfor %}
     </div>
 </div>
-{% endif %}
-
+{% else %}
 {{ ui::pager(page=page, total_pages=total_pages) }}
+{% endif %}
 
 {% endblock %}

@@ -11,9 +11,7 @@ use std::sync::{Arc, Mutex};
 use nvnmchain_explorer::config::Settings;
 use nvnmchain_explorer::db::{self, Db};
 use nvnmchain_explorer::decoder::{checksum_address, keccak256, keccak_hex, TRANSFER_TOPIC};
-use nvnmchain_explorer::models::{
-    Block, BlockBundle, RegistryDeployed, Transaction, TransferEvent,
-};
+use nvnmchain_explorer::models::{Block, BlockBundle, Transaction, TransferEvent};
 use nvnmchain_explorer::signatures;
 use nvnmchain_explorer::tokens::TokenMeta;
 use serde_json::{json, Value};
@@ -25,8 +23,6 @@ const TX_HASH: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 const FAILED_TX_HASH: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const UNKNOWN_LOG_TX_HASH: &str =
     "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
-const REGISTRY_FACTORY: &str = "0x00000000000000000000000000000000000FAC70";
-const REGISTRY: &str = "0x4444444444444444444444444444444444444444";
 
 fn temp_db(name: &str) -> (tempfile::TempDir, Db) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -185,19 +181,7 @@ fn transfer_bundle() -> BlockBundle {
         block,
         txs: Vec::new(),
         transfers,
-        anchored: Vec::new(),
         tokens: Vec::new(),
-        // One registry the configured factory deployed, so the search box has
-        // a name to find and somewhere other than an address page to send it.
-        registries: vec![RegistryDeployed {
-            factory: REGISTRY_FACTORY.into(),
-            registry: REGISTRY.into(),
-            creator: SENDER.into(),
-            name: "docs".into(),
-            description: "docs about docs".into(),
-            block_number: 101,
-            created_at: 0,
-        }],
     }
 }
 
@@ -238,7 +222,6 @@ async fn serve(stats: Value) -> (tempfile::TempDir, String) {
     // chain — which would make these tests both slow and non-deterministic.
     cfg.signature_lookup_url = None;
     cfg.rpc_url = "http://127.0.0.1:1".into();
-    cfg.registry_factory = Some(REGISTRY_FACTORY.into());
     let tera = web::build_tera(db.clone()).expect("templates");
     let state = AppState {
         db,
@@ -609,9 +592,7 @@ fn an_address_page_merges_sent_and_received_in_block_order() {
             block,
             txs,
             transfers: Vec::new(),
-            anchored: Vec::new(),
             tokens: Vec::new(),
-            registries: Vec::new(),
         };
         db::save_block_bundle(&db, &bundle).expect("save");
     }
@@ -667,9 +648,7 @@ fn an_address_transfer_page_merges_sent_and_received_in_block_order() {
             block,
             txs: Vec::new(),
             transfers,
-            anchored: Vec::new(),
             tokens: Vec::new(),
-            registries: Vec::new(),
         };
         db::save_block_bundle(&db, &bundle).expect("save");
     }
@@ -802,15 +781,6 @@ async fn the_search_box_suggests_what_is_being_typed() {
         json!(format!("/token/{}", checksum_address(TOKEN)))
     );
 
-    // A registry by name, sent to its tree rather than its address page.
-    let registry = suggest(&base, "doc").await;
-    assert_eq!(registry[0]["type"], json!("registry"));
-    assert_eq!(registry[0]["label"], json!("docs"));
-    assert_eq!(
-        registry[0]["url"],
-        json!(format!("/anchoring/{}", checksum_address(REGISTRY)))
-    );
-
     // A precompile by name, which no database row describes. Matched as a
     // substring, so a partial second word still finds it.
     for term in ["fee", "fee man", "manager"] {
@@ -869,11 +839,9 @@ async fn a_virtual_address_is_recognised_in_search() {
 #[tokio::test]
 async fn search_terms_are_never_patterns() {
     let (_dir, base) = serve(Value::Null).await;
-    // Leaked wildcards would make these match pathUSD or the docs registry;
-    // escaped, they cannot.
+    // Leaked wildcards would make these match pathUSD; escaped, they cannot.
     assert!(suggest(&base, "%path%").await.is_empty());
     assert!(suggest(&base, "_ath").await.is_empty());
-    assert!(suggest(&base, "d_cs").await.is_empty());
     assert!(suggest(&base, "' OR 1=1 --").await.is_empty());
     // And one character matches too much to rank at all.
     assert!(suggest(&base, "p").await.is_empty());
@@ -1074,20 +1042,32 @@ async fn every_address_tab_renders() {
     }
 }
 
-/// Multicall3, Permit2 and CreateX are not Tempo's, but they are deployed at
-/// canonical addresses and called constantly. Every path that names a contract
-/// must know them.
+/// Multicall3, Permit2, CreateX and the anchoring contract sit at fixed addresses
+/// that no Tempo binding covers. Every path that names a contract must know them.
 #[tokio::test]
 async fn canonical_contracts_are_named_and_searchable() {
     let (_dir, base) = serve(Value::Null).await;
     let multicall = "0xcA11bde05977b3631167028862bE2a173976CA11";
+    let anchoring = "0x0000000000000000000000000000000000000a00";
 
     let (dir, db) = temp_db("canonical.db");
     assert_eq!(
         nvnmchain_explorer::web::address_label(&db, multicall).as_deref(),
         Some("Multicall3")
     );
+    assert_eq!(
+        nvnmchain_explorer::web::address_label(&db, anchoring).as_deref(),
+        Some("Anchoring")
+    );
+    let module_admin = "0x0582bfb2e8561d48636e78f0e6b139d5a842be8f";
+    assert_eq!(
+        nvnmchain_explorer::web::address_label(&db, module_admin).as_deref(),
+        Some("Module Admin")
+    );
     drop(dir);
+
+    let page = get_json(&base, &format!("/address/{anchoring}?tab=contract")).await;
+    assert_eq!(page["interface"]["abis"], json!(["anchoring"]));
 
     let hits = suggest(&base, "permit").await;
     assert!(

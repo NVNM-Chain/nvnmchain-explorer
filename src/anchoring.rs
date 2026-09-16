@@ -1,121 +1,225 @@
-//! The anchoring precompile: one Merkle Mountain Range per caller, enshrined at
-//! T10. It keeps the leaf count and the peaks, so its two append events are the
-//! only record of which leaves arrived and what they carried.
-//!
-//! What a payload *means* is not read here: those shapes track a contract in
-//! another repo, and reading them belongs to the decoder that versions with it
-//! (`nvnmchain-anchoring`). `decode_envelope` only names the fields of the two
-//! envelopes a registry commits to, so a page shows them rather than one run of
-//! hex. A payload is only meaningful with its namespace beside it — one contract
-//! per registry, so the same commitment under two namespaces is two different
-//! records.
-//!
-//! That split is why the log is ingested here rather than read back from a
-//! general indexer: `metadata` is a dynamic `bytes`, so one decoding it as the
-//! head word hands back the ABI offset instead of the payload — and
-//! `is_self_verifying` would hash the wrong thing.
+//! The anchoring contract at `0x…0a00`, read from the node rather than the index: the
+//! registries and records it was seeded with at genesis emitted no events.
 
-use crate::decoder::{decode_abi_args, keccak256, keccak_hex, normalize_hex};
+use std::ops::RangeInclusive;
 
-/// The envelopes a registry commits to: the `bytes32` tag each leads with, and the
-/// fields behind it, named as `nvnmchain-anchoring` names them. Only the layout: what a
-/// field means, and how versions fold into a record, stays with that decoder. A payload
-/// leading with a tag not listed here falls through to its raw bytes.
-const ENVELOPES: &[(&str, &[(&str, &str)])] = &[
-    (
-        "record",
-        &[
-            ("kind", "bytes32"),
-            ("checksum_hash", "bytes32"),
-            ("index", "uint256"),
-            ("uri", "string"),
-            ("checksum", "string"),
-            ("checksum_algo", "string"),
-            ("metadata", "string"),
-            ("category", "uint8"),
-            ("data_pointer", "string"),
-            ("author", "address"),
-            ("timestamp", "uint256"),
-        ],
-    ),
-    (
-        "status",
-        &[
-            ("kind", "bytes32"),
-            ("checksum_hash", "bytes32"),
-            ("index", "uint256"),
-            ("status", "string"),
-            ("author", "address"),
-            ("seq", "uint256"),
-        ],
-    ),
-];
+use alloy_primitives::{keccak256, B256, U256};
+use alloy_sol_types::{sol, SolCall, SolValue};
+use anyhow::{Context, Result};
+use serde_json::{json, Value};
 
-/// The tag `raw` leads with, if it is one of the envelopes': the name, then zeroes to
-/// the end of the word.
-fn tag_of(raw: &[u8]) -> Option<&'static str> {
-    let word = raw.get(..32)?;
-    ENVELOPES.iter().map(|(name, _)| *name).find(|name| {
-        word.starts_with(name.as_bytes()) && word[name.len()..].iter().all(|b| *b == 0)
-    })
-}
+use crate::rpc::ChainRpc;
 
-/// The envelope tag `metadata` leads with, if any. Reads one word, so a listing labels
-/// every row without decoding a page of payloads.
-pub fn envelope_kind(metadata: &str) -> Option<&'static str> {
-    let hexed = metadata.strip_prefix("0x").unwrap_or(metadata);
-    tag_of(&hex::decode(hexed.get(..64)?).ok()?)
-}
+pub const ADDRESS: &str = "0x0000000000000000000000000000000000000a00";
 
-/// An envelope's fields after its tag, named, or `None` for a payload that leads with
-/// no tag the table knows: a batch's, an empty one, a shape added since.
-pub fn decode_envelope(metadata: &str) -> Option<(&'static str, Vec<(&'static str, String)>)> {
-    let raw = hex::decode(metadata.strip_prefix("0x").unwrap_or(metadata)).ok()?;
-    let tag = tag_of(&raw)?;
-    let fields = ENVELOPES.iter().find(|(name, _)| *name == tag)?.1;
-    let types: Vec<&str> = fields.iter().map(|(_, ty)| *ty).collect();
-    let values = decode_abi_args(&types, &raw);
-    if values.len() != fields.len() {
-        return None; // the bytes do not fit the layout
+sol! {
+    #[derive(Debug, serde::Serialize)]
+    struct Record {
+        string uri;
+        string checksum;
+        string checksumAlgo;
+        string metadata;
+        string timestamp;
+        string status;
+        uint64 recordId;
+        uint64 index;
+        bool isLatest;
+        uint64 registryId;
     }
-    let named = fields
-        .iter()
-        .map(|(name, _)| *name)
-        .zip(values)
-        .skip(1)
+
+    #[derive(Debug, serde::Serialize)]
+    struct Registry {
+        uint64 id;
+        string name;
+        string description;
+        string creator;
+        string createdAt;
+        string metadata;
+    }
+
+    #[derive(Default)]
+    struct PageRequest {
+        bytes key;
+        uint64 offset;
+        uint64 limit;
+        bool countTotal;
+        bool reverse;
+    }
+
+    struct PageResponse {
+        bytes nextKey;
+        uint64 total;
+    }
+
+    function records(uint64 registryId, string checksum, uint64 recordId, uint64 index, PageRequest pagination)
+        external view returns (Record[] recordsOut, PageResponse paginationOut);
+
+    function registries(uint64 registryId, PageRequest pagination)
+        external view returns (Registry[] registriesOut, PageResponse paginationOut);
+
+    function registriesByName(string name, uint8 matchMode, PageRequest pagination)
+        external view returns (Registry[] registriesOut, PageResponse paginationOut);
+}
+
+fn eth_call<C: SolCall>(call: &C) -> Value {
+    let data = format!("0x{}", hex::encode(call.abi_encode()));
+    json!([{"to": ADDRESS, "data": data}, "latest"])
+}
+
+fn returns<C: SolCall>(result: Value) -> Result<C::Return> {
+    let data = hex::decode(result.as_str().unwrap_or("").trim_start_matches("0x"))?;
+    C::abi_decode_returns(&data).with_context(|| format!("decode {}", C::SIGNATURE))
+}
+
+async fn view<C: SolCall>(rpc: &ChainRpc, call: C) -> Result<C::Return> {
+    returns::<C>(rpc.call("eth_call", eth_call(&call)).await?)
+}
+
+/// A storage word, for the two counts no view returns. The slots are the migration's layout,
+/// which nvnmchain-contracts' `StorageLayout.t.sol` pins.
+async fn word(rpc: &ChainRpc, slot: B256) -> Result<U256> {
+    let word = rpc
+        .eth_get_storage_at(ADDRESS, &slot.to_string(), "latest")
+        .await?;
+    word.parse().with_context(|| format!("storage word {word}"))
+}
+
+/// `_registryCount`, above `_moduleAdmin` in slot 3. Ids run `1..=count`.
+async fn registry_count(rpc: &ChainRpc) -> Result<u64> {
+    let slot = word(rpc, B256::with_last_byte(3)).await?;
+    Ok((slot >> 160usize).saturating_to())
+}
+
+/// `_recordCount[registryId]`, the mapping at slot 5. Ids run `1..=count`.
+async fn record_count(rpc: &ChainRpc, registry_id: u64) -> Result<u64> {
+    let slot = keccak256((registry_id, 5u64).abi_encode());
+    Ok(word(rpc, slot).await?.saturating_to())
+}
+
+/// The ids on 1-based page `page` of `1..=total` listed newest first, or `None` past the end.
+fn newest_first(total: u64, page: u64, per_page: u64) -> Option<RangeInclusive<u64>> {
+    let last = total
+        .checked_sub((page - 1) * per_page)
+        .filter(|&id| id > 0)?;
+    Some(last.saturating_sub(per_page - 1).max(1)..=last)
+}
+
+fn version(registry_id: u64, record_id: u64, index: u64) -> recordsCall {
+    recordsCall {
+        registryId: registry_id,
+        checksum: String::new(),
+        recordId: record_id,
+        index,
+        pagination: PageRequest::default(),
+    }
+}
+
+/// Registries newest first, and how many there are.
+pub async fn registries(rpc: &ChainRpc, page: u64, per_page: u64) -> Result<(Vec<Registry>, u64)> {
+    let total = registry_count(rpc).await?;
+    if total == 0 {
+        return Ok((Vec::new(), 0)); // nor may there be a contract to ask
+    }
+    let pagination = PageRequest {
+        offset: (page - 1) * per_page,
+        limit: per_page,
+        reverse: true,
+        ..Default::default()
+    };
+    let call = registriesCall {
+        registryId: 0,
+        pagination,
+    };
+    Ok((view(rpc, call).await?.registriesOut, total))
+}
+
+/// A registry, the latest version of each of its records newest first, and how many records
+/// it has; `None` if there is no such registry.
+pub async fn registry(
+    rpc: &ChainRpc,
+    registry_id: u64,
+    page: u64,
+    per_page: u64,
+) -> Result<Option<(Registry, Vec<Record>, u64)>> {
+    if !(1..=registry_count(rpc).await?).contains(&registry_id) {
+        return Ok(None);
+    }
+    let call = registriesCall {
+        registryId: registry_id,
+        pagination: PageRequest::default(),
+    };
+    let registry = view(rpc, call)
+        .await?
+        .registriesOut
+        .pop()
+        .context("no registry")?;
+    let total = record_count(rpc, registry_id).await?;
+    let Some(ids) = newest_first(total, page, per_page) else {
+        return Ok(Some((registry, Vec::new(), total)));
+    };
+    let pagination = PageRequest {
+        offset: ids.start() - 1,
+        limit: ids.end() - ids.start() + 1,
+        ..Default::default()
+    };
+    let call = recordsCall {
+        pagination,
+        ..version(registry_id, 0, 0)
+    };
+    let mut records = view(rpc, call).await?.recordsOut;
+    records.reverse();
+    Ok(Some((registry, records, total)))
+}
+
+/// A record's latest version, and its versions newest first; `None` if there is no such
+/// record. The latest's `index` is how many versions there are.
+pub async fn record(
+    rpc: &ChainRpc,
+    registry_id: u64,
+    record_id: u64,
+    page: u64,
+    per_page: u64,
+) -> Result<Option<(Record, Vec<Record>)>> {
+    if !(1..=record_count(rpc, registry_id).await?).contains(&record_id) {
+        return Ok(None);
+    }
+    // Index 0 asks for the latest.
+    let latest = view(rpc, version(registry_id, record_id, 0))
+        .await?
+        .recordsOut
+        .pop()
+        .context("no record")?;
+    let Some(indexes) = newest_first(latest.index, page, per_page) else {
+        return Ok(Some((latest, Vec::new())));
+    };
+    let calls = indexes
+        .rev()
+        .map(|index| {
+            (
+                "eth_call".to_string(),
+                eth_call(&version(registry_id, record_id, index)),
+            )
+        })
         .collect();
-    Some((tag, named))
+    let mut versions = Vec::new();
+    for result in rpc.batch_call(calls).await? {
+        versions.extend(returns::<recordsCall>(result?)?.recordsOut);
+    }
+    Ok(Some((latest, versions)))
 }
 
-/// Fixed at genesis (`IAnchoring.sol`).
-pub const ANCHORING_ADDRESS: &str = "0x0000000000000000000000000000000000000A00";
-
-/// Whether the commitment is `keccak256(metadata)`, as a registry's record
-/// leaves are: the envelope rides along as the leaf's payload, so the log
-/// carries the preimage of what the leaf committed to.
-///
-/// Only a single leaf can be checked this way. A batch reaches the chain as the
-/// roots of subtrees, and no row of it is logged on its own.
-pub fn is_self_verifying(commitment: &str, metadata: &str) -> bool {
-    let Ok(raw) = hex::decode(metadata.strip_prefix("0x").unwrap_or(metadata)) else {
-        return false;
+/// Registries named exactly `q`, and the latest version of the record with checksum `q` in
+/// each registry that has one. The contract matches names exactly and nothing else.
+pub async fn lookup(rpc: &ChainRpc, q: &str) -> Result<(Vec<Registry>, Vec<Record>)> {
+    let call = registriesByNameCall {
+        name: q.into(),
+        matchMode: 1,
+        pagination: PageRequest::default(),
     };
-    keccak_hex(&raw) == normalize_hex(commitment)
-}
-
-/// The root: the peaks bagged highest first, `keccak256("bag" ‖ acc ‖ peak)`,
-/// as the precompile derives it. An append event carries the peaks and not the
-/// root, which is this one fold away; no peaks is the empty tree's zero root.
-pub fn bag(peaks: &[[u8; 32]]) -> String {
-    let Some((first, rest)) = peaks.split_first() else {
-        return format!("0x{}", "00".repeat(32));
+    let named = view(rpc, call).await?.registriesOut;
+    let call = recordsCall {
+        checksum: q.into(),
+        ..version(0, 0, 0)
     };
-    let root = rest.iter().fold(*first, |acc, peak| {
-        let mut preimage = Vec::with_capacity(3 + 64);
-        preimage.extend_from_slice(b"bag");
-        preimage.extend_from_slice(&acc);
-        preimage.extend_from_slice(peak);
-        keccak256(&preimage)
-    });
-    format!("0x{}", hex::encode(root))
+    Ok((named, view(rpc, call).await?.recordsOut))
 }
