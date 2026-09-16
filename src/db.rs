@@ -662,6 +662,8 @@ pub fn get_recent_blocks(db: &Db, limit: usize) -> Vec<Block> {
 // Transactions
 // ---------------------------------------------------------------------------
 
+/// A rewrite that carries nothing for a blob keeps what is stored: the trace the
+/// transaction page cached, the raw bytes a failed decode left out.
 fn upsert_transaction(conn: &Connection, tx: &Transaction) -> Result<()> {
     exec_cached(
         conn,
@@ -677,9 +679,11 @@ fn upsert_transaction(conn: &Connection, tx: &Transaction) -> Result<()> {
             gas_used=excluded.gas_used, base_fee=excluded.base_fee,
             contract_address=excluded.contract_address, fee_token=excluded.fee_token,
             fee_amount=excluded.fee_amount,
-            input=excluded.input, raw=excluded.raw,
-            trace_data=excluded.trace_data,
-            receipt_data=excluded.receipt_data, timestamp=excluded.timestamp
+            input=excluded.input,
+            raw=COALESCE(excluded.raw, transactions.raw),
+            trace_data=COALESCE(excluded.trace_data, transactions.trace_data),
+            receipt_data=COALESCE(excluded.receipt_data, transactions.receipt_data),
+            timestamp=excluded.timestamp
         "#,
         params![
             hex_blob(&tx.hash),

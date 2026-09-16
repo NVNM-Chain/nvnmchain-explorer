@@ -616,6 +616,28 @@ fn blob_hex_round_trip() {
     assert_eq!(call_to, "0x20c0000000000000000000000000000000000000");
 }
 
+/// A re-index carrying no trace, raw bytes or receipt keeps the ones stored: the
+/// trace the transaction page cached, the raw bytes a failed decode left out.
+#[test]
+fn a_rewrite_without_the_blobs_keeps_them() {
+    let (_dir, db) = temp_db("keep-blobs.db");
+    let raw_block = sample_raw_block();
+    let block = parse_block(&raw_block);
+    let mut tx = parse_transaction(&raw_block["transactions"][0], &block);
+    tx.raw = Some("0xabcd".into());
+    tx.trace_data = Some("[]".into());
+    tx.receipt_data = Some("{}".into());
+    db::save_transaction(&db, &tx).unwrap();
+
+    let bare = parse_transaction(&raw_block["transactions"][0], &block);
+    assert!(bare.raw.is_none() && bare.trace_data.is_none());
+    db::save_transaction(&db, &bare).unwrap();
+    let stored = db::get_transaction(&db, &tx.hash).unwrap();
+    assert_eq!(stored.raw.as_deref(), Some("0xabcd"));
+    assert_eq!(stored.trace_data.as_deref(), Some("[]"));
+    assert_eq!(stored.receipt_data.as_deref(), Some("{}"));
+}
+
 #[test]
 fn duplicate_bundle_is_idempotent() {
     let (_dir, db) = temp_db("dedup.db");

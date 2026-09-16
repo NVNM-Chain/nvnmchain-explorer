@@ -98,9 +98,9 @@ pub fn parse_transaction(tx: &Value, block: &Block) -> Transaction {
         fee_token: None,
         fee_amount,
         input,
-        // The canonical RLP bytes are fetched separately by the indexer
-        // (eth_getRawTransactionByHash) and parsed at runtime with the tempo
-        // primitives — nothing else is stored per column.
+        // The canonical RLP bytes are re-encoded by the indexer from the
+        // block's own transaction object and parsed at render time with the
+        // tempo primitives — nothing else is stored per column.
         raw: None,
         trace_data: None,
         receipt_data: None,

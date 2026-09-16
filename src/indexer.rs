@@ -160,11 +160,7 @@ async fn fetch_raw_blocks(
     for (num, res) in nums.zip(results) {
         match res {
             Ok(v) if !v.is_null() => {
-                let has_txs = v
-                    .get("transactions")
-                    .and_then(Value::as_array)
-                    .is_some_and(|txs| !txs.is_empty());
-                if has_txs {
+                if has_txs(&v) {
                     need_receipts.push((blocks.len(), num));
                 }
                 blocks.push((v, None));
@@ -183,16 +179,69 @@ async fn fetch_raw_blocks(
         .collect();
     match rpc.batch_call(calls).await {
         Ok(results) => {
-            for ((idx, num), res) in need_receipts.into_iter().zip(results) {
+            for ((idx, num), res) in need_receipts.iter().zip(results) {
                 match res {
-                    Ok(v) => blocks[idx].1 = Some(v),
+                    Ok(v) if !v.is_null() => blocks[*idx].1 = Some(v),
+                    Ok(_) => warn!("getBlockReceipts({num}) answered null"),
                     Err(e) => warn!("getBlockReceipts({num}) failed: {e}"),
                 }
             }
         }
         Err(e) => warn!("receipts batch failed: {e:#}"),
     }
-    Ok(blocks)
+    // A block short of its receipts would be written as if every transaction
+    // succeeded and none paid a fee, and never revisited. One more try, a
+    // receipt at a time for a node without eth_getBlockReceipts; a block still
+    // short is left out, so the loops fetch it again.
+    for (idx, num) in need_receipts {
+        if blocks[idx].1.is_some() {
+            continue;
+        }
+        let hashes = tx_hashes(&blocks[idx].0);
+        let calls = hashes
+            .iter()
+            .map(|h| ("eth_getTransactionReceipt".into(), json!([h])))
+            .collect();
+        let receipts: Option<Vec<Value>> = match rpc.batch_call(calls).await {
+            Ok(results) if results.len() == hashes.len() => results
+                .into_iter()
+                .map(|r| r.ok().filter(|v| !v.is_null()))
+                .collect(),
+            _ => None,
+        };
+        match receipts {
+            Some(receipts) => blocks[idx].1 = Some(Value::Array(receipts)),
+            None => warn!("receipts for block {num} unavailable; leaving it for the next fetch"),
+        }
+    }
+    Ok(without_missing_receipts(blocks))
+}
+
+fn has_txs(block: &Value) -> bool {
+    block
+        .get("transactions")
+        .and_then(Value::as_array)
+        .is_some_and(|txs| !txs.is_empty())
+}
+
+fn tx_hashes(block: &Value) -> Vec<String> {
+    block
+        .get("transactions")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|t| t.get("hash").and_then(Value::as_str))
+        .map(String::from)
+        .collect()
+}
+
+/// The blocks that can be written: every block with transactions has its receipts.
+fn without_missing_receipts(blocks: Vec<(Value, Option<Value>)>) -> Vec<(Value, Option<Value>)> {
+    blocks
+        .into_iter()
+        .filter(|(block, receipts)| receipts.is_some() || !has_txs(block))
+        .collect()
 }
 
 async fn fetch_block_bundles(
@@ -680,6 +729,18 @@ impl Indexer {
         out
     }
 
+    /// `fetch_range` from `from`, cut at the first block that did not come back. What lies
+    /// above the hole is dropped and fetched again with it; nothing steps over a hole,
+    /// since neither loop ever comes back for one.
+    async fn fetch_from(&self, from: u64, to: u64) -> Vec<BlockBundle> {
+        contiguous_from(self.fetch_range(from, to).await, from)
+    }
+
+    /// `fetch_range` up to `to`, cut at the first block below it that did not come back.
+    async fn fetch_down_to(&self, from: u64, to: u64) -> Vec<BlockBundle> {
+        contiguous_down_to(self.fetch_range(from, to).await, to)
+    }
+
     async fn send_bundles(&self, bundles: impl IntoIterator<Item = BlockBundle>) -> bool {
         for b in bundles {
             if self.bundle_tx.send(b).await.is_err() {
@@ -689,6 +750,35 @@ impl Indexer {
         }
         true
     }
+}
+
+/// The bundles that run on from `from` with no hole, in order. Sorted input.
+fn contiguous_from(bundles: Vec<BlockBundle>, from: u64) -> Vec<BlockBundle> {
+    let mut expected = from;
+    bundles
+        .into_iter()
+        .take_while(|b| {
+            let hit = b.block.number as u64 == expected;
+            expected += 1;
+            hit
+        })
+        .collect()
+}
+
+/// The bundles that run down from `to` with no hole, still in ascending order. Sorted input.
+fn contiguous_down_to(bundles: Vec<BlockBundle>, to: u64) -> Vec<BlockBundle> {
+    let mut expected = to;
+    let mut kept: Vec<BlockBundle> = bundles
+        .into_iter()
+        .rev()
+        .take_while(|b| {
+            let hit = b.block.number as u64 == expected;
+            expected = expected.wrapping_sub(1);
+            hit
+        })
+        .collect();
+    kept.reverse();
+    kept
 }
 
 /// Collapse every queued head into the highest one seen. The watcher polls and
@@ -716,7 +806,7 @@ async fn wait_for_seed(db: &Db) -> u64 {
     }
 }
 
-async fn forward_loop(ix: Indexer, block_events: broadcast::Sender<Value>) {
+async fn forward_loop(mut ix: Indexer, block_events: broadcast::Sender<Value>) {
     let (head_tx, mut head_rx) = mpsc::channel::<u64>(256);
     tokio::spawn(crate::ws::head_watcher(
         ix.rpc.clone(),
@@ -760,7 +850,17 @@ async fn forward_loop(ix: Indexer, block_events: broadcast::Sender<Value>) {
             db::set_chain_head(&ix.db, head as i64);
             let end = sent.saturating_add(ix.cfg.batch).min(head);
             ix.set_tip_lag(head.saturating_sub(sent));
-            let bundles = ix.fetch_range(sent + 1, end).await;
+            let bundles = ix.fetch_from(sent + 1, end).await;
+            // Nothing past `sent` came back: the fetch failed, or the node has
+            // not caught up with the head it announced. Ask again after a
+            // moment; stepping over the block would leave a hole for good.
+            let Some(reached) = bundles.last().map(|b| b.block.number as u64) else {
+                warn!("blocks {}..={end} not fetched; retrying", sent + 1);
+                if sleep_or_shutdown(&mut ix.shutdown, ix.cfg.poll).await {
+                    return;
+                }
+                continue;
+            };
             // Live feed is tip-only and in number order: concurrent fetches
             // complete out of order, and backfill must not reach viewers.
             for b in &bundles {
@@ -773,7 +873,7 @@ async fn forward_loop(ix: Indexer, block_events: broadcast::Sender<Value>) {
             if !ix.send_bundles(bundles).await {
                 return;
             }
-            sent = end;
+            sent = reached;
         }
         ix.set_tip_lag(0);
     }
@@ -822,7 +922,9 @@ async fn backfill_loop(mut ix: Indexer) {
             },
         };
         let start = target.saturating_sub(ix.cfg.batch).max(1);
-        let bundles = ix.fetch_range(start, target - 1).await;
+        // Cut at the first hole below the target: the frontier only descends,
+        // so a block left above it would never be fetched again.
+        let bundles = ix.fetch_down_to(start, target - 1).await;
         if bundles.is_empty() {
             consecutive_failures += 1;
             let backoff = Duration::from_millis(200 * consecutive_failures.min(10) as u64);
@@ -831,13 +933,7 @@ async fn backfill_loop(mut ix: Indexer) {
             }
             continue;
         }
-        // Blocks the range failed to fetch must stay above the frontier or
-        // nothing ever revisits them: it only descends, and a hole below it is
-        // out of reach. `fetch_range` sorts, so the first bundle is the lowest.
-        let reached = bundles
-            .first()
-            .map(|b| b.block.number as u64)
-            .unwrap_or(start);
+        let reached = bundles[0].block.number as u64;
         // Tip-first so the head lands in the DB as soon as possible (the
         // forward loop waits for it on a fresh database).
         if !ix.send_bundles(bundles.into_iter().rev()).await {
@@ -894,10 +990,11 @@ pub async fn run_forever(
     let (bundle_tx, mut bundle_rx) = mpsc::channel::<BlockBundle>(1024);
     let writer_db = db.clone();
     let writer_shutdown = shutdown.clone();
-    // The writer only persists. Live streaming happens in the forward loop,
-    // which re-reads each freshly indexed range from the DB in number order
-    // (concurrent fetches complete out of order, so the writer cannot emit
-    // gaplessly, and backfill history must not reach the live feed at all).
+    // The writer only persists. The forward loop streams what it fetched, in
+    // number order, before handing it here: concurrent fetches complete out
+    // of order, so the writer could not emit gaplessly, and backfill must not
+    // reach the live feed at all. A viewer can see a block a moment before it
+    // is queryable, while the writer commits it.
     // How many queued bundles may share one commit. Only bounds how much one
     // transaction holds: a writer that is keeping up sees an empty queue and
     // commits per block; batching engages only once it falls behind.
@@ -920,8 +1017,17 @@ pub async fn run_forever(
                 batch.push(next);
             }
             if let Err(e) = db::save_block_bundles(&writer_db, &batch) {
+                // One bad bundle failed the whole batch; write the rest on
+                // their own so one block is lost rather than sixty-four.
                 let (first, last) = (batch[0].block.number, batch[batch.len() - 1].block.number);
-                warn!("db write failed for blocks {first}..={last}: {e:#}");
+                warn!(
+                    "db write failed for blocks {first}..={last}: {e:#}; writing them one by one"
+                );
+                for bundle in &batch {
+                    if let Err(e) = db::save_block_bundle(&writer_db, bundle) {
+                        tracing::error!("block {} not written: {e:#}", bundle.block.number);
+                    }
+                }
             }
         }
     });
@@ -1178,6 +1284,50 @@ mod tests {
             chunks(u64::MAX - 1, u64::MAX, 16),
             vec![u64::MAX - 1..=u64::MAX]
         );
+    }
+
+    /// A block that did not come back must not be stepped over: what the forward
+    /// loop sends stops below it, what backfill sends stops above it.
+    #[test]
+    fn a_hole_cuts_the_run_on_either_side() {
+        let fetched = |nums: &[u64]| -> Vec<BlockBundle> {
+            nums.iter()
+                .map(|n| assemble_bundle(&json!({"number": format!("0x{n:x}")}), None))
+                .collect()
+        };
+        let numbers = |bundles: &[BlockBundle]| -> Vec<i64> {
+            bundles.iter().map(|b| b.block.number).collect()
+        };
+        assert_eq!(
+            numbers(&contiguous_from(fetched(&[10, 11, 13]), 10)),
+            [10, 11]
+        );
+        assert!(contiguous_from(fetched(&[11, 12]), 10).is_empty());
+        assert_eq!(
+            numbers(&contiguous_down_to(fetched(&[10, 11, 13]), 13)),
+            [13]
+        );
+        assert!(contiguous_down_to(fetched(&[10, 11]), 13).is_empty());
+        assert_eq!(
+            numbers(&contiguous_down_to(fetched(&[10, 11, 12, 13]), 13)),
+            [10, 11, 12, 13]
+        );
+    }
+
+    /// A block with transactions but no receipts is not a block to write.
+    #[test]
+    fn a_block_short_of_its_receipts_is_left_out() {
+        let with = json!({"number": "0x1", "transactions": [{"hash": "0xab"}]});
+        let empty = json!({"number": "0x2", "transactions": []});
+        let kept = without_missing_receipts(vec![
+            (with.clone(), None),
+            (empty.clone(), None),
+            (with.clone(), Some(json!([{}]))),
+        ]);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].0, empty);
+        assert_eq!(kept[1].0, with);
+        assert_eq!(tx_hashes(&with), ["0xab"]);
     }
 
     #[test]
