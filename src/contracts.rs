@@ -320,9 +320,8 @@ mod tests {
         }
     }
 
-    /// The module admin's ABI is vendored from the same submodule as the anchoring contract's,
-    /// so the registry decodes the calls the two owners send it and the event it emits when
-    /// the break-glass grant runs.
+    /// The module admin is a Safe, so the registry decodes the transaction two of its owners
+    /// sign and the event it emits when the break-glass grant runs.
     #[test]
     fn the_module_admin_shows_its_own_interface() {
         let module_admin = "0x0582bfb2e8561d48636e78f0e6b139d5a842be8f";
@@ -334,13 +333,13 @@ mod tests {
         let contract = crate::decoder::REGISTRY
             .contract("module_admin")
             .expect("module_admin registered");
-        for function in ["propose", "confirm", "owners"] {
+        for function in ["execTransaction", "swapOwner", "getOwners"] {
             assert!(
                 contract.functions().any(|f| f.name == function),
                 "`{function}` missing from the module admin ABI"
             );
         }
-        assert!(contract.events().any(|e| e.name == "Executed"));
+        assert!(contract.events().any(|e| e.name == "ExecutionSuccess"));
     }
 
     /// The lookup must not care how an address is spelled.

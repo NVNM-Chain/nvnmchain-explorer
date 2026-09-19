@@ -853,27 +853,64 @@ static PHRASES: &[Phrase] = &[
         ("Registry", Slot::Value("registryId")),
         ("Record", Slot::Value("checksum")),
     ]),
-    // The module admin multisig: a call to the anchoring contract proposed by one owner,
-    // confirmed by another, and run once the second confirmation lands.
+    // The module admin, which is a Safe. Its owners sign off chain and anyone relays, so what
+    // lands on chain is the run, not the signing -- and never SafeSetup, which genesis stands in
+    // for by writing the state itself.
+    phrase("ExecutionSuccess(bytes32,uint256)", "safe transaction run", "Execute", &[]),
+    phrase("ExecutionFailure(bytes32,uint256)", "safe transaction reverted", "Execute", &[]),
+    phrase("SafeSetup(address,address[],uint256,address,address)", "safe set up", "Setup", &[]),
+    phrase("SignMsg(bytes32)", "message signed", "Sign Message", &[]),
     phrase(
-        "Proposed(uint256,address,bytes)",
-        "proposal made",
-        "Propose",
+        "ApproveHash(bytes32,address)",
+        "safe transaction approved",
+        "Approve Hash",
         &[Slot::Word("by"), Slot::Account("owner")],
-    )
-    .notes(&[("Proposal", Slot::Value("id"))]),
+    ),
+    phrase("AddedOwner(address)", "owner added", "Add Owner", &[Slot::Account("owner")]),
+    phrase("RemovedOwner(address)", "owner removed", "Remove Owner", &[Slot::Account("owner")]),
     phrase(
-        "Confirmed(uint256,address,uint8)",
-        "proposal confirmed",
-        "Confirm",
-        &[Slot::Word("by"), Slot::Account("owner")],
-    )
-    .notes(&[
-        ("Proposal", Slot::Value("id")),
-        ("Confirmations", Slot::Value("confirmations")),
-    ]),
-    phrase("Executed(uint256,bytes)", "proposal executed", "Execute", &[])
-        .notes(&[("Proposal", Slot::Value("id"))]),
+        "ChangedThreshold(uint256)",
+        "threshold changed",
+        "Change Threshold",
+        &[Slot::Word("to"), Slot::Value("threshold")],
+    ),
+    phrase("EnabledModule(address)", "module enabled", "Enable Module", &[Slot::Account("module")]),
+    phrase(
+        "DisabledModule(address)",
+        "module disabled",
+        "Disable Module",
+        &[Slot::Account("module")],
+    ),
+    phrase(
+        "ExecutionFromModuleSuccess(address)",
+        "module transaction run",
+        "Execute From Module",
+        &[Slot::Account("module")],
+    ),
+    phrase(
+        "ExecutionFromModuleFailure(address)",
+        "module transaction reverted",
+        "Execute From Module",
+        &[Slot::Account("module")],
+    ),
+    phrase(
+        "ChangedFallbackHandler(address)",
+        "fallback handler changed",
+        "Change Fallback Handler",
+        &[Slot::Word("to"), Slot::Account("handler")],
+    ),
+    phrase(
+        "ChangedGuard(address)",
+        "guard changed",
+        "Change Guard",
+        &[Slot::Word("to"), Slot::Account("guard")],
+    ),
+    phrase(
+        "SafeReceived(address,uint256)",
+        "safe received",
+        "Receive",
+        &[Slot::Word("from"), Slot::Account("sender")],
+    ),
 ];
 
 // ---------------------------------------------------------------------------
