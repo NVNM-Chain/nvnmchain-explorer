@@ -1086,11 +1086,6 @@ async fn canonical_contracts_are_named_and_searchable() {
         nvnmchain_explorer::web::address_label(&db, anchoring).as_deref(),
         Some("Anchoring")
     );
-    let module_admin = "0x0582bfb2e8561d48636e78f0e6b139d5a842be8f";
-    assert_eq!(
-        nvnmchain_explorer::web::address_label(&db, module_admin).as_deref(),
-        Some("Module Admin")
-    );
     drop(dir);
 
     let page = get_json(&base, &format!("/address/{anchoring}?tab=contract")).await;
