@@ -1,16 +1,11 @@
 //! The anchoring pages, over a stub node that answers like the contract: 30 registries,
 //! registry 1 with 27 records and its record 1 with 30 versions, so every listing pages.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use alloy_primitives::{B256, U256};
 use alloy_sol_types::SolCall;
-use axum::{
-    extract::{Query, State},
-    routing::post,
-    Json, Router,
-};
+use axum::{extract::State, routing::post, Json, Router};
 use nvnmchain_explorer::anchoring::{
     recordsCall, recordsReturn, registriesByNameCall, registriesByNameReturn, registriesCall,
     registriesReturn, PageResponse, Record, Registry,
@@ -138,8 +133,37 @@ fn answer(data: &[u8], registries: u64) -> Vec<u8> {
     }
 }
 
-fn respond(request: &Value, registries: u64) -> Value {
+/// `anchoring_searchRegistriesByName` as a node running the index answers it: the
+/// registries whose lowercased name contains the query, by id, with an id as a number.
+fn search_registries_by_name(params: &Value, registries: u64) -> Value {
+    let name = params[0]["name"]
+        .as_str()
+        .unwrap_or_default()
+        .to_lowercase();
+    assert_eq!(params[0]["mode"], "contains", "the box asks for contains");
+    let rows: Vec<Value> = (1..=registries)
+        .map(registry)
+        .filter(|r| r.name.to_lowercase().contains(&name))
+        .take(params[0]["limit"].as_u64().unwrap_or(50) as usize)
+        .map(|r| {
+            json!({"id": r.id, "name": r.name, "description": r.description,
+                        "creator": r.creator, "createdAt": r.createdAt, "metadata": r.metadata})
+        })
+        .collect();
+    json!({ "registries": rows })
+}
+
+fn respond(request: &Value, registries: u64, indexing: bool) -> Value {
     let params = &request["params"];
+    if request["method"] == "anchoring_searchRegistriesByName" {
+        // A node started without `--anchoring.name-index` never registers the namespace.
+        return match indexing {
+            true => json!({"jsonrpc": "2.0", "id": request["id"],
+                           "result": search_registries_by_name(params, registries)}),
+            false => json!({"jsonrpc": "2.0", "id": request["id"],
+                            "error": {"code": -32601, "message": "Method not found"}}),
+        };
+    }
     let result = match request["method"].as_str().unwrap() {
         "eth_getStorageAt" => {
             let slot = params[1].as_str().unwrap();
@@ -165,14 +189,24 @@ fn respond(request: &Value, registries: u64) -> Value {
     json!({"jsonrpc": "2.0", "id": request["id"], "result": result})
 }
 
+/// A node with no name index: the search namespace is not registered.
 async fn stub_node(registries: u64) -> String {
-    let handler = |State(registries): State<u64>, Json(body): Json<Value>| async move {
+    node(registries, false).await
+}
+
+/// A node started with `--anchoring.name-index`, which also answers the search.
+async fn stub_indexing_node(registries: u64) -> String {
+    node(registries, true).await
+}
+
+async fn node(registries: u64, indexing: bool) -> String {
+    let handler = move |State(registries): State<u64>, Json(body): Json<Value>| async move {
         Json(match body.as_array() {
             Some(batch) => json!(batch
                 .iter()
-                .map(|r| respond(r, registries))
+                .map(|r| respond(r, registries, indexing))
                 .collect::<Vec<_>>()),
-            None => respond(&body, registries),
+            None => respond(&body, registries, indexing),
         })
     };
     let app = Router::new()
@@ -186,21 +220,12 @@ async fn stub_node(registries: u64) -> String {
 
 /// The explorer, reading `rpc_url`.
 async fn serve(rpc_url: String) -> (tempfile::TempDir, String) {
-    serve_with(rpc_url, None).await
-}
-
-/// The explorer over a stub node, and the name index beside it when there is one.
-async fn serve_with(
-    rpc_url: String,
-    name_search_url: Option<String>,
-) -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().unwrap();
     let conn = db::init_db(dir.path().join("anchoring.db").to_str().unwrap()).unwrap();
     let db = Arc::new(Mutex::new(conn));
     let mut cfg = Settings::from_env();
     cfg.signature_lookup_url = None;
     cfg.rpc_url = rpc_url;
-    cfg.name_search_url = name_search_url;
     let state = AppState {
         tera: web::build_tera(db.clone()).unwrap(),
         db,
@@ -384,39 +409,11 @@ async fn the_search_box_finds_a_registry_by_name_and_a_record_by_checksum() {
     assert!(kinds.contains(&"registry"), "{suggestions}");
 }
 
-/// A stub name index: the registries whose name starts with the query, in id order,
-/// written as the service writes them -- proto JSON, so an id is a string.
-async fn stub_name_index() -> String {
-    async fn search(Query(params): Query<HashMap<String, String>>) -> Json<Value> {
-        let name = params
-            .get("name")
-            .cloned()
-            .unwrap_or_default()
-            .to_lowercase();
-        // Prefix is the only mode the box asks for; the explorer bounds the page itself.
-        let rows: Vec<Value> = (1..=30)
-            .map(registry)
-            .filter(|r| r.name.to_lowercase().starts_with(&name))
-            .map(|r| json!({"id": r.id.to_string(), "name": r.name}))
-            .collect();
-        Json(json!({"registries": rows, "pagination": null}))
-    }
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let app = Router::new().route(
-        "/NVNM-Chain/nvnmchain/anchoring/v1/registries/search",
-        axum::routing::get(search),
-    );
-    tokio::spawn(async move { axum::serve(listener, app).await });
-    format!("http://{addr}")
-}
-
-/// Half a name matches only in the index beside the chain: the contract answers a whole
-/// one and nothing less.
+/// Half a name matches only in the node's name index: the contract answers a whole one
+/// and nothing less.
 #[tokio::test]
 async fn the_search_box_takes_half_a_name_from_the_index() {
-    let (_dir, base) = serve_with(stub_node(30).await, Some(stub_name_index().await)).await;
+    let (_dir, base) = serve(stub_indexing_node(30).await).await;
 
     let (_, suggestions) = get(&base, "/api/search?q=reg-1").await;
     let rows: Vec<(&str, &str)> = suggestions["results"]
@@ -445,7 +442,8 @@ async fn the_search_box_takes_half_a_name_from_the_index() {
     let (_, found) = get(&base, "/search?q=reg-2").await;
     assert_eq!(found["match"]["url"], "/anchoring/20");
 
-    // Without an index, the same half name finds nothing.
+    // On a node that does not serve the search, the same half name finds nothing — and
+    // the method being absent is not an error the box shows.
     let (_dir, bare) = serve(stub_node(30).await).await;
     let (_, none) = get(&bare, "/search?q=reg-2").await;
     assert_eq!(none["match"], Value::Null);

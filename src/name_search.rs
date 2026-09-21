@@ -1,57 +1,48 @@
-//! The registry name index, when an operator runs one.
+//! The registry name index, when the node is running one.
 //!
-//! The contract answers a whole name and nothing else, so any part of one matches only here:
-//! nvnmchain-anchoring, on the route the Cosmos module served the search on. A courtesy,
-//! never a dependency -- without it the box still finds a whole name, from the contract.
+//! The contract answers a whole name and nothing else, so any part of one matches only in
+//! `anchoring_searchRegistriesByName`, which a node serves when started with
+//! `--anchoring.name-index`. A courtesy, never a dependency: without it the box still finds
+//! a whole name, from the contract.
 
 use std::time::Duration;
 
+use anyhow::{Context, Result};
 use serde::Deserialize;
+use serde_json::json;
 
-/// A keystroke must not wait on another service. Shared with the contract half of
-/// a suggestion, which is subject to the same impatience.
+use crate::rpc::ChainRpc;
+
+/// A keystroke must not wait on a busy node. The contract half of a suggestion shares it.
 pub const TIMEOUT: Duration = Duration::from_secs(2);
 
-/// `RegistryNameMatchMode.REGISTRY_NAME_MATCH_MODE_CONTAINS`. A reader types the part of
-/// the name they remember, which is as often the middle as the start.
-const CONTAINS: &str = "4";
+/// A reader remembers the middle of a name as often as its start.
+const CONTAINS: &str = "contains";
 
-/// Rows asked for per row shown: the index answers by id, so the name meant can sit behind
-/// longer ones that merely contain it.
+/// Rows asked for per row shown.
 const OVERFETCH: usize = 8;
 
-const SEARCH_PATH: &str = "/NVNM-Chain/nvnmchain/anchoring/v1/registries/search";
-
-/// A registry the index matched.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A registry the index matched, read down to what a suggestion shows.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Named {
     pub id: u64,
     pub name: String,
 }
 
-/// The service's answer. Proto JSON, so `id` is a string.
+/// The node's answer.
 #[derive(Deserialize)]
 struct Answer {
-    registries: Option<Vec<Row>>,
-}
-
-#[derive(Deserialize)]
-struct Row {
-    id: String,
-    name: String,
+    #[serde(default)]
+    registries: Vec<Named>,
 }
 
 /// Registries whose name contains `q`, best first, at most `limit`.
 ///
 /// Empty for anything that goes wrong: the box is better without a row than broken by a
-/// service that is down, slow, or answering something else.
-pub async fn matching(client: &reqwest::Client, base: &str, q: &str, limit: usize) -> Vec<Named> {
-    match ask(client, base, q, limit.saturating_mul(OVERFETCH)).await {
-        Ok(mut named) => {
-            rank(&mut named, &q.to_lowercase());
-            named.truncate(limit);
-            named
-        }
+/// node that is down, slow, or not running the index.
+pub async fn matching(rpc: &ChainRpc, q: &str, limit: usize) -> Vec<Named> {
+    match ask(rpc, q, limit).await {
+        Ok(named) => named,
         Err(e) => {
             tracing::debug!("name index: {e}");
             Vec::new()
@@ -60,7 +51,7 @@ pub async fn matching(client: &reqwest::Client, base: &str, q: &str, limit: usiz
 }
 
 /// The whole name first, then the names beginning with it, then the rest, each by id.
-/// Cached, or the key is lowercased again at every comparison.
+/// Cached: the key is otherwise lowercased at every comparison.
 fn rank(named: &mut [Named], lower: &str) {
     named.sort_by_cached_key(|n| {
         let name = n.name.to_lowercase();
@@ -75,36 +66,20 @@ fn rank(named: &mut [Named], lower: &str) {
     });
 }
 
-async fn ask(
-    client: &reqwest::Client,
-    base: &str,
-    q: &str,
-    limit: usize,
-) -> reqwest::Result<Vec<Named>> {
-    let answer: Answer = client
-        .get(format!("{}{SEARCH_PATH}", base.trim_end_matches('/')))
-        .query(&[
-            ("name", q),
-            ("mode", CONTAINS),
-            ("pagination.limit", &limit.to_string()),
-        ])
-        .timeout(TIMEOUT)
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    Ok(answer
-        .registries
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|row| {
-            Some(Named {
-                id: row.id.parse().ok()?,
-                name: row.name,
-            })
-        })
-        .collect())
+/// The index answers by id, so the name meant can sit behind longer ones that merely
+/// contain it: ask for more than will be shown, then rank.
+async fn ask(rpc: &ChainRpc, q: &str, limit: usize) -> Result<Vec<Named>> {
+    let call = rpc.call(
+        "anchoring_searchRegistriesByName",
+        json!([{"name": q, "mode": CONTAINS, "limit": limit.saturating_mul(OVERFETCH)}]),
+    );
+    let answer = tokio::time::timeout(TIMEOUT, call)
+        .await
+        .context("timed out")??;
+    let mut named = serde_json::from_value::<Answer>(answer)?.registries;
+    rank(&mut named, &q.to_lowercase());
+    named.truncate(limit);
+    Ok(named)
 }
 
 #[cfg(test)]
@@ -142,5 +117,23 @@ mod tests {
         rank(&mut hits, "wash");
         let order: Vec<_> = hits.iter().map(|n| n.id).collect();
         assert_eq!(order, [1, 2]);
+    }
+
+    /// The node returns an id as a number and the fields the page never shows; taking the
+    /// two that matter is what keeps a later field from breaking the box.
+    #[test]
+    fn a_row_is_read_from_the_nodes_answer() {
+        let answer = json!({"registries": [
+            {"id": 7, "name": "Fund Alpha", "description": "", "creator": "nvnm1…",
+             "createdAt": "2026-09-21 00:00:00 +0000 UTC", "metadata": "{}"}
+        ]});
+        let parsed: Answer = serde_json::from_value(answer).unwrap();
+        assert_eq!(
+            parsed.registries,
+            [Named {
+                id: 7,
+                name: "Fund Alpha".into()
+            }]
+        );
     }
 }

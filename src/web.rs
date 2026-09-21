@@ -1914,9 +1914,9 @@ impl Hit {
     }
 }
 
-/// What the contract knows about `q`, best first: a registry by its whole name, a record by
-/// its checksum, then registries whose name contains it, which only the index beside the
-/// chain matches. Empty when neither knows it, or cannot be reached.
+/// What the chain knows about `q`, best first: a registry by its whole name, a record by
+/// its checksum, then registries whose name contains it, which only a node running the
+/// name index matches. Empty when neither knows it, or cannot be reached.
 async fn anchoring_hits(state: &AppState, q: &str, limit: usize) -> Vec<Hit> {
     let mut hits = Vec::new();
     // Two calls to the node per keystroke: a slow node costs the reader these
@@ -1931,12 +1931,10 @@ async fn anchoring_hits(state: &AppState, q: &str, limit: usize) -> Vec<Hit> {
         hits.extend(records.iter().map(Hit::record));
     }
     if hits.len() < limit {
-        if let Some(base) = state.cfg.name_search_url.as_deref() {
-            for named in name_search::matching(state.rpc.http_client(), base, q, limit).await {
-                let hit = Hit::registry(named.id, named.name);
-                if !hits.iter().any(|seen| seen.url == hit.url) {
-                    hits.push(hit);
-                }
+        for named in name_search::matching(&state.rpc, q, limit).await {
+            let hit = Hit::registry(named.id, named.name);
+            if !hits.iter().any(|seen| seen.url == hit.url) {
+                hits.push(hit);
             }
         }
     }

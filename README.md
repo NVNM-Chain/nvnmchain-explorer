@@ -141,7 +141,6 @@ The indexer is built for a sub-second chain:
 | `NATIVE_SYMBOL` | `OM` | Symbol shown for native (burnt/gas) amounts |
 | `STATS_INTERVAL_SECONDS` | `5` | How often the dashboard stats are recomputed |
 | `SIGNATURE_LOOKUP_URL` | OpenChain | Signature directory for selectors no built-in ABI declares; set empty to disable ([Decoding](#decoding)) |
-| `NAME_SEARCH_URL` | unset | nvnmchain-anchoring's registry name index, so the search box takes any part of a name |
 | `RUST_LOG` | `nvnmchain_explorer=info` | Log verbosity |
 
 ## Routes
@@ -189,8 +188,9 @@ uses, so the explorer cannot decode against an ABI the contract no longer has.
 The anchoring pages read that contract over RPC, not the index: the corpus it
 was seeded with at genesis emitted no events. So does the search box, for a whole
 registry name or a record's checksum — all the contract matches. Any part of a name
-matches only in nvnmchain-anchoring's index: set `NAME_SEARCH_URL` and the box takes it
-from there, at a request per keystroke.
+matches only in the node's registry name index: start the node with
+`--anchoring.name-index` and the box asks it, at a request per keystroke. A node without
+it answers "method not found", which costs the box those rows and nothing else.
 
 Each decoded log is also said in words, from the phrasing table in
 `src/summary.rs`, and the transaction page leads with that sentence. Two tests

@@ -35,8 +35,6 @@ pub struct Settings {
     /// Answers are cached in the database, misses included. `None` disables it
     /// — the explorer then never talks to a third party.
     pub signature_lookup_url: Option<String>,
-    /// nvnmchain-anchoring's registry name index, which is what matches half a name.
-    pub name_search_url: Option<String>,
 }
 
 /// OpenChain's signature directory, queried at most once per selector per
@@ -108,21 +106,12 @@ impl Settings {
             native_symbol: env_or("NATIVE_SYMBOL", "NVNM"),
             stats_interval_seconds: env_f64("STATS_INTERVAL_SECONDS", 5.0).clamp(1.0, 3600.0),
             signature_lookup_url: signature_lookup_url(),
-            name_search_url: trimmed("NAME_SEARCH_URL"),
         }
     }
 }
 
 /// The signature directory to consult, or `None` when the operator has turned
 /// the lookup off with an empty `SIGNATURE_LOOKUP_URL`.
-/// An optional URL from the environment: unset or blank is `None`.
-fn trimmed(key: &str) -> Option<String> {
-    env::var(key)
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-}
-
 fn signature_lookup_url() -> Option<String> {
     match env::var("SIGNATURE_LOOKUP_URL") {
         Ok(url) if url.trim().is_empty() => None,
