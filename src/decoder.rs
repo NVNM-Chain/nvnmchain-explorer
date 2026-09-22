@@ -1,21 +1,278 @@
-//! ABI decoding for calls, events, traces, and balance changes.
+//! ABI decoding for calls, events, reverts, traces, and balance changes.
 //!
-//! ABI type parsing and argument decoding are delegated to ethers-core
-//! ([`HumanReadableParser`] + the ethabi decoder), with a thin formatter on
-//! top that renders addresses checksummed and integers decimal. Built-in
-//! TIP-20 / ERC-20 token metadata and labels round it out.
+//! What a selector or `topic0` means comes from [`REGISTRY`], built from the
+//! `tempo-contracts` bindings, where `#[sol(abi)]` turns each `interface` into
+//! a JSON ABI at compile time — the Solidity the node is built from, not a
+//! copy of it. The rest is the display layer over it: it decodes the arguments
+//! and renders them the way the explorer shows values, with addresses EIP-55
+//! checksummed, integers decimal and bytes hex.
 
-use std::{collections::HashMap, sync::LazyLock};
+use std::collections::HashMap;
+use std::sync::LazyLock;
 
+use alloy_json_abi::JsonAbi;
+// `ethers_core::abi::AbiError` is ethers' own error enum; the ABI *error
+// definition* is ethabi's, reachable only through the re-exported crate.
+use ethers_core::abi::ethabi::AbiError;
 use ethers_core::abi::{
-    decode as abi_decode, HumanReadableParser, ParamType, Token, Uint as EthersUint,
+    decode as abi_decode, ethabi::RawLog, Contract, Event, Function, HumanReadableParser, Param,
+    ParamType, Token, Uint as EthersUint,
 };
-use num_bigint::{BigInt, Sign};
+use num_bigint::BigInt;
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha3::{Digest, Keccak256};
 
 use crate::models::Transaction;
+
+// ---------------------------------------------------------------------------
+// The ABI registry
+// ---------------------------------------------------------------------------
+
+/// What no binding declares: the errors every Solidity `revert` produces.
+///
+/// Written as signatures rather than hand-built ABIs. A signature is what the
+/// selector hashes, so there is one spelling to get right and it reads like
+/// Solidity; a mistyped type does not parse at all, which
+/// `every_local_declaration_parses` catches, and `local_selectors_are_pinned`
+/// pins what they hash to so a renamed argument cannot pass unnoticed.
+const LOCAL: &[(&str, &[&str])] = &[(
+    "solidity",
+    &["error Error(string message)", "error Panic(uint256 code)"],
+)];
+
+/// Every Tempo precompile, from the chain's own `tempo-contracts` bindings.
+///
+/// `#[sol(abi)]` there turns each `interface` into a JSON ABI at compile time,
+/// so these are the Solidity the node is built from rather than a copy of it:
+/// an interface that changes upstream arrives with a `cargo update`, and one
+/// that is renamed fails to compile here.
+fn tempo_contracts() -> Vec<(&'static str, JsonAbi)> {
+    use tempo_contracts::precompiles::*;
+    vec![
+        ("tip20", tip20::ITIP20::abi::contract()),
+        ("tip20_roles_auth", tip20::IRolesAuth::abi::contract()),
+        (
+            "tip20_factory",
+            tip20_factory::ITIP20Factory::abi::contract(),
+        ),
+        (
+            "tip20_channel_reserve",
+            tip20_channel_reserve::ITIP20ChannelReserve::abi::contract(),
+        ),
+        (
+            "tip403_registry",
+            tip403_registry::ITIP403Registry::abi::contract(),
+        ),
+        ("fee_manager", tip_fee_manager::IFeeManager::abi::contract()),
+        ("fee_amm", tip_fee_manager::ITIPFeeAMM::abi::contract()),
+        (
+            "stablecoin_dex",
+            stablecoin_dex::IStablecoinDEX::abi::contract(),
+        ),
+        (
+            "account_keychain",
+            account_keychain::IAccountKeychain::abi::contract(),
+        ),
+        ("nonce", nonce::INonce::abi::contract()),
+        (
+            "validator_config_v2",
+            validator_config_v2::IValidatorConfigV2::abi::contract(),
+        ),
+        (
+            "validator_config",
+            validator_config::IValidatorConfig::abi::contract(),
+        ),
+        (
+            "receive_policy_guard",
+            receive_policy_guard::IReceivePolicyGuard::abi::contract(),
+        ),
+        (
+            "storage_credits",
+            storage_credits::IStorageCredits::abi::contract(),
+        ),
+        (
+            "signature_verifier",
+            signature_verifier::ISignatureVerifier::abi::contract(),
+        ),
+        (
+            "address_registry",
+            address_registry::IAddressRegistry::abi::contract(),
+        ),
+        (
+            "current_committee",
+            current_committee::ICurrentCommittee::abi::contract(),
+        ),
+    ]
+}
+
+/// Contracts that are not Tempo's, so no binding carries them; without these their calls decode to
+/// a bare selector. The canonical deployments are vendored under `abi/`; anchoring comes from the
+/// nvnmchain-contracts submodule, so it cannot drift from what it decodes.
+const VENDORED: &[(&str, &str)] = &[
+    ("multicall3", include_str!("../abi/multicall3.json")),
+    ("permit2", include_str!("../abi/permit2.json")),
+    ("createx", include_str!("../abi/createx.json")),
+    (
+        "anchoring",
+        include_str!("../contracts/layout/anchoring.abi.json"),
+    ),
+];
+
+/// One parsed ABI and the name it was registered under.
+struct NamedContract {
+    name: &'static str,
+    contract: Contract,
+}
+
+/// Everything the registry answers, built once.
+pub(crate) struct Registry {
+    /// Registration order, so a lookup can say which ABI a match came from.
+    contracts: Vec<NamedContract>,
+    /// Selector -> (contract index, function).
+    functions: HashMap<[u8; 4], (usize, Function)>,
+    /// `topic0` -> (contract index, event).
+    events: HashMap<[u8; 32], (usize, Event)>,
+    /// Selector -> (contract index, error).
+    errors: HashMap<[u8; 4], (usize, AbiError)>,
+}
+
+/// Canonical `name(type,type)` signature — what the selector/topic hashes.
+fn signature_of(name: &str, inputs: impl Iterator<Item = ParamType>) -> String {
+    let types: Vec<String> = inputs.map(|t| t.to_string()).collect();
+    format!("{name}({})", types.join(","))
+}
+
+pub(crate) fn function_signature(f: &Function) -> String {
+    signature_of(&f.name, f.inputs.iter().map(|p| p.kind.clone()))
+}
+
+pub(crate) fn event_signature(e: &Event) -> String {
+    signature_of(&e.name, e.inputs.iter().map(|p| p.kind.clone()))
+}
+
+fn error_signature(e: &AbiError) -> String {
+    signature_of(&e.name, e.inputs.iter().map(|p| p.kind.clone()))
+}
+
+/// One [`LOCAL`] group, parsed into the same `Contract` the bindings convert to.
+///
+/// `parse_abi` cannot express an anonymous tuple parameter; should a
+/// declaration ever need one, parse it with `HumanReadableParser` instead.
+fn local_contract(name: &str, declarations: &[&str]) -> Contract {
+    ethers_core::abi::parse_abi(declarations)
+        .map_err(|e| tracing::error!("the local ABI `{name}` failed to parse: {e}"))
+        .unwrap_or_default()
+}
+
+/// Alloy's ABI type and ethabi's are the same wire format, so one serde hop
+/// bridges the bindings into the `Contract` the rest of this module uses.
+fn from_json_abi(abi: &JsonAbi) -> Result<Contract, serde_json::Error> {
+    serde_json::from_str(&serde_json::to_string(abi)?)
+}
+
+fn selector(signature: &str) -> [u8; 4] {
+    let hash = keccak256(signature.as_bytes());
+    [hash[0], hash[1], hash[2], hash[3]]
+}
+
+impl Registry {
+    fn build() -> Self {
+        let mut registry = Registry {
+            contracts: Vec::new(),
+            functions: HashMap::new(),
+            events: HashMap::new(),
+            errors: HashMap::new(),
+        };
+        // Chain-local first: nothing upstream should shadow these.
+        let parsed = LOCAL
+            .iter()
+            .map(|(name, declarations)| (*name, local_contract(name, declarations)))
+            .chain(tempo_contracts().into_iter().filter_map(|(name, abi)| {
+                from_json_abi(&abi)
+                    .map_err(|e| tracing::error!("binding `{name}` did not convert: {e}"))
+                    .ok()
+                    .map(|contract| (name, contract))
+            }))
+            .chain(VENDORED.iter().filter_map(|(name, json)| {
+                // A malformed asset is a build-time mistake: skip it loudly
+                // rather than taking the process down on a page view.
+                match serde_json::from_str(json) {
+                    Ok(contract) => Some((*name, contract)),
+                    Err(e) => {
+                        tracing::error!("vendored ABI `{name}` failed to parse: {e}");
+                        None
+                    }
+                }
+            }));
+        for (name, contract) in parsed {
+            let index = registry.contracts.len();
+            for function in contract.functions() {
+                registry
+                    .functions
+                    .entry(selector(&function_signature(function)))
+                    .or_insert_with(|| (index, function.clone()));
+            }
+            for event in contract.events() {
+                if event.anonymous {
+                    continue; // no topic0 to key on
+                }
+                registry
+                    .events
+                    .entry(keccak256(event_signature(event).as_bytes()))
+                    .or_insert_with(|| (index, event.clone()));
+            }
+            for error in contract.errors() {
+                registry
+                    .errors
+                    .entry(selector(&error_signature(error)))
+                    .or_insert_with(|| (index, error.clone()));
+            }
+            registry.contracts.push(NamedContract { name, contract });
+        }
+        registry
+    }
+
+    /// Every event the registry can decode, in no particular order. Exists
+    /// for the test that holds the phrasing table to it.
+    #[cfg(test)]
+    pub(crate) fn events(&self) -> impl Iterator<Item = &Event> {
+        self.events.values().map(|(_, event)| event)
+    }
+
+    /// The whole ABI registered under `name`, for the pages that list what a
+    /// contract exposes.
+    pub(crate) fn contract(&self, name: &str) -> Option<&Contract> {
+        self.contracts
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| &c.contract)
+    }
+
+    fn contract_name(&self, index: usize) -> &'static str {
+        self.contracts.get(index).map(|c| c.name).unwrap_or("")
+    }
+
+    fn function(&self, selector: &[u8; 4]) -> Option<(&'static str, &Function)> {
+        self.functions
+            .get(selector)
+            .map(|(i, f)| (self.contract_name(*i), f))
+    }
+
+    pub(crate) fn event(&self, topic0: &[u8; 32]) -> Option<(&'static str, &Event)> {
+        self.events
+            .get(topic0)
+            .map(|(i, e)| (self.contract_name(*i), e))
+    }
+
+    fn error(&self, selector: &[u8; 4]) -> Option<(&'static str, &AbiError)> {
+        self.errors
+            .get(selector)
+            .map(|(i, e)| (self.contract_name(*i), e))
+    }
+}
+
+pub(crate) static REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::build);
 
 // ---------------------------------------------------------------------------
 // Raw RLP transaction parsing (tempo primitives / alloy fork)
@@ -122,11 +379,23 @@ pub fn keccak_hex(input: &[u8]) -> String {
     format!("0x{}", hex::encode(keccak256(input)))
 }
 
+/// `0x12345678…9abc` — a hash or address short enough to read in a line.
+pub fn truncate_hash(h: &str, prefix: usize, suffix: usize) -> String {
+    if h.is_empty() {
+        return String::new();
+    }
+    if h.len() > prefix + suffix + 3 {
+        format!("{}…{}", &h[..prefix + 2], &h[h.len() - suffix..])
+    } else {
+        h.to_string()
+    }
+}
+
 /// EIP-55 checksummed address from any 40-hex-digit input (with or without 0x).
 pub fn checksum_address(addr: &str) -> String {
     let lower = addr.trim().to_lowercase();
     let lower = lower.strip_prefix("0x").unwrap_or(&lower);
-    if lower.len() != 40 || !lower.chars().all(|c| c.is_ascii_hexdigit()) {
+    if !is_valid_address(lower) {
         return addr.trim().to_string();
     }
     let hash = keccak256(lower.as_bytes());
@@ -182,20 +451,21 @@ impl DecodedCall {
     }
 }
 
+impl DecodedEvent {
+    /// One argument by the name the ABI gives it. A foreign contract may emit
+    /// anything under a known `topic0`, so a declared argument can still be
+    /// absent — the caller decides what that means.
+    pub fn param(&self, name: &str) -> Option<&str> {
+        self.params
+            .iter()
+            .find(|p| p.name == name)
+            .map(|p| p.value.as_str())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ABI type parsing + decoding (ethers-core / ethabi)
 // ---------------------------------------------------------------------------
-
-fn word(bytes: &[u8]) -> &[u8] {
-    &bytes[..bytes.len().min(32)]
-}
-
-fn big_from_word(bytes: &[u8]) -> BigInt {
-    let w = word(bytes);
-    let mut buf = [0u8; 32];
-    buf[..w.len()].copy_from_slice(w);
-    BigInt::from_bytes_be(Sign::Plus, &buf)
-}
 
 fn hex_bytes(value: &[u8]) -> String {
     format!("0x{}", hex::encode(value))
@@ -262,208 +532,40 @@ pub fn decode_abi_args(types: &[&str], data: &[u8]) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Known selectors / signatures
+// Calls
 // ---------------------------------------------------------------------------
 
-struct FnDef {
-    name: &'static str,
-    canonical: &'static str,
-    /// (type, name) input pairs.
-    inputs: &'static [(&'static str, &'static str)],
-}
-
-fn tip20_fns() -> &'static [FnDef] {
-    &[
-        FnDef {
-            name: "transfer",
-            canonical: "transfer(address,uint256)",
-            inputs: &[("address", "to"), ("uint256", "amount")],
-        },
-        FnDef {
-            name: "transferWithMemo",
-            canonical: "transferWithMemo(address,uint256,bytes32)",
-            inputs: &[
-                ("address", "to"),
-                ("uint256", "amount"),
-                ("bytes32", "memo"),
-            ],
-        },
-        FnDef {
-            name: "transferFrom",
-            canonical: "transferFrom(address,address,uint256)",
-            inputs: &[
-                ("address", "sender"),
-                ("address", "to"),
-                ("uint256", "amount"),
-            ],
-        },
-        FnDef {
-            name: "transferFromWithMemo",
-            canonical: "transferFromWithMemo(address,address,uint256,bytes32)",
-            inputs: &[
-                ("address", "sender"),
-                ("address", "to"),
-                ("uint256", "amount"),
-                ("bytes32", "memo"),
-            ],
-        },
-        FnDef {
-            name: "approve",
-            canonical: "approve(address,uint256)",
-            inputs: &[("address", "spender"), ("uint256", "amount")],
-        },
-        FnDef {
-            name: "mint",
-            canonical: "mint(address,uint256)",
-            inputs: &[("address", "to"), ("uint256", "amount")],
-        },
-        FnDef {
-            name: "mintWithMemo",
-            canonical: "mintWithMemo(address,uint256,bytes32)",
-            inputs: &[
-                ("address", "to"),
-                ("uint256", "amount"),
-                ("bytes32", "memo"),
-            ],
-        },
-        FnDef {
-            name: "burn",
-            canonical: "burn(uint256)",
-            inputs: &[("uint256", "amount")],
-        },
-        FnDef {
-            name: "burnWithMemo",
-            canonical: "burnWithMemo(uint256,bytes32)",
-            inputs: &[("uint256", "amount"), ("bytes32", "memo")],
-        },
-    ]
-}
-
-/// Functions known by signature alone, in the named form the UI shows. The
-/// selector is derived from this string when [`BY_SELECTOR`] is built, so
-/// there is no hand-written selector to fall out of step.
-fn additional_sigs() -> &'static [&'static str] {
-    &[
-        "balanceOf(address account)",
-        "totalSupply()",
-        "name()",
-        "symbol()",
-        "decimals()",
-        "allowance(address owner, address spender)",
-        // AccountKeychain. `KeyRestrictions` is spelled as the tuple it
-        // expands to, since the selector hashes the expansion. `authorizeKey`
-        // is overloaded three times, each overload with its own selector.
-        "authorizeKey(address keyId, uint8 signatureType, uint64 expiry, bool enforceLimits, \
-         (address,uint256)[] limits)",
-        "authorizeKey(address keyId, uint8 signatureType, \
-         (uint64,bool,(address,uint256,uint64)[],bool,(address,(bytes4,address[])[])[]) restrictions)",
-        "authorizeKey(address keyId, uint8 signatureType, \
-         (uint64,bool,(address,uint256,uint64)[],bool,(address,(bytes4,address[])[])[]) restrictions, \
-         bytes32 witness)",
-        "authorizeAdminKey(address keyId, uint8 signatureType, bytes32 witness)",
-        "burnKeyAuthorizationWitness(bytes32 witness)",
-        "revokeKey(address keyId)",
-        "updateSpendingLimit(address keyId, address token, uint256 newLimit)",
-        "setAllowedCalls(address keyId, (address,(bytes4,address[])[])[] scopes)",
-        "removeAllowedCalls(address keyId, address target)",
-    ]
-}
-
-fn selector_hex(sig: &str) -> String {
-    let hash = keccak256(sig.as_bytes());
-    format!("0x{}", hex::encode(&hash[..4]))
-}
-
-/// How a recognised selector is decoded: a TIP-20 entry, or a signature-list
-/// entry parsed when the table is built.
-enum Known {
-    Tip20(&'static FnDef),
-    Sig(SigEntry),
-}
-
-/// A signature-list entry, parsed once at table build.
-struct SigEntry {
-    name: String,
-    canonical: String,
-    inputs: Vec<(String, String)>,
-}
-
-impl Known {
-    /// Name, canonical signature, and `(type, name)` inputs.
-    fn parts(&self) -> (&str, &str, Vec<(&str, &str)>) {
-        match self {
-            Known::Tip20(def) => (
-                def.name,
-                def.canonical,
-                def.inputs.iter().map(|&(t, n)| (t, n)).collect(),
-            ),
-            Known::Sig(entry) => (
-                &entry.name,
-                &entry.canonical,
-                entry
-                    .inputs
-                    .iter()
-                    .map(|(t, n)| (t.as_str(), n.as_str()))
-                    .collect(),
-            ),
-        }
-    }
-}
-
-/// Selector -> function, hashed once rather than on every decode. TIP-20
-/// entries take precedence.
-static BY_SELECTOR: LazyLock<HashMap<String, Known>> =
-    LazyLock::new(|| build_table(tip20_fns(), additional_sigs()));
-
-/// Split out so precedence can be tested against a deliberate collision.
-fn build_table(tip20: &'static [FnDef], sigs: &'static [&'static str]) -> HashMap<String, Known> {
-    let mut by_selector = HashMap::new();
-    for def in tip20 {
-        by_selector.insert(selector_hex(def.canonical), Known::Tip20(def));
-    }
-    for &sig in sigs {
-        // Selector, canonical form, and parameter names all derive from the
-        // one spelling; an unparsable signature is skipped (caught by test).
-        let Ok(fun) = HumanReadableParser::parse_function(sig) else {
-            continue;
-        };
-        let selector = format!("0x{}", hex::encode(fun.short_signature()));
-        let types: Vec<String> = fun.inputs.iter().map(|p| p.kind.to_string()).collect();
-        by_selector.entry(selector).or_insert_with(|| {
-            Known::Sig(SigEntry {
-                canonical: format!("{}({})", fun.name, types.join(",")),
-                inputs: types
-                    .into_iter()
-                    .zip(fun.inputs.iter().map(|p| p.name.clone()))
-                    .collect(),
-                name: fun.name,
-            })
-        });
-    }
-    by_selector
-}
-
-/// Pair each declared input with its value; a missing one renders empty so
-/// the call's shape stays visible.
-fn decoded_params(inputs: &[(&str, &str)], values: &[String]) -> Vec<DecodedParam> {
+/// Pair each declared parameter with its decoded value. One the decoder could
+/// not reach renders empty, so a malformed call still shows its shape.
+fn decoded_params(inputs: &[Param], data: &[u8]) -> Vec<DecodedParam> {
+    let types: Vec<ParamType> = inputs.iter().map(|p| p.kind.clone()).collect();
+    let tokens = abi_decode(&types, data).unwrap_or_default();
     inputs
         .iter()
         .enumerate()
-        .map(|(i, (ty, name))| DecodedParam {
-            ty: ty.to_string(),
-            name: if name.is_empty() {
-                format!("arg{i}")
-            } else {
-                name.to_string()
-            },
-            value: values.get(i).cloned().unwrap_or_default(),
+        .map(|(i, p)| DecodedParam {
+            ty: p.kind.to_string(),
+            name: param_name(&p.name, i),
+            value: tokens
+                .get(i)
+                .map(|t| format_token(&p.kind, t))
+                .unwrap_or_default(),
             indexed: false,
         })
         .collect()
 }
 
-/// Decode 0x-prefixed calldata into a call descriptor (None for empty/trivial).
-pub fn decode_function_call(data: &str) -> Option<DecodedCall> {
+/// The name a parameter is shown under; interfaces may leave it blank.
+fn param_name(name: &str, position: usize) -> String {
+    if name.is_empty() {
+        format!("arg{position}")
+    } else {
+        name.to_string()
+    }
+}
+
+/// Split `0x…` calldata into its 4-byte selector and its arguments.
+fn split_calldata(data: &str) -> Option<([u8; 4], Vec<u8>)> {
     let data = data.strip_prefix("0x").unwrap_or(data);
     if data.is_empty() {
         return None;
@@ -473,20 +575,22 @@ pub fn decode_function_call(data: &str) -> Option<DecodedCall> {
         return None;
     }
     let (selector, args) = raw.split_at(4);
+    Some((selector.try_into().ok()?, args.to_vec()))
+}
+
+/// Decode 0x-prefixed calldata (None for empty/trivial). An unrecognised
+/// selector still yields a descriptor: the selector and raw arguments are
+/// worth showing, and the 4-byte cache can name it later.
+pub fn decode_function_call(data: &str) -> Option<DecodedCall> {
+    let (selector, args) = split_calldata(data)?;
     let sel_hex = format!("0x{}", hex::encode(selector));
 
-    // Both tables report the canonical signature; the names are on `params`.
-    let (name, signature, params) = match BY_SELECTOR.get(&sel_hex) {
-        Some(known) => {
-            let (name, canonical, inputs) = known.parts();
-            let types: Vec<&str> = inputs.iter().map(|&(t, _)| t).collect();
-            let values = decode_abi_args(&types, args);
-            (
-                Some(name.to_string()),
-                Some(canonical.to_string()),
-                decoded_params(&inputs, &values),
-            )
-        }
+    let (name, signature, params) = match REGISTRY.function(&selector) {
+        Some((_, function)) => (
+            Some(function.name.clone()),
+            Some(function_signature(function)),
+            decoded_params(&function.inputs, &args),
+        ),
         None => (None, None, Vec::new()),
     };
 
@@ -495,39 +599,185 @@ pub fn decode_function_call(data: &str) -> Option<DecodedCall> {
         signature,
         params,
         selector: sel_hex,
-        raw_args: format!("0x{}", hex::encode(args)),
+        raw_args: format!("0x{}", hex::encode(&args)),
     })
+}
+
+/// Decode calldata against a signature learned at runtime — what the 4-byte
+/// directory answers with. The signature is checked against the selector
+/// first, so a directory that answers with the wrong function names nothing.
+pub fn decode_with_signature(data: &str, signature: &str) -> Option<DecodedCall> {
+    let (selector, args) = split_calldata(data)?;
+    if !crate::signatures::hashes_to(signature, &hex::encode(selector)) {
+        return None;
+    }
+    let function = HumanReadableParser::parse_function(signature).ok()?;
+    Some(DecodedCall {
+        name: Some(function.name.clone()),
+        signature: Some(function_signature(&function)),
+        params: decoded_params(&function.inputs, &args),
+        selector: format!("0x{}", hex::encode(selector)),
+        raw_args: format!("0x{}", hex::encode(&args)),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Reverts
+// ---------------------------------------------------------------------------
+
+/// A decoded revert: the custom error the call reverted with, or Solidity's
+/// built-in `Error(string)` / `Panic(uint256)`.
+#[derive(Debug, Clone, Serialize)]
+pub struct DecodedError {
+    pub name: String,
+    pub signature: String,
+    pub params: Vec<DecodedParam>,
+    pub selector: String,
+}
+
+impl DecodedError {
+    /// `InsufficientBalance(1, 2)` — the one-line form the UI shows.
+    pub fn call_form(&self) -> String {
+        let args: Vec<&str> = self.params.iter().map(|p| p.value.as_str()).collect();
+        format!("{}({})", self.name, args.join(", "))
+    }
+
+    /// The revert message for `revert("…")`, which carries its reason as the
+    /// sole argument of the built-in `Error(string)`.
+    pub fn reason(&self) -> Option<&str> {
+        if self.name != "Error" {
+            return None;
+        }
+        self.params.first().map(|p| p.value.as_str())
+    }
+}
+
+/// Decode ABI-encoded revert data (`0x…`) against the built-in error table.
+pub fn decode_revert(data: &str) -> Option<DecodedError> {
+    let (selector, args) = split_calldata(data)?;
+    let (_, error) = REGISTRY.error(&selector)?;
+    Some(DecodedError {
+        name: error.name.clone(),
+        signature: error_signature(error),
+        params: decoded_params(&error.inputs, &args),
+        selector: format!("0x{}", hex::encode(selector)),
+    })
+}
+
+/// The first `0x…` blob in a node's error text: some report revert data
+/// inside the message rather than as a field.
+pub fn revert_data_in(message: &str) -> Option<String> {
+    let bytes = message.as_bytes();
+    let start = message.find("0x")?;
+    let end = bytes[start + 2..]
+        .iter()
+        .position(|c| !c.is_ascii_hexdigit())
+        .map(|n| start + 2 + n)
+        .unwrap_or(bytes.len());
+    let hex = &message[start..end];
+    // A selector at minimum; anything shorter is an address fragment or noise.
+    (hex.len() >= 10).then(|| hex.to_string())
 }
 
 // ---------------------------------------------------------------------------
 // Event decoding
 // ---------------------------------------------------------------------------
 
-pub const TRANSFER_TOPIC: &str =
-    "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
-pub const TRANSFER_WITH_MEMO_TOPIC: &str =
-    "0xab2461e5dc8495f413774182e5eb0e9f0f30a81bf32c4b7a4a1d70c3c4e2f0a";
-pub const APPROVAL_TOPIC: &str =
-    "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925";
+/// The signatures of the logs the explorer decodes.
+pub const TRANSFER_SIGNATURE: &str = "Transfer(address,address,uint256)";
+pub const TRANSFER_WITH_MEMO_SIGNATURE: &str = "TransferWithMemo(address,address,uint256,bytes32)";
+pub const APPROVAL_SIGNATURE: &str = "Approval(address,address,uint256)";
 
-fn address_from_topic(topic: &str) -> String {
+/// `keccak256` of the signature beside it, in the lowercase `0x…` form the
+/// chain reports `topic0` in.
+///
+/// Derived, never written out: a mistyped hash does not fail loudly, it
+/// silently matches nothing. `TRANSFER_WITH_MEMO_TOPIC` was 63 hex digits, so
+/// no memo transfer was ever indexed.
+pub static TRANSFER_TOPIC: LazyLock<String> =
+    LazyLock::new(|| keccak_hex(TRANSFER_SIGNATURE.as_bytes()));
+pub static TRANSFER_WITH_MEMO_TOPIC: LazyLock<String> =
+    LazyLock::new(|| keccak_hex(TRANSFER_WITH_MEMO_SIGNATURE.as_bytes()));
+pub static APPROVAL_TOPIC: LazyLock<String> =
+    LazyLock::new(|| keccak_hex(APPROVAL_SIGNATURE.as_bytes()));
+
+/// Whether `addr` is 20 hex-encoded bytes — the shape, not the checksum.
+pub fn is_valid_address(addr: &str) -> bool {
+    let s = addr.strip_prefix("0x").unwrap_or(addr);
+    s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+pub fn address_from_topic(topic: &str) -> String {
     let hexed = topic.strip_prefix("0x").unwrap_or(topic);
     let addr = &hexed[hexed.len().saturating_sub(40)..];
     checksum_address(addr)
 }
 
-fn uint256_from_data(data: &str, offset: usize) -> String {
-    let bytes = hex::decode(data.strip_prefix("0x").unwrap_or(data)).unwrap_or_default();
-    let chunk = bytes.get(offset * 32..offset * 32 + 32).unwrap_or(&[]);
-    big_from_word(chunk).to_string()
+/// Format one decoded log argument. An indexed dynamic parameter (string,
+/// bytes, array, tuple) is in the log only as its keccak hash, so that is what
+/// it renders as.
+fn format_log_token(param: &Param, indexed: bool, token: &Token) -> String {
+    if indexed && is_dynamic(&param.kind) {
+        if let Token::FixedBytes(bytes) = token {
+            return hex_bytes(bytes);
+        }
+    }
+    format_token(&param.kind, token)
 }
 
-fn bytes32_from_data(data: &str, offset: usize) -> String {
-    let bytes = hex::decode(data.strip_prefix("0x").unwrap_or(data)).unwrap_or_default();
-    let chunk = bytes.get(offset * 32..offset * 32 + 32).unwrap_or(&[]);
-    hex_bytes(chunk)
+/// Whether an indexed parameter of this type is stored hashed in its topic.
+fn is_dynamic(kind: &ParamType) -> bool {
+    matches!(
+        kind,
+        ParamType::String
+            | ParamType::Bytes
+            | ParamType::Array(_)
+            | ParamType::FixedArray(_, _)
+            | ParamType::Tuple(_)
+    )
 }
 
+/// Decode a log's arguments against an event definition. `None` when the log
+/// does not fit it — a foreign contract may emit anything under a known
+/// `topic0`.
+fn decode_log_params(event: &Event, topics: &[Value], data: &str) -> Option<Vec<DecodedParam>> {
+    let topics: Vec<ethers_core::types::H256> = topics
+        .iter()
+        .filter_map(Value::as_str)
+        .filter_map(|t| hex::decode(t.strip_prefix("0x").unwrap_or(t)).ok())
+        .filter(|b| b.len() == 32)
+        .map(|b| ethers_core::types::H256::from_slice(&b))
+        .collect();
+    let data = hex::decode(data.strip_prefix("0x").unwrap_or(data)).ok()?;
+    let decoded = event.parse_log(RawLog { topics, data }).ok()?;
+    // `parse_log` returns the params in declared order, so they zip with the
+    // definition the names and indexed flags come from.
+    Some(
+        event
+            .inputs
+            .iter()
+            .enumerate()
+            .zip(decoded.params.iter())
+            .map(|((i, input), got)| {
+                let param = Param {
+                    name: input.name.clone(),
+                    kind: input.kind.clone(),
+                    internal_type: None,
+                };
+                DecodedParam {
+                    ty: input.kind.to_string(),
+                    name: param_name(&input.name, i),
+                    value: format_log_token(&param, input.indexed, &got.value),
+                    indexed: input.indexed,
+                }
+            })
+            .collect(),
+    )
+}
+
+/// Decode one receipt log against the built-in ABI registry. An unknown
+/// `topic0` still comes back, as an unnamed event carrying its raw data, so
+/// the events list never silently drops a row.
 pub fn decode_event(log: &Value) -> Option<DecodedEvent> {
     let topics = log.get("topics")?.as_array()?;
     if topics.is_empty() {
@@ -553,163 +803,48 @@ pub fn decode_event(log: &Value) -> Option<DecodedEvent> {
         .unwrap_or("0x")
         .to_string();
 
-    let make =
-        |name: &'static str, signature: &'static str, params: Vec<DecodedParam>| DecodedEvent {
-            name: Some(name.to_string()),
-            signature: Some(signature.to_string()),
-            contract: contract.clone(),
-            params,
-            topic0: topic0.clone(),
-            log_index: log_index.clone(),
-            transaction_hash: transaction_hash.clone(),
-        };
+    let known = hex::decode(topic0.strip_prefix("0x").unwrap_or(&topic0))
+        .ok()
+        .filter(|b| b.len() == 32)
+        .and_then(|b| {
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&b);
+            REGISTRY.event(&key)
+        });
 
-    match topic0.as_str() {
-        TRANSFER_TOPIC => {
-            if topics.len() < 3 {
-                return Some(DecodedEvent {
-                    name: Some("Transfer".into()),
-                    signature: Some("Transfer(address,address,uint256)".into()),
-                    contract,
-                    params: Vec::new(),
-                    topic0,
-                    log_index,
-                    transaction_hash,
-                });
-            }
-            let from = topics[1].as_str().unwrap_or("");
-            let to = topics[2].as_str().unwrap_or("");
-            Some(make(
-                "Transfer",
-                "Transfer(address,address,uint256)",
-                vec![
-                    DecodedParam {
-                        ty: "address".into(),
-                        name: "from".into(),
-                        value: address_from_topic(from),
-                        indexed: true,
-                    },
-                    DecodedParam {
-                        ty: "address".into(),
-                        name: "to".into(),
-                        value: address_from_topic(to),
-                        indexed: true,
-                    },
-                    DecodedParam {
-                        ty: "uint256".into(),
-                        name: "amount".into(),
-                        value: uint256_from_data(&data, 0),
-                        indexed: false,
-                    },
-                ],
-            ))
-        }
-        TRANSFER_WITH_MEMO_TOPIC => {
-            if topics.len() < 3 {
-                return Some(DecodedEvent {
-                    name: Some("TransferWithMemo".into()),
-                    signature: Some("TransferWithMemo(address,address,uint256,bytes32)".into()),
-                    contract,
-                    params: Vec::new(),
-                    topic0,
-                    log_index,
-                    transaction_hash,
-                });
-            }
-            let from = topics[1].as_str().unwrap_or("");
-            let to = topics[2].as_str().unwrap_or("");
-            Some(make(
-                "TransferWithMemo",
-                "TransferWithMemo(address,address,uint256,bytes32)",
-                vec![
-                    DecodedParam {
-                        ty: "address".into(),
-                        name: "from".into(),
-                        value: address_from_topic(from),
-                        indexed: true,
-                    },
-                    DecodedParam {
-                        ty: "address".into(),
-                        name: "to".into(),
-                        value: address_from_topic(to),
-                        indexed: true,
-                    },
-                    DecodedParam {
-                        ty: "uint256".into(),
-                        name: "amount".into(),
-                        value: uint256_from_data(&data, 0),
-                        indexed: false,
-                    },
-                    DecodedParam {
-                        ty: "bytes32".into(),
-                        name: "memo".into(),
-                        value: bytes32_from_data(&data, 1),
-                        indexed: false,
-                    },
-                ],
-            ))
-        }
-        APPROVAL_TOPIC => {
-            if topics.len() < 3 {
-                return Some(DecodedEvent {
-                    name: Some("Approval".into()),
-                    signature: Some("Approval(address,address,uint256)".into()),
-                    contract,
-                    params: Vec::new(),
-                    topic0,
-                    log_index,
-                    transaction_hash,
-                });
-            }
-            let owner = topics[1].as_str().unwrap_or("");
-            let spender = topics[2].as_str().unwrap_or("");
-            Some(make(
-                "Approval",
-                "Approval(address,address,uint256)",
-                vec![
-                    DecodedParam {
-                        ty: "address".into(),
-                        name: "owner".into(),
-                        value: address_from_topic(owner),
-                        indexed: true,
-                    },
-                    DecodedParam {
-                        ty: "address".into(),
-                        name: "spender".into(),
-                        value: address_from_topic(spender),
-                        indexed: true,
-                    },
-                    DecodedParam {
-                        ty: "uint256".into(),
-                        name: "amount".into(),
-                        value: uint256_from_data(&data, 0),
-                        indexed: false,
-                    },
-                ],
-            ))
-        }
-        _ => {
-            let value = if data.len() > 200 {
-                format!("{}...", &data[..200])
-            } else {
-                data.clone()
-            };
-            Some(DecodedEvent {
-                name: None,
-                signature: None,
-                contract,
-                params: vec![DecodedParam {
-                    ty: "bytes".into(),
-                    name: "data".into(),
-                    value,
-                    indexed: false,
-                }],
-                topic0,
-                log_index,
-                transaction_hash,
-            })
-        }
+    if let Some((_, event)) = known {
+        return Some(DecodedEvent {
+            name: Some(event.name.clone()),
+            signature: Some(event_signature(event)),
+            contract,
+            // A log that does not fit the definition keeps the name the topic
+            // identifies it by, with no arguments invented for it.
+            params: decode_log_params(event, topics, &data).unwrap_or_default(),
+            topic0,
+            log_index,
+            transaction_hash,
+        });
     }
+
+    let value = if data.len() > 200 {
+        format!("{}...", &data[..200])
+    } else {
+        data.clone()
+    };
+    Some(DecodedEvent {
+        name: None,
+        signature: None,
+        contract,
+        params: vec![DecodedParam {
+            ty: "bytes".into(),
+            name: "data".into(),
+            value,
+            indexed: false,
+        }],
+        topic0,
+        log_index,
+        transaction_hash,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -738,7 +873,12 @@ fn hex_to_dec(value: &Value, default: &str) -> String {
 
 fn walk_trace(node: &Value, depth: usize, result: &mut Vec<Value>) {
     let input = node.get("input").and_then(Value::as_str).unwrap_or("0x");
-    let decoded = decode_function_call(input).map(|d| d.to_json());
+    let kind = node.get("type").and_then(Value::as_str).unwrap_or("CALL");
+    // A CREATE's input is the contract's init code, not calldata: its first
+    // four bytes are constructor prologue, not a selector to decode or name.
+    let decoded = (!kind.starts_with("CREATE"))
+        .then(|| decode_function_call(input).map(|d| d.to_json()))
+        .flatten();
     let error = node
         .get("error")
         .or_else(|| node.get("revertReason"))
@@ -746,7 +886,7 @@ fn walk_trace(node: &Value, depth: usize, result: &mut Vec<Value>) {
         .filter(|s| !s.is_empty());
     let mut flat = json!({
         "depth": depth,
-        "type": node.get("type").and_then(Value::as_str).unwrap_or("CALL"),
+        "type": kind,
         "from": node.get("from").and_then(Value::as_str).unwrap_or(""),
         "to": node.get("to").and_then(Value::as_str).unwrap_or(""),
         "data": input,
@@ -817,25 +957,15 @@ pub fn extract_balance_changes(receipt: &Value, tx: &Transaction) -> Vec<Value> 
                 // looked up by that spelling.
                 let token =
                     checksum_address(log.get("address").and_then(Value::as_str).unwrap_or(""));
-                let mut from = String::new();
-                let mut to = String::new();
-                let mut amount = String::new();
-                for p in &decoded.params {
-                    match p.name.as_str() {
-                        "from" => from = p.value.clone(),
-                        "to" => to = p.value.clone(),
-                        "amount" => amount = p.value.clone(),
-                        _ => {}
-                    }
-                }
+                let amount = decoded.param("amount").unwrap_or_default();
                 changes.push(json!({
-                    "address": from,
+                    "address": decoded.param("from").unwrap_or_default(),
                     "token": token,
                     "change": format!("-{amount}"),
                     "is_fee": false,
                 }));
                 changes.push(json!({
-                    "address": to,
+                    "address": decoded.param("to").unwrap_or_default(),
                     "token": token,
                     "change": format!("+{amount}"),
                     "is_fee": false,
@@ -910,7 +1040,164 @@ pub fn parse_decimal_or_hex(s: &str) -> i128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A binding that fails to convert, or a vendored asset with a typo, would
+    /// show up only as calls and logs quietly falling back to "unknown".
+    #[test]
+    fn every_source_loads() {
+        for (name, abi) in tempo_contracts() {
+            let converted = from_json_abi(&abi);
+            assert!(converted.is_ok(), "binding `{name}`: {converted:?}");
+            let converted = converted.unwrap();
+            assert_eq!(
+                converted.functions().count(),
+                abi.functions().count(),
+                "`{name}` lost functions crossing into ethabi"
+            );
+            assert_eq!(
+                converted.events().count(),
+                abi.events().count(),
+                "`{name}` lost events"
+            );
+            assert_eq!(
+                converted.errors().count(),
+                abi.errors().count(),
+                "`{name}` lost errors"
+            );
+        }
+        for (name, json) in VENDORED {
+            let parsed: Result<Contract, _> = serde_json::from_str(json);
+            assert!(parsed.is_ok(), "`{name}` failed to parse: {parsed:?}");
+        }
+        assert_eq!(
+            REGISTRY.contracts.len(),
+            LOCAL.len() + tempo_contracts().len() + VENDORED.len()
+        );
+    }
+
+    /// A collapse to a handful of entries means an asset stopped loading.
+    #[test]
+    fn registry_covers_the_tempo_surface() {
+        let (functions, events, errors) = (
+            REGISTRY.functions.len(),
+            REGISTRY.events.len(),
+            REGISTRY.errors.len(),
+        );
+        assert!(functions > 240, "only {functions} functions registered");
+        assert!(events > 70, "only {events} events registered");
+        assert!(errors > 120, "only {errors} errors registered");
+    }
+
+    /// The selector hashes the canonical signature, not ethabi's
+    /// `Function::signature()`, which appends outputs.
+    #[test]
+    fn signatures_are_canonical() {
+        let transfer = selector("transfer(address,uint256)");
+        let (_, f) = REGISTRY.function(&transfer).expect("transfer registered");
+        assert_eq!(function_signature(f), "transfer(address,uint256)");
+        assert_eq!(f.short_signature(), transfer);
+    }
+
+    /// `TransferWithMemo`'s memo is indexed, so its topic0 differs from the
+    /// shape a non-indexed memo would hash to. Pin the real one.
+    #[test]
+    fn transfer_with_memo_is_registered_with_an_indexed_memo() {
+        let topic0 = keccak256(b"TransferWithMemo(address,address,uint256,bytes32)");
+        let (_, event) = REGISTRY
+            .event(&topic0)
+            .expect("TransferWithMemo registered");
+        assert_eq!(event.name, "TransferWithMemo");
+        let memo = event.inputs.last().expect("memo param");
+        assert!(memo.indexed, "memo is indexed in the TIP-20 ABI");
+    }
+
+    /// Solidity's built-in `revert("…")` must decode like any custom error.
+    #[test]
+    fn builtin_revert_errors_are_registered() {
+        let (_, error) = REGISTRY
+            .error(&selector("Error(string)"))
+            .expect("Error(string) registered");
+        assert_eq!(error.name, "Error");
+        assert!(REGISTRY.error(&selector("Panic(uint256)")).is_some());
+    }
+
+    /// A declaration that does not parse registers nothing, which would show
+    /// up only as calls quietly failing to decode. Counted per group, so a
+    /// declaration lost to a typo cannot hide behind another group's total.
+    #[test]
+    fn every_local_declaration_parses() {
+        for (name, declarations) in LOCAL {
+            let contract = local_contract(name, declarations);
+            let parsed = contract.functions().count()
+                + contract.events().count()
+                + contract.errors().count();
+            assert_eq!(parsed, declarations.len(), "in `{name}`");
+        }
+    }
+
+    /// Parsing proves the declarations are well formed, not that they are the
+    /// right ones, so pin what they hash to: `Error`/`Panic` are the language's
+    /// own constants.
+    #[test]
+    fn local_selectors_are_pinned() {
+        for (signature, expected) in [
+            ("Error(string)", "0x08c379a0"),
+            ("Panic(uint256)", "0x4e487b71"),
+        ] {
+            let found = format!("0x{}", hex::encode(selector(signature)));
+            assert_eq!(found, expected, "for {signature}");
+        }
+    }
+
     use ethers_core::abi::encode as abi_encode;
+
+    /// Deriving stops a topic being mistyped; pinning the values stops a
+    /// signature being edited without noticing.
+    #[test]
+    fn topics_are_what_the_chain_reports() {
+        for (topic, expected) in [
+            (
+                &*TRANSFER_TOPIC,
+                "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+            ),
+            (
+                &*TRANSFER_WITH_MEMO_TOPIC,
+                "0x57bc7354aa85aed339e000bccffabbc529466af35f0772c8f8ee1145927de7f0",
+            ),
+            (
+                &*APPROVAL_TOPIC,
+                "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925",
+            ),
+        ] {
+            assert_eq!(topic, expected);
+        }
+    }
+
+    /// The bug: a memo transfer decoded as an unknown log, so none was ever
+    /// indexed.
+    #[test]
+    fn a_memo_transfer_decodes() {
+        let address = |byte: &str| format!("0x{}{}", "00".repeat(12), byte.repeat(20));
+        let memo = format!("0x{}", "ab".repeat(32));
+        let log = json!({
+            "address": format!("0x{}", "cc".repeat(20)),
+            // `memo` is indexed, so a real log carries it as a fourth topic
+            // and `data` holds `amount` alone.
+            "topics": [
+                TRANSFER_WITH_MEMO_TOPIC.as_str(),
+                address("11"),
+                address("22"),
+                memo,
+            ],
+            "data": format!("0x{:064x}", 1234u64),
+        });
+        let event = decode_event(&log).expect("decoded");
+        assert_eq!(event.name.as_deref(), Some("TransferWithMemo"));
+        assert_eq!(event.params[2].value, "1234");
+        assert_eq!(event.params[3].name, "memo");
+        assert_eq!(event.params[3].value, memo);
+        assert!(event.params[3].indexed);
+    }
 
     #[test]
     fn decode_abi_args_dynamic_string() {
@@ -983,37 +1270,65 @@ mod tests {
         assert!(decode_abi_args(&["not-a-type"], &[0u8; 32]).is_empty());
     }
 
-    /// A signature-list entry must not shadow a TIP-20 entry; the live tables
-    /// share no selector, so build one that collides.
+    /// `revert("boom")` arrives as `Error(string)`; the reason must come back
+    /// out of it rather than being shown as hex.
     #[test]
-    fn tip20_wins_when_both_tables_claim_a_selector() {
-        static TIP20: [FnDef; 1] = [FnDef {
-            name: "burn",
-            canonical: "burn(uint256)",
-            inputs: &[("uint256", "amount")],
-        }];
-        let table = build_table(&TIP20, &["burn(uint256 value)"]);
-        match table.get(&selector_hex("burn(uint256)")) {
-            Some(Known::Tip20(def)) => assert_eq!(def.inputs[0].1, "amount"),
-            Some(Known::Sig(entry)) => {
-                panic!(
-                    "signature list shadowed the TIP-20 entry: {}",
-                    entry.canonical
-                )
-            }
-            None => panic!("burn(uint256) missing from the table"),
-        }
+    fn decodes_a_plain_revert_string() {
+        let data = format!(
+            "0x08c379a0{}",
+            hex::encode(ethers_core::abi::encode(&[Token::String("boom".into())]))
+        );
+        let decoded = decode_revert(&data).expect("Error(string) decoded");
+        assert_eq!(decoded.name, "Error");
+        assert_eq!(decoded.reason(), Some("boom"));
     }
 
-    /// The table build skips an unparsable signature, which would silently
-    /// stop it from matching; catch that here.
+    /// A custom error is named and its arguments rendered, so a failed
+    /// transaction says what the contract objected to.
     #[test]
-    fn every_signature_parses() {
-        for &sig in additional_sigs() {
-            assert!(
-                HumanReadableParser::parse_function(sig).is_ok(),
-                "`{sig}` does not parse as a human-readable signature"
-            );
-        }
+    fn decodes_a_custom_error() {
+        let selector = &keccak256(b"ContractPaused()")[..4];
+        let decoded =
+            decode_revert(&format!("0x{}", hex::encode(selector))).expect("custom error decoded");
+        assert_eq!(decoded.name, "ContractPaused");
+        assert_eq!(decoded.call_form(), "ContractPaused()");
+
+        // The TIP-20 balance error carries what was available and what was
+        // needed; both must survive into the rendered form.
+        let token = "0x20c0000000000000000000000000000000000000";
+        let args = ethers_core::abi::encode(&[
+            Token::Uint(1u64.into()),
+            Token::Uint(5u64.into()),
+            Token::Address(token.parse().unwrap()),
+        ]);
+        let selector = &keccak256(b"InsufficientBalance(uint256,uint256,address)")[..4];
+        let decoded = decode_revert(&format!("0x{}{}", hex::encode(selector), hex::encode(args)))
+            .expect("InsufficientBalance decoded");
+        assert_eq!(decoded.name, "InsufficientBalance");
+        assert_eq!(
+            decoded.call_form(),
+            format!("InsufficientBalance(1, 5, {})", checksum_address(token))
+        );
+    }
+
+    /// Revert data an unknown contract produced has no definition to decode
+    /// against; that must be a `None`, not a wrong answer.
+    #[test]
+    fn unknown_revert_data_decodes_to_nothing() {
+        assert!(decode_revert("0xdeadbeef").is_none());
+        assert!(decode_revert("0x").is_none());
+    }
+
+    /// Some nodes report revert data inside the error message rather than as
+    /// a field; pull the blob back out of the prose.
+    #[test]
+    fn finds_revert_data_inside_an_error_message() {
+        assert_eq!(
+            revert_data_in("execution reverted: 0x08c379a0abcd (some detail)").as_deref(),
+            Some("0x08c379a0abcd")
+        );
+        // Too short to be a selector — an address fragment, not revert data.
+        assert_eq!(revert_data_in("reverted at 0x1234"), None);
+        assert_eq!(revert_data_in("out of gas"), None);
     }
 }

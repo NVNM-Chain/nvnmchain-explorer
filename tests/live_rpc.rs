@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use nvnmchain_explorer::config::{DEFAULT_CHAIN_ID, DEFAULT_RPC_URL, DEFAULT_WS_URL};
-use nvnmchain_explorer::db::{self, Db};
+use nvnmchain_explorer::db::{self, Db, TxColumns};
 use nvnmchain_explorer::indexer::{fetch_block_bundle, index_block};
 use nvnmchain_explorer::rpc::ChainRpc;
 use nvnmchain_explorer::web::{self, AppState};
@@ -203,7 +203,7 @@ async fn index_recent_blocks_into_sqlite() {
     // Transactions that exist on the chain must be stored with receipts.
     for n in start..=head {
         let block = db::get_block_by_number(&db, n as i64).unwrap();
-        let txs = db::get_block_transactions(&db, block.number);
+        let txs = db::get_block_transactions(&db, block.number, TxColumns::Full);
         assert_eq!(txs.len() as i64, block.tx_count);
         for tx in &txs {
             assert_eq!(tx.block_number, block.number);
@@ -212,7 +212,7 @@ async fn index_recent_blocks_into_sqlite() {
     }
 
     // If the tip block has transactions, spot-check a receipt + decoded call.
-    let txs = db::get_block_transactions(&db, head as i64);
+    let txs = db::get_block_transactions(&db, head as i64, TxColumns::Full);
     if let Some(tx) = txs.first() {
         if tx.receipt_data.is_some() {
             let receipt: Value = serde_json::from_str(tx.receipt_data.as_deref().unwrap()).unwrap();
@@ -246,6 +246,9 @@ async fn web_api_serves_indexed_data() {
         index_concurrency: 8,
         native_symbol: "OM".into(),
         stats_interval_seconds: 5.0,
+        // The test asserts what this chain says; a third-party directory has
+        // no part in that, and would be a network call per page view.
+        signature_lookup_url: None,
     };
     let tera = web::build_tera(db.clone()).expect("tera");
     let (block_tx, _) = broadcast::channel::<Value>(64);
@@ -255,6 +258,7 @@ async fn web_api_serves_indexed_data() {
         cfg,
         tera,
         block_events: block_tx,
+        stats: std::sync::Arc::new(std::sync::RwLock::new(serde_json::Value::Null)),
         shutdown: tokio::sync::watch::channel(false).1,
     };
     let app = web::app(state);
@@ -320,7 +324,7 @@ async fn web_api_serves_indexed_data() {
     assert!(search.status().is_redirection() || search.status().is_success());
 
     // A transaction page if the tip block has transactions.
-    let txs = db::get_block_transactions(&db, head as i64);
+    let txs = db::get_block_transactions(&db, head as i64, TxColumns::Full);
     if let Some(tx) = txs.first() {
         let tx_resp = client
             .get(format!("{base}/tx/{}", tx.hash))

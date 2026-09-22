@@ -47,6 +47,15 @@ async fn main() -> anyhow::Result<()> {
     // continuing to fetch/index for minutes.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let indexer_shutdown = shutdown_rx.clone();
+    // Home-page stats live here; the stats task refreshes them, the web
+    // handlers read them. Seeded from kv so a restart paints real numbers
+    // before the first recompute.
+    let home_stats = Arc::new(std::sync::RwLock::new(
+        db::get_kv(&db, "stats")
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or(serde_json::Value::Null),
+    ));
+    let indexer_stats = home_stats.clone();
     let indexer_task = tokio::spawn(async move {
         info!("indexer websocket feed: {ws_url}");
         indexer::run_forever(
@@ -54,6 +63,7 @@ async fn main() -> anyhow::Result<()> {
             indexer_db,
             indexer_cfg,
             indexer_block_tx,
+            indexer_stats,
             indexer_shutdown,
         )
         .await
@@ -65,6 +75,7 @@ async fn main() -> anyhow::Result<()> {
         cfg: cfg.clone(),
         tera,
         block_events: block_tx,
+        stats: home_stats,
         shutdown: shutdown_rx.clone(),
     };
     let app = web::app(state);

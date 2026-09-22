@@ -1,0 +1,99 @@
+{# Shared markup. Import where used: Tera does not inherit imports from base.html. #}
+
+{# Previous/next links for a listing, hidden when everything fits on one page.
+   Links are relative, so the page keeps whatever path it is on; `query` carries
+   any other parameter the page needs to preserve, e.g. "tab=transfers&". #}
+{% macro pager(page, total_pages, query="") %}
+{% if total_pages > 1 %}
+<div class="flex justify-center gap-3 mt-5 text-xs items-center">
+    {% if page > 1 %}
+    <a href="?{{ query }}page={{ page - 1 }}" class="badge badge-info hover:text-blue-300">← Previous</a>
+    {% endif %}
+    <span class="text-dim">Page {{ page }} of {{ total_pages }}</span>
+    {% if page < total_pages %}
+    <a href="?{{ query }}page={{ page + 1 }}" class="badge badge-info hover:text-blue-300">Next →</a>
+    {% endif %}
+</div>
+{% endif %}
+{% endmacro pager %}
+
+{# The transaction table both listings draw: the address page's tab and /txs.
+   Rows come from `tx_row` in web.rs, so the keys are the same on both. #}
+{% macro tx_table(transactions) %}
+<div class="min-w-[760px]">
+    <div class="flex table-header">
+        <div class="flex-1 px-3">Tx Hash</div>
+        <div class="w-24 px-3">Block</div>
+        <div class="w-32 px-3 hidden md:block">Method</div>
+        <div class="w-44 px-3 hidden md:block">From</div>
+        <div class="w-44 px-3 hidden md:block">To</div>
+        <div class="w-20 px-3 text-right">Time</div>
+    </div>
+    {% for tx in transactions %}
+    <div class="t-row flex text-xs">
+        <div class="flex-1 px-3 py-3">
+            {{ self::copy_tx(hash=tx.tx_hash) }}
+            {% if tx.tx_status == 0 %}<span class="badge badge-error ml-1">fail</span>{% endif %}
+        </div>
+        <div class="w-24 px-3 py-3">
+            <a href="/block/{{ tx.tx_block }}" class="mono text-blue-400 hover:text-blue-300">{{ tx.tx_block }}</a>
+        </div>
+        <div class="w-32 px-3 py-3 hidden md:block">
+            {% if tx.tx_method %}<span class="badge badge-method mono">{{ tx.tx_method }}</span>{% else %}<span class="text-faint">—</span>{% endif %}
+        </div>
+        <div class="w-44 px-3 py-3 hidden md:block mono truncate">
+            {{ self::copy_address(address=tx.tx_from) }}
+        </div>
+        <div class="w-44 px-3 py-3 hidden md:block mono truncate">
+            {% if tx.tx_to %}
+            {{ self::copy_address(address=tx.tx_to) }}
+            {% else %}<span class="text-faint">create</span>{% endif %}
+        </div>
+        <div class="w-20 px-3 py-3 text-right text-dim">{{ format_time_ago(timestamp=tx.tx_timestamp) }}</div>
+    </div>
+    {% endfor %}
+</div>
+{% endmacro tx_table %}
+
+{# A copy-to-clipboard button. The value rides in `data-copy`; one delegated
+   listener in base.html does the copying, so a page of a hundred rows adds a
+   hundred buttons and no handlers. #}
+{% macro copy(text, label="Copy") %}
+<button type="button" class="copy-btn" data-copy="{{ text }}" title="{{ label }}" aria-label="{{ label }}">
+    <svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+        <rect x="5.5" y="5.5" width="8" height="8" rx="1.6"></rect>
+        <path d="M10.5 3.5v-1a1 1 0 0 0-1-1h-7a1 1 0 0 0-1 1v7a1 1 0 0 0 1 1h1"></path>
+    </svg>
+    <span class="copy-done" aria-hidden="true">✓</span>
+</button>
+{% endmacro copy %}
+
+{# An address: linked, tagged with whatever the chain knows it as, and
+   copyable. `full` spells the whole address out; the default truncates. #}
+{% macro copy_address(address, full=false) %}
+<span class="addr">
+    <a href="{{ get_address_url(address=address) }}" class="text-blue-400 hover:text-blue-300">{% if full %}{{ address }}{% else %}{{ truncate_hash(h=address, prefix=8, suffix=6) }}{% endif %}</a>
+    {% set tag = address_label(address=address) %}
+    {% if tag %}<span class="addr-tag" title="{{ tag }}">{{ tag }}</span>{% endif %}
+    {{ self::copy(text=address, label="Copy address") }}
+</span>
+{% endmacro copy_address %}
+
+{# A transaction hash: linked, truncated, and copyable. #}
+{% macro copy_tx(hash) %}
+<span class="addr">
+    <a href="/tx/{{ hash }}" class="mono text-blue-400 hover:text-blue-300">{{ truncate_hash(h=hash, prefix=10, suffix=6) }}</a>
+    {{ self::copy(text=hash, label="Copy hash") }}
+</span>
+{% endmacro copy_tx %}
+
+{# One entry of a contract's interface: its selector or topic, its signature,
+   and a way to copy whichever of the two is worth copying. #}
+{% macro abi_entry(id, signature, copy="", kind="badge-method") %}
+<div class="text-xs flex items-start gap-2 flex-wrap">
+    <span class="badge {{ kind }} mono">{{ id }}</span>
+    <span class="mono break-all">{{ signature }}</span>
+    {# `fallback`, not `default`: the argument's default is an empty string. #}
+    {{ self::copy(text=copy | fallback(value=signature), label="Copy") }}
+</div>
+{% endmacro abi_entry %}

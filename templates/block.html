@@ -15,6 +15,18 @@
         {% else %}
         <span class="badge text-faint" style="background:rgba(255,255,255,0.04);">empty block</span>
         {% endif %}
+        <span class="flex items-center gap-1 ml-auto text-xs mono">
+            {% if previous_block is number %}
+            <a href="/block/{{ previous_block }}" class="step" rel="prev">← prev</a>
+            {% else %}
+            <span class="step step-off" aria-disabled="true">← prev</span>
+            {% endif %}
+            {% if next_block is number %}
+            <a href="/block/{{ next_block }}" class="step" rel="next">next →</a>
+            {% else %}
+            <span class="step step-off" aria-disabled="true">next →</span>
+            {% endif %}
+        </span>
     </div>
 </div>
 

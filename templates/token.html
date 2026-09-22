@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "_macros.html" as ui %}
 {% block title %}Token {{ token.symbol | fallback(value=truncate_hash(h=token.address, prefix=8, suffix=4)) }} ⋅ nvnmchain Explorer{% endblock %}
 {% block content %}
 
@@ -22,7 +23,7 @@
         <div class="mb-5">
             <span class="text-faint text-xs">Address</span>
             <div class="mono text-sm mt-1">
-                <a href="{{ get_address_url(address=token.address) }}" class="text-blue-400">{{ token.address }}</a>
+                {{ ui::copy_address(address=token.address, full=true) }}
             </div>
         </div>
         <div class="grid grid-cols-2 md:grid-cols-5 gap-4 text-xs">
@@ -52,9 +53,40 @@
 
 <!-- Tabs -->
 <div class="flex border-b gap-1 mb-5 overflow-x-auto" style="border-color: var(--border);">
-    <a href="?tab=transfers" class="tab {% if active_tab == 'transfers' %}active{% endif %}">Transfers <span class="text-faint font-normal">({{ transfer_count }})</span></a>
+    <a href="?tab=transfers" class="tab {% if active_tab == 'transfers' %}active{% endif %}">Transfers <span class="text-faint font-normal">({{ transfer_count | comma }})</span></a>
+    <a href="?tab=holders" class="tab {% if active_tab == 'holders' %}active{% endif %}">Holders <span class="text-faint font-normal">({{ holders | comma }})</span></a>
 </div>
 
+{% if active_tab == 'holders' %}
+<div class="card overflow-x-auto">
+    <div class="card-header">Holders</div>
+    {% if holder_rows %}
+    <div class="min-w-[600px]">
+        <div class="flex table-header">
+            <div class="w-14 px-3">#</div>
+            <div class="flex-1 px-3">Address</div>
+            <div class="w-44 px-3 text-right">Balance</div>
+            <div class="w-28 px-3 text-right">Share</div>
+        </div>
+        {% for h in holder_rows %}
+        <div class="t-row flex text-xs items-center">
+            <div class="w-14 px-3 py-3 text-faint">{{ h.rank }}</div>
+            <div class="flex-1 px-3 py-3 mono truncate">
+                {{ ui::copy_address(address=h.address) }}
+            </div>
+            <div class="w-44 px-3 py-3 text-right mono">
+                {{ h.formatted }} <span class="text-dim text-[11px]">{{ token.symbol }}</span>
+            </div>
+            <div class="w-28 px-3 py-3 text-right text-dim">{% if h.share %}{{ h.share }}%{% else %}—{% endif %}</div>
+        </div>
+        {% endfor %}
+    </div>
+    {% else %}
+    <div class="card-body text-center text-dim text-sm py-10">No holders found</div>
+    {% endif %}
+</div>
+{{ ui::pager(page=page, total_pages=total_pages, query="tab=holders&") }}
+{% else %}
 <div class="card overflow-x-auto">
     <div class="card-header">Transfers</div>
     {% if transfers %}
@@ -68,14 +100,14 @@
         {% for t in transfers %}
         <div class="t-row flex text-xs">
             <div class="flex-1 px-3 py-3">
-                <a href="/tx/{{ t.tx_hash }}" class="mono text-blue-400 hover:text-blue-300">{{ truncate_hash(h=t.tx_hash, prefix=10, suffix=6) }}</a>
+                {{ ui::copy_tx(hash=t.tx_hash) }}
                 {% if t.tx_status == 0 %}<span class="badge badge-error ml-1">fail</span>{% endif %}
             </div>
             <div class="w-40 px-3 py-3 hidden md:block mono truncate">
-                <a href="{{ get_address_url(address=t.from_addr) }}" class="text-dim hover:text-blue-300">{{ truncate_hash(h=t.from_addr) }}</a>
+                {{ ui::copy_address(address=t.from_addr) }}
             </div>
             <div class="w-40 px-3 py-3 hidden md:block mono truncate">
-                <a href="{{ get_address_url(address=t.to_addr) }}" class="text-dim hover:text-blue-300">{{ truncate_hash(h=t.to_addr) }}</a>
+                {{ ui::copy_address(address=t.to_addr) }}
             </div>
             <div class="w-44 px-3 py-3 text-right mono">
                 {{ format_token_amount(amount=t.amount, decimals=token.decimals) }}
@@ -88,16 +120,6 @@
     <div class="card-body text-center text-dim text-sm py-10">No transfers found</div>
     {% endif %}
 </div>
-
-{% if page > 1 or transfers | length == 25 %}
-<div class="flex justify-center gap-3 mt-5 text-xs items-center">
-    {% if page > 1 %}
-    <a href="?tab=transfers&page={{ page - 1 }}" class="badge badge-info hover:text-blue-300">← Previous</a>
-    {% endif %}
-    <span class="text-dim">Page {{ page }}</span>
-    {% if transfers | length == 25 %}
-    <a href="?tab=transfers&page={{ page + 1 }}" class="badge badge-info hover:text-blue-300">Next →</a>
-    {% endif %}
-</div>
+{{ ui::pager(page=page, total_pages=total_pages, query="tab=transfers&") }}
 {% endif %}
 {% endblock %}

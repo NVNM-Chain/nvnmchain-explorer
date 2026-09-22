@@ -1,4 +1,4 @@
-use nvnmchain_explorer::db::{self, Db};
+use nvnmchain_explorer::db::{self, Db, TxColumns};
 use nvnmchain_explorer::decoder::{
     checksum_address, decode_abi_args, decode_event, decode_function_call, extract_balance_changes,
     extract_calls, flatten_trace, TRANSFER_TOPIC,
@@ -6,7 +6,7 @@ use nvnmchain_explorer::decoder::{
 use nvnmchain_explorer::models::{BlockBundle, Transaction, TransferEvent};
 use nvnmchain_explorer::parse::{parse_block, parse_transaction};
 use nvnmchain_explorer::tokens::{
-    decode_string_result, format_token_amount, has_control_chars, sanitize_metadata_text,
+    decode_string_result, format_token_amount, has_control_chars, sanitize_metadata_text, TokenMeta,
 };
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
@@ -140,7 +140,7 @@ fn decode_transfer_event() {
     let log = json!({
         "address": format!("0x{}", "cc".repeat(20)),
         "topics": [
-            TRANSFER_TOPIC,
+            TRANSFER_TOPIC.as_str(),
             format!("0x{}{}", "00".repeat(12), from.trim_start_matches("0x")),
             format!("0x{}{}", "00".repeat(12), to.trim_start_matches("0x")),
         ],
@@ -154,6 +154,39 @@ fn decode_transfer_event() {
     assert!(event.params[0].indexed);
     assert_eq!(event.params[2].value, "1234");
     assert_eq!(event.params[1].value, checksum_address(&to));
+}
+
+/// The anchoring contract decodes under the selector and topic0 the chain's precompile had.
+#[test]
+fn decode_the_anchoring_contract() {
+    // (registryId 3, recordId 1, index 2, status "Revoked"), as both the call and the event carry it.
+    let status = hex::encode(format!("{:\0<32}", "Revoked"));
+    let args = format!(
+        "{:064x}{:064x}{:064x}{:064x}{:064x}{status}",
+        3, 1, 2, 0x80, 7
+    );
+
+    let call = decode_function_call(&format!("0x97b40c25{args}")).expect("decoded");
+    assert_eq!(
+        call.signature.as_deref(),
+        Some("updateRecordStatus(uint64,uint64,uint64,string)")
+    );
+    assert_eq!(call.params[3].value, "Revoked");
+
+    let caller = format!("0x{}", "11".repeat(20));
+    let log = json!({
+        "address": "0x0000000000000000000000000000000000000a00",
+        "topics": [
+            "0xd7b75457d41293eab4829975c951ce8c53106866f0c429d175fc6c91cdad5ade",
+            format!("0x{}{}", "00".repeat(12), "11".repeat(20)),
+        ],
+        "data": format!("0x{args}"),
+        "logIndex": "0x0",
+    });
+    let event = decode_event(&log).expect("decoded event");
+    assert_eq!(event.name.as_deref(), Some("UpdateRecordStatus"));
+    assert_eq!(event.params[0].value, checksum_address(&caller));
+    assert_eq!(event.params[4].value, "Revoked");
 }
 
 #[test]
@@ -180,6 +213,24 @@ fn flatten_trace_nested() {
     assert_eq!(flat[0]["children"], json!([1, 2]));
     assert_eq!(flat[1]["gas"], "21000");
     assert_eq!(flat[2]["value"], "1");
+}
+
+/// A CREATE's input is init code, whose first four bytes are constructor
+/// prologue — not a selector to decode, name, or ask a directory about.
+#[test]
+fn a_create_call_decodes_no_selector() {
+    let trace = json!({
+        "type": "CREATE",
+        "from": format!("0x{}", "aa".repeat(20)),
+        "to": format!("0x{}", "bb".repeat(20)),
+        // Solidity's usual prologue: PUSH1 0xA0; CALLVALUE; PUSH2 …
+        "input": format!("0x60a03461{}", "00".repeat(60)),
+        "gas": "0x186a0",
+        "gasUsed": "0xcccc",
+    });
+    let flat = flatten_trace(&trace);
+    assert_eq!(flat[0]["type"], "CREATE");
+    assert_eq!(flat[0]["decoded"], Value::Null);
 }
 
 /// ABI-encode a `string` return value the standard dynamic way:
@@ -225,6 +276,16 @@ fn decode_string_result_dynamic_encoding() {
     assert_eq!(decode_string_result(""), "");
     assert_eq!(decode_string_result("0x"), "");
     assert_eq!(decode_string_result("0x12"), "");
+
+    // A length word of all ones reads to the end of the buffer, not past it.
+    let mut hostile = hex::decode(abi_string("TestUSD").trim_start_matches("0x")).unwrap();
+    hostile[32..64].fill(0xff);
+    let decoded = decode_string_result(&format!("0x{}", hex::encode(&hostile)));
+    assert!(decoded.starts_with("TestUSD"), "{decoded:?}");
+    // An offset word past the buffer falls back to the in-place shape.
+    let mut wild = hostile.clone();
+    wild[24..32].fill(0xff);
+    let _ = decode_string_result(&format!("0x{}", hex::encode(&wild)));
 }
 
 #[test]
@@ -297,7 +358,7 @@ fn balance_changes_from_receipt() {
         "logs": [{
             "address": format!("0x{}", "cc".repeat(20)),
             "topics": [
-                TRANSFER_TOPIC,
+                TRANSFER_TOPIC.as_str(),
                 format!("0x{}{}", "00".repeat(12), from.trim_start_matches("0x")),
                 format!("0x{}{}", "00".repeat(12), to.trim_start_matches("0x")),
             ],
@@ -405,7 +466,6 @@ fn fresh_schema_has_all_columns() {
         "blocks",
         "transactions",
         "token_metadata",
-        "contract_labels",
         "transfer_events",
         "kv",
         "token_balances",
@@ -419,6 +479,105 @@ fn fresh_schema_has_all_columns() {
             .expect("table lookup");
         assert_eq!(count, 1, "table {table} should exist");
     }
+}
+
+#[test]
+fn a_database_with_the_anchoring_tables_loses_them() {
+    // They indexed the anchoring precompile, which the chain no longer has.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("legacy.db");
+    let legacy = rusqlite::Connection::open(&path).expect("open");
+    legacy
+        .execute_batch(
+            "CREATE TABLE anchored_events (id INTEGER PRIMARY KEY);
+             CREATE TABLE anchored_namespaces (namespace BLOB PRIMARY KEY);
+             CREATE TABLE registries (address BLOB NOT NULL, factory BLOB NOT NULL);",
+        )
+        .expect("legacy schema");
+    drop(legacy);
+
+    let conn = nvnmchain_explorer::db::init_db(path.to_str().unwrap()).expect("init_db");
+    let left: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table'
+             AND name IN ('anchored_events', 'anchored_namespaces', 'registries')",
+            [],
+            |r| r.get(0),
+        )
+        .expect("table lookup");
+    assert_eq!(left, 0);
+}
+
+#[test]
+fn a_database_with_single_column_address_indexes_gets_the_composite_ones() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("legacy-indexes.db");
+    let conn = nvnmchain_explorer::db::init_db(path.to_str().unwrap()).expect("init_db");
+    conn.execute_batch(
+        "DROP INDEX idx_tx_from_block; DROP INDEX idx_tx_to_block;
+         CREATE INDEX idx_tx_from ON transactions(from_addr);
+         CREATE INDEX idx_tx_to ON transactions(to_addr);
+         CREATE INDEX idx_tx_block_number ON transactions(block_number);",
+    )
+    .expect("the indexes an older explorer built");
+    drop(conn);
+
+    let conn = nvnmchain_explorer::db::init_db(path.to_str().unwrap()).expect("reopen");
+    let names: Vec<String> = conn
+        .prepare(
+            "SELECT name FROM sqlite_master
+             WHERE type='index' AND tbl_name='transactions' AND name LIKE 'idx_tx_%'
+             ORDER BY name",
+        )
+        .expect("prepare")
+        .query_map([], |r| r.get(0))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("rows");
+    assert_eq!(
+        names,
+        [
+            "idx_tx_block_position",
+            "idx_tx_from_block",
+            "idx_tx_to_block"
+        ]
+    );
+}
+
+#[test]
+fn a_database_with_single_column_transfer_indexes_gets_the_composite_ones() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("legacy-transfer-indexes.db");
+    let conn = nvnmchain_explorer::db::init_db(path.to_str().unwrap()).expect("init_db");
+    conn.execute_batch(
+        "DROP INDEX idx_transfer_from_block; DROP INDEX idx_transfer_to_block;
+         CREATE INDEX idx_transfer_from ON transfer_events(from_addr);
+         CREATE INDEX idx_transfer_to ON transfer_events(to_addr);",
+    )
+    .expect("the indexes an older explorer built");
+    drop(conn);
+
+    let conn = nvnmchain_explorer::db::init_db(path.to_str().unwrap()).expect("reopen");
+    let names: Vec<String> = conn
+        .prepare(
+            "SELECT name FROM sqlite_master
+             WHERE type='index' AND tbl_name='transfer_events' AND name LIKE 'idx_transfer_%'
+             ORDER BY name",
+        )
+        .expect("prepare")
+        .query_map([], |r| r.get(0))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("rows");
+    assert_eq!(
+        names,
+        [
+            "idx_transfer_from_block",
+            "idx_transfer_to_block",
+            "idx_transfer_token_block",
+            "idx_transfer_tx_hash"
+        ]
+    );
 }
 
 #[test]
@@ -481,6 +640,114 @@ fn blob_hex_round_trip() {
     assert_eq!(call_to, "0x20c0000000000000000000000000000000000000");
 }
 
+/// A re-index carrying no trace, raw bytes or receipt keeps the ones stored: the
+/// trace the transaction page cached, the raw bytes a failed decode left out.
+#[test]
+fn a_rewrite_without_the_blobs_keeps_them() {
+    let (_dir, db) = temp_db("keep-blobs.db");
+    let raw_block = sample_raw_block();
+    let block = parse_block(&raw_block);
+    let mut tx = parse_transaction(&raw_block["transactions"][0], &block);
+    tx.raw = Some("0xabcd".into());
+    tx.trace_data = Some("[]".into());
+    tx.receipt_data = Some("{}".into());
+    db::save_transaction(&db, &tx).unwrap();
+
+    let bare = parse_transaction(&raw_block["transactions"][0], &block);
+    assert!(bare.raw.is_none() && bare.trace_data.is_none());
+    db::save_transaction(&db, &bare).unwrap();
+    let stored = db::get_transaction(&db, &tx.hash).unwrap();
+    assert_eq!(stored.raw.as_deref(), Some("0xabcd"));
+    assert_eq!(stored.trace_data.as_deref(), Some("[]"));
+    assert_eq!(stored.receipt_data.as_deref(), Some("{}"));
+}
+
+/// A database from before the counters is counted once when it opens, and the
+/// writer carries on from there.
+#[test]
+fn counters_are_seeded_from_the_tables_of_an_older_database() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("counters.db");
+    let conn = db::init_db(path.to_str().unwrap()).expect("init_db");
+    let db: Db = Arc::new(Mutex::new(conn));
+    let raw_block = sample_raw_block();
+    let block = parse_block(&raw_block);
+    let tx = parse_transaction(&raw_block["transactions"][0], &block);
+    db::save_block_bundle(
+        &db,
+        &BlockBundle {
+            block,
+            txs: vec![tx],
+            transfers: vec![],
+            tokens: vec![],
+        },
+    )
+    .expect("save");
+    db::lock(&db)
+        .execute("DELETE FROM counters", [])
+        .expect("an older database has none");
+    drop(db);
+
+    let conn = db::init_db(path.to_str().unwrap()).expect("reopen");
+    assert_eq!(db::counter(&conn, "blocks"), 1);
+    assert_eq!(db::counter(&conn, "transactions"), 1);
+}
+
+/// The count the writer keeps is what a recount finds, at every step.
+#[test]
+fn holder_count_follows_the_balances() {
+    let (_dir, db) = temp_db("holders.db");
+    let raw_block = sample_raw_block();
+    let block = parse_block(&raw_block);
+    let tx = parse_transaction(&raw_block["transactions"][0], &block);
+    let (token, a, b) = sample_parties();
+    let meta = TokenMeta {
+        address: token.clone(),
+        name: "T".into(),
+        symbol: "T".into(),
+        decimals: 0,
+        currency: "T".into(),
+        total_supply: "0".into(),
+    };
+    let save = |log_index: i64, from: &str, to: &str, amount: &str| {
+        let transfer = TransferEvent {
+            id: 0,
+            tx_hash: tx.hash.clone(),
+            block_number: block.number,
+            log_index,
+            token_addr: token.clone(),
+            from_addr: from.into(),
+            to_addr: to.into(),
+            amount: amount.into(),
+            timestamp: block.timestamp,
+            created_at: 0,
+        };
+        let bundle = BlockBundle {
+            block: block.clone(),
+            txs: vec![tx.clone()],
+            transfers: vec![transfer],
+            tokens: vec![meta.clone()],
+        };
+        db::save_block_bundle(&db, &bundle).expect("save");
+        let kept = db::get_token_metadata(&db, &token)
+            .expect("token")
+            .holder_count;
+        assert_eq!(
+            kept,
+            db::get_token_holder_count(&db, &token),
+            "the kept count is what a recount finds"
+        );
+        kept
+    };
+    // a pays b out of nothing: b holds, a is owed.
+    assert_eq!(save(0, &a, &b, "100"), 1);
+    // b pays it back: both at zero, nobody holds.
+    assert_eq!(save(1, &b, &a, "100"), 0);
+    // b holds again, and a second payment adds no holder.
+    assert_eq!(save(2, &a, &b, "50"), 1);
+    assert_eq!(save(3, &a, &b, "50"), 1);
+}
+
 #[test]
 fn duplicate_bundle_is_idempotent() {
     let (_dir, db) = temp_db("dedup.db");
@@ -509,6 +776,9 @@ fn duplicate_bundle_is_idempotent() {
         count, 1,
         "duplicate bundle must not duplicate transfer rows"
     );
+    // A rewrite moves the counters the stats read no further either.
+    assert_eq!(db::counter(&conn, "blocks"), 1);
+    assert_eq!(db::counter(&conn, "transactions"), 1);
 
     let unique: i64 = conn
         .query_row(
@@ -604,10 +874,12 @@ fn indexed_transfer_reads_back_through_every_listing() {
     assert_eq!(holdings[0]["symbol"], json!("PRB"));
     assert_eq!(holdings[0]["formatted"], json!("1"));
 
-    // And the tokens list reports the holders the transfer created.
-    assert_eq!(db::get_token_holder_count(&db, &token), 2);
+    // And the tokens list reports the holders the transfer created. Only the
+    // recipient: the sender was never seen being funded, so its balance went
+    // negative, and a negative balance is not a holding.
+    assert_eq!(db::get_token_holder_count(&db, &token), 1);
     let stored = db::get_token_metadata(&db, &token).expect("token metadata");
-    assert_eq!(stored.holder_count, 2, "holder_count on the tokens list");
+    assert_eq!(stored.holder_count, 1, "holder_count on the tokens list");
 }
 
 #[test]
@@ -700,12 +972,13 @@ fn blob_storage_queries_match_text_params() {
     assert_eq!(holdings[0]["formatted"], "1");
 
     // Holder count: live count over token_balances plus the cached
-    // token_metadata.holder_count refreshed with a hex_blob key. Both the
-    // sender (negative balance) and the recipient hold a row, so it's 2.
-    assert_eq!(db::get_token_holder_count(&db, &token), 2);
+    // token_metadata.holder_count refreshed with a hex_blob key. The sender's
+    // row went negative — indexing began after it was funded — and a negative
+    // balance is not a holding, so only the recipient counts.
+    assert_eq!(db::get_token_holder_count(&db, &token), 1);
     let meta_back = db::get_token_metadata(&db, &token).expect("token metadata");
     assert_eq!(
-        meta_back.holder_count, 2,
+        meta_back.holder_count, 1,
         "token_metadata.holder_count must be refreshed via BLOB key"
     );
 
@@ -721,7 +994,7 @@ fn blob_storage_queries_match_text_params() {
     }
     let meta_back = db::get_token_metadata(&db, &token).expect("token metadata");
     assert_eq!(
-        meta_back.holder_count, 2,
+        meta_back.holder_count, 1,
         "sync_holder_counts must backfill stale counts"
     );
 }
@@ -739,10 +1012,14 @@ fn huge_page_numbers_do_not_panic() {
         db::init_db(path.to_str().unwrap()).expect("init_db"),
     ));
 
-    assert!(
-        db::get_address_transactions(&db, &format!("0x{}", "11".repeat(20)), u32::MAX, 25)
-            .is_empty()
-    );
+    assert!(db::get_address_transactions(
+        &db,
+        &format!("0x{}", "11".repeat(20)),
+        u32::MAX,
+        25,
+        TxColumns::List,
+    )
+    .is_empty());
     assert!(
         db::get_token_transfers(&db, &format!("0x{}", "aa".repeat(20)), u32::MAX, 25).is_empty()
     );
@@ -784,7 +1061,7 @@ fn authorize_key_restrictions_decode() {
     // The old bare-`tuple` spelling decoded this parameter to nothing at all.
     let call = decode_function_call(AUTHORIZE_KEY_CALLDATA).expect("authorizeKey");
     let names: Vec<&str> = call.params.iter().map(|p| p.name.as_str()).collect();
-    assert_eq!(names, ["keyId", "signatureType", "restrictions"]);
+    assert_eq!(names, ["keyId", "signatureType", "config"]);
     assert_eq!(call.params[0].value, addr("11"));
     assert_eq!(call.params[1].value, "2");
     // expiry, enforceLimits, one TokenLimit, allowAnyCalls, no CallScopes.
@@ -914,7 +1191,7 @@ fn witness_overload_decodes_the_argument_after_the_tuple() {
     let call = decode_function_call(WITNESS_CALLDATA).expect("authorizeKey with witness");
     assert_eq!(call.name.as_deref(), Some("authorizeKey"));
     let names: Vec<&str> = call.params.iter().map(|p| p.name.as_str()).collect();
-    assert_eq!(names, ["keyId", "signatureType", "restrictions", "witness"]);
+    assert_eq!(names, ["keyId", "signatureType", "config", "witness"]);
     assert_eq!(
         call.params[2].value,
         format!(
@@ -952,7 +1229,7 @@ fn array_length_is_bounded_by_the_calldata() {
     assert_eq!(call.name.as_deref(), Some("authorizeKey"));
     // All-or-nothing: the refused list keeps its names and types, values empty.
     let names: Vec<&str> = call.params.iter().map(|p| p.name.as_str()).collect();
-    assert_eq!(names, ["keyId", "signatureType", "restrictions"]);
+    assert_eq!(names, ["keyId", "signatureType", "config"]);
     assert!(call.params.iter().all(|p| p.value.is_empty()));
 }
 

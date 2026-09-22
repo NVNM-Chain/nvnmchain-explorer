@@ -10,3 +10,6 @@ explorer.db*
 /target/
 Cargo.lock.orig
 /TODO.md
+# A local `.cargo/config.toml` may patch tempo-contracts to a checkout. Cargo writes that
+# patch into Cargo.lock, so regenerate the lock with the patch off before committing it.
+.cargo/

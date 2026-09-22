@@ -59,6 +59,13 @@ impl ChainRpc {
         Self::new(&settings.rpc_url)
     }
 
+    /// The shared HTTP client, for the few requests that are not JSON-RPC —
+    /// the signature directory. Borrowing it keeps one connection pool per
+    /// process rather than one per subsystem.
+    pub fn http_client(&self) -> &Client {
+        &self.client
+    }
+
     fn next_id(&self) -> u64 {
         self.req_id.fetch_add(1, Ordering::Relaxed)
     }
@@ -264,23 +271,12 @@ impl ChainRpc {
 
     pub async fn eth_get_balance(&self, address: &str, block: &str) -> Result<String> {
         let result = self.call("eth_getBalance", json!([address, block])).await?;
-        Ok(hex_to_dec_str(&result))
+        Ok(decimal_amount(&result))
     }
 
     #[allow(dead_code)]
     pub async fn eth_get_code(&self, address: &str, block: &str) -> Result<String> {
         let result = self.call("eth_getCode", json!([address, block])).await?;
-        Ok(result
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .unwrap_or("0x")
-            .to_string())
-    }
-
-    pub async fn eth_call(&self, to: &str, data: &str, block: &str) -> Result<String> {
-        let result = self
-            .call("eth_call", json!([{"to": to, "data": data}, block]))
-            .await?;
         Ok(result
             .as_str()
             .filter(|s| !s.is_empty())
@@ -317,7 +313,6 @@ impl ChainRpc {
         .await
     }
 
-    #[allow(dead_code)]
     pub async fn eth_get_storage_at(
         &self,
         address: &str,
@@ -334,19 +329,28 @@ impl ChainRpc {
             .to_string())
     }
 
-    /// Trace a transaction with the callTracer; `None` when tracing is
-    /// unavailable.
-    pub async fn debug_trace_transaction(&self, tx_hash: &str) -> Option<Value> {
+    /// Trace a transaction with the callTracer, keeping the node's error so a
+    /// caller can tell "this node cannot trace" from "nothing to say about this
+    /// transaction" — the two want different handling.
+    pub async fn try_debug_trace_transaction(&self, tx_hash: &str) -> Result<Value> {
         self.call(
             "debug_traceTransaction",
             json!([tx_hash, {"tracer": "callTracer"}]),
         )
         .await
-        .ok()
-        .filter(|v| !v.is_null())
     }
 
-    /// Trace all transactions in a block with the callTracer.
+    /// Trace a transaction with the callTracer; `None` when tracing is
+    /// unavailable. Not on the index path — kept for debugging.
+    pub async fn debug_trace_transaction(&self, tx_hash: &str) -> Option<Value> {
+        self.try_debug_trace_transaction(tx_hash)
+            .await
+            .ok()
+            .filter(|v| !v.is_null())
+    }
+
+    /// Trace all transactions in a block with the callTracer. Not on the index
+    /// path — kept for debugging.
     pub async fn debug_trace_block(&self, block_num: u64) -> Option<Value> {
         self.call(
             "debug_traceBlockByNumber",
@@ -368,17 +372,25 @@ pub fn hex_to_u64(value: &Value) -> Result<u64> {
     u64::from_str_radix(s, 16).with_context(|| format!("invalid hex number: {s}"))
 }
 
-/// Convert a `0x`-prefixed hex JSON value to a decimal string with arbitrary
-/// precision.
-pub fn hex_to_dec_str(value: &Value) -> String {
-    let s = value.as_str().unwrap_or("0x0");
-    let s = s.strip_prefix("0x").unwrap_or(s);
-    if s.is_empty() {
-        return "0".into();
-    }
-    match BigInt::parse_bytes(s.as_bytes(), 16) {
-        Some(n) => n.to_string(),
-        None => "0".into(),
+/// An RPC amount as a decimal string, in whichever shape the node sent it:
+/// `0x`-prefixed hex, a decimal string, or a JSON number.
+///
+/// Wei-scale amounts overflow every fixed-width integer, so the hex path goes
+/// through a big integer and the result stays a string all the way to storage.
+/// Anything that is neither a string nor a number is `"0"`.
+pub fn decimal_amount(value: &Value) -> String {
+    match value {
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => match s.strip_prefix("0x") {
+            // How a node spells zero once it has trimmed the leading digits.
+            Some("") => "0".into(),
+            Some(hex) => BigInt::parse_bytes(hex.as_bytes(), 16)
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| s.clone()),
+            // Already decimal — kept verbatim rather than guessed at.
+            None => s.clone(),
+        },
+        _ => "0".into(),
     }
 }
 
@@ -445,5 +457,55 @@ pub async fn resolve_block_ref(rpc: &ChainRpc, reference: &str) -> Result<Option
         Err(_) => {
             bail!("invalid block reference: {reference}")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Base fees and token fees pass through here on the way to storage, and
+    /// nodes disagree about how to spell them.
+    #[test]
+    fn an_amount_is_read_however_the_node_spells_it() {
+        assert_eq!(decimal_amount(&json!("0x1a")), "26");
+        assert_eq!(decimal_amount(&json!("0x0")), "0");
+        // How a node spells zero once it has trimmed the leading digits.
+        assert_eq!(decimal_amount(&json!("0x")), "0");
+        // Already decimal, or a JSON number: kept, not guessed at.
+        assert_eq!(decimal_amount(&json!("1500000")), "1500000");
+        assert_eq!(decimal_amount(&json!(1_500_000)), "1500000");
+        // Neither a string nor a number says nothing about the amount.
+        assert_eq!(decimal_amount(&Value::Null), "0");
+        assert_eq!(decimal_amount(&json!({"wei": 1})), "0");
+    }
+
+    /// Wei-scale amounts run past every fixed-width integer, so the hex path
+    /// has to be a big integer — this is the whole reason amounts stay strings.
+    #[test]
+    fn an_amount_larger_than_a_u128_survives() {
+        let huge = "f".repeat(64);
+        let expected = num_bigint::BigInt::parse_bytes(huge.as_bytes(), 16)
+            .expect("parse")
+            .to_string();
+        assert_eq!(decimal_amount(&json!(format!("0x{huge}"))), expected);
+        assert!(expected.len() > 70, "far past u128");
+    }
+
+    /// Undecodable hex is handed back rather than quietly becoming zero: a
+    /// stored `0x…` reads as wrong, where a stored `0` reads as a real amount.
+    #[test]
+    fn undecodable_hex_is_not_mistaken_for_zero() {
+        assert_eq!(decimal_amount(&json!("0xnot-a-number")), "0xnot-a-number");
+    }
+
+    #[test]
+    fn an_integer_field_is_read_from_either_form() {
+        assert_eq!(parse_int_any(&json!("0x5208")), 21_000);
+        assert_eq!(parse_int_any(&json!("21000")), 21_000);
+        assert_eq!(parse_int_any(&json!(21_000)), 21_000);
+        assert_eq!(parse_int_any(&json!("")), 0);
+        assert_eq!(parse_int_any(&json!("nonsense")), 0);
+        assert_eq!(parse_int_any(&Value::Null), 0);
     }
 }

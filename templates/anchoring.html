@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% import "_macros.html" as ui %}
+{% block title %}Anchoring – nvnmchain Explorer{% endblock %}
+{% block content %}
+
+<div class="mb-6 flex flex-wrap items-end justify-between gap-4">
+    <div>
+        <h1 class="text-2xl font-extrabold tracking-tight">Anchoring</h1>
+        <p class="text-xs text-dim mt-1">{% if not q %}{{ total }} registries · {% endif %}read from the contract at {{ ui::copy_address(address=address) }}</p>
+    </div>
+    <form action="/anchoring" method="get" class="w-full md:w-96">
+        <input type="text" name="q" value="{{ q }}" class="search-input" placeholder="Registry id, exact name or checksum">
+    </form>
+</div>
+
+{% if q %}<h2 class="section-title mb-2">Registries named “{{ q }}”</h2>{% endif %}
+<div class="card overflow-x-auto mb-6">
+    <div class="min-w-[720px]">
+        <div class="flex table-header">
+            <div class="w-20 px-3">Id</div>
+            <div class="flex-1 px-3">Registry</div>
+            <div class="w-52 px-3">Creator</div>
+            <div class="w-56 px-3 text-right">Created</div>
+        </div>
+        {% for registry in registries %}
+        <div class="t-row flex text-xs items-center">
+            <div class="w-20 px-3 py-3 mono"><a href="/anchoring/{{ registry.id }}" class="text-blue-400 hover:text-blue-300">{{ registry.id }}</a></div>
+            <div class="flex-1 px-3 py-3 min-w-0">
+                <a href="/anchoring/{{ registry.id }}" class="text-blue-400 hover:text-blue-300 font-medium block truncate">{{ registry.name }}</a>
+                {% if registry.description %}<span class="text-faint block truncate">{{ registry.description }}</span>{% endif %}
+            </div>
+            <div class="w-52 px-3 py-3 mono truncate text-dim" title="{{ registry.creator }}">{{ truncate_hash(h=registry.creator, prefix=10, suffix=6) }}</div>
+            <div class="w-56 px-3 py-3 text-right text-faint">{{ registry.createdAt }}</div>
+        </div>
+        {% else %}
+        <div class="card-body text-center text-dim text-sm py-10">{% if q %}No registry has this name{% else %}No registries yet{% endif %}</div>
+        {% endfor %}
+    </div>
+</div>
+
+{% if q %}
+<h2 class="section-title mb-2">Records with checksum “{{ q }}”</h2>
+<div class="card overflow-x-auto">
+    <div class="min-w-[720px]">
+        <div class="flex table-header">
+            <div class="w-40 px-3">Record</div>
+            <div class="flex-1 px-3">URI</div>
+            <div class="w-28 px-3">Status</div>
+            <div class="w-56 px-3 text-right">Anchored</div>
+        </div>
+        {% for record in records %}
+        <div class="t-row flex text-xs items-center">
+            <div class="w-40 px-3 py-3 mono"><a href="/anchoring/{{ record.registryId }}/{{ record.recordId }}" class="text-blue-400 hover:text-blue-300">{{ record.registryId }} / {{ record.recordId }}</a> <span class="text-faint">v{{ record.index }}</span></div>
+            <div class="flex-1 px-3 py-3 truncate text-dim">{{ record.uri }}</div>
+            <div class="w-28 px-3 py-3"><span class="badge">{{ record.status }}</span></div>
+            <div class="w-56 px-3 py-3 text-right text-faint">{{ record.timestamp }}</div>
+        </div>
+        {% else %}
+        <div class="card-body text-center text-dim text-sm py-10">No registry has a record with this checksum</div>
+        {% endfor %}
+    </div>
+</div>
+{% else %}
+{{ ui::pager(page=page, total_pages=total_pages) }}
+{% endif %}
+
+{% endblock %}

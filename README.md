@@ -21,6 +21,7 @@ codebase is validated against. Point it anywhere with `NVNM_RPC` (the legacy
 ## Quick start
 
 ```bash
+git submodule update --init contracts   # the anchoring ABI is compiled in from it
 cargo run --release
 ```
 
@@ -139,6 +140,7 @@ The indexer is built for a sub-second chain:
 | `INDEX_CONCURRENCY` | `32` | Blocks fetched in parallel |
 | `NATIVE_SYMBOL` | `OM` | Symbol shown for native (burnt/gas) amounts |
 | `STATS_INTERVAL_SECONDS` | `5` | How often the dashboard stats are recomputed |
+| `SIGNATURE_LOOKUP_URL` | OpenChain | Signature directory for selectors no built-in ABI declares; set empty to disable ([Decoding](#decoding)) |
 | `RUST_LOG` | `nvnmchain_explorer=info` | Log verbosity |
 
 ## Routes
@@ -149,10 +151,14 @@ The indexer is built for a sub-second chain:
 | `/block/{num\|hash}` | Block detail |
 | `/blocks` | Block list |
 | `/tx/{hash}` | Transaction detail (tabs: Overview/Balances/Calls/Events/Raw) |
-| `/address/{addr}` | Address info (transactions, transfers, holdings) |
-| `/token/{addr}` | Token metadata + transfers |
+| `/address/{addr}` | Address info (transactions, transfers, holdings, contract) |
+| `/token/{addr}` | Token metadata, transfers, and holders |
 | `/tokens` | Token list |
+| `/anchoring` | Anchoring registries; `?q=` finds an id, an exact name or a checksum |
+| `/anchoring/{registry}` | A registry and the latest version of each record |
+| `/anchoring/{registry}/{record}` | A record's versions |
 | `/search?q=...` | Smart redirect (block#/tx/address/token auto-detection) |
+| `/api/search?q=...` | Suggestions for the search box, answered from the index |
 | `/api/events` | SSE live feed — pushes each newly indexed tip block (drives the home page's streaming "Latest Blocks" panel) |
 
 All data endpoints accept `?format=json` or `Accept: application/json`.
@@ -162,6 +168,40 @@ latest-blocks panel, the latest-block stat, and the block-time stat in real
 time as blocks land — no client polling. The feed is in-process: run a single
 instance (as the deploy configs do) so the indexer and the web server share
 the same broadcast channel.
+
+### Decoding
+
+Calls, logs and reverts decode against the chain's own definitions: the
+[tempo-contracts](https://github.com/NVNM-Chain/nvnmchain-tempo) bindings,
+where `#[sol(abi)]` turns each `interface` into a JSON ABI at compile time —
+an upstream change arrives with `cargo update`, and a rename fails to compile
+rather than silently failing to decode. The few declarations with no binding
+are Solidity signatures at the top of `src/decoder.rs`: a typo there does not
+parse, and tests pin the selectors they hash to.
+
+Multicall3, Permit2, CreateX and the anchoring contract at `0x…0a00` are not
+Tempo's, so no binding carries them. The first three are vendored JSON under
+`abi/`. Anchoring comes from the nvnmchain-contracts submodule at `contracts/`,
+which generates `layout/anchoring.abi.json` beside the bytecode Tempo's genesis
+uses, so the explorer cannot decode against an ABI the contract no longer has.
+
+The anchoring pages read that contract over RPC, not the index: the corpus it
+was seeded with at genesis emitted no events. So does the search box, for a whole
+registry name or a record's checksum — all the contract matches. Any part of a name
+matches only in the node's registry name index: start the node with
+`--anchoring.name-index` and the box asks it, at a request per keystroke. A node without
+it answers "method not found", which costs the box those rows and nothing else.
+
+Each decoded log is also said in words, from the phrasing table in
+`src/summary.rs`, and the transaction page leads with that sentence. Two tests
+hold the table and the registry to each other, so a new event cannot land
+unexplained.
+
+A selector nothing declares is looked up once in a public signature directory
+(OpenChain by default) and cached, misses included. An answer is believed only
+when it hashes to the selector it was offered for, and is badged as the
+stranger's name it is. Set `SIGNATURE_LOOKUP_URL=` (empty) and the explorer
+talks to no third party.
 
 ## Indexer
 
@@ -186,15 +226,21 @@ holder counts and address holdings stay exact without rescanning history.
 ## Tests
 
 ```bash
-# Unit tests (no network)
-cargo test --test decoder
+# Unit and integration tests (no network)
+cargo test --lib --test decoder --test anchoring --test pages
 
 # Integration tests against the live chain RPC
 cargo test --test live_rpc
 ```
 
-The integration tests hit the RPC: they assert the chain id, fetch and index
-recent blocks into a temp SQLite DB, and boot the HTTP API to verify the JSON
+`tests/pages.rs` boots the HTTP API over a temp SQLite database and renders the
+real templates, so a context key a handler stops sending fails a test rather
+than a page view. Nothing in it reaches the network: the RPC points at a closed
+port and the signature directory is stubbed. `tests/anchoring.rs` does the same
+over a stub node that answers like the anchoring contract.
+
+The live tests hit the RPC: they assert the chain id, fetch and index recent
+blocks into a temp SQLite DB, and boot the HTTP API to verify the JSON
 endpoints end to end.
 
 ## Layout
@@ -207,13 +253,20 @@ src/
   ws.rs         WebSocket newHeads feed + polling fallback
   parse.rs      raw RPC → storage models
   db.rs         SQLite layer
-  decoder.rs    ABI decoder, events, traces
+  decoder.rs    ABI registry (from tempo-contracts) + decoder
+  summary.rs    what a transaction did, in a sentence
+  memo.rs       TIP-20 transfer memos
+  signatures.rs names for selectors no built-in ABI declares
+  name_search.rs  registry names from nvnmchain-anchoring, when one is configured
+  tempo_address.rs  TIP-1022 virtual addresses
   contracts.rs  precompile / token labels
+  anchoring.rs  the anchoring contract's views
   tokens.rs     token metadata + formatting
   indexer.rs    background indexing
   web.rs        axum routes + template helpers
+abi/            ABIs for contracts no Tempo binding carries
 templates/      Tera templates
-tests/          decoder unit tests + live RPC integration tests
+tests/          unit + page tests, and live RPC integration tests
 ```
 
 ## License

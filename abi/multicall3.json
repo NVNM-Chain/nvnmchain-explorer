@@ -1,0 +1,384 @@
+[
+ {
+  "type": "function",
+  "name": "aggregate",
+  "inputs": [
+   {
+    "name": "calls",
+    "type": "tuple[]",
+    "components": [
+     {
+      "name": "target",
+      "type": "address"
+     },
+     {
+      "name": "callData",
+      "type": "bytes"
+     }
+    ]
+   }
+  ],
+  "outputs": [
+   {
+    "name": "blockNumber",
+    "type": "uint256"
+   },
+   {
+    "name": "returnData",
+    "type": "bytes[]"
+   }
+  ],
+  "stateMutability": "payable"
+ },
+ {
+  "type": "function",
+  "name": "aggregate3",
+  "inputs": [
+   {
+    "name": "calls",
+    "type": "tuple[]",
+    "components": [
+     {
+      "name": "target",
+      "type": "address"
+     },
+     {
+      "name": "allowFailure",
+      "type": "bool"
+     },
+     {
+      "name": "callData",
+      "type": "bytes"
+     }
+    ]
+   }
+  ],
+  "outputs": [
+   {
+    "name": "returnData",
+    "type": "tuple[]",
+    "components": [
+     {
+      "name": "success",
+      "type": "bool"
+     },
+     {
+      "name": "returnData",
+      "type": "bytes"
+     }
+    ]
+   }
+  ],
+  "stateMutability": "payable"
+ },
+ {
+  "type": "function",
+  "name": "aggregate3Value",
+  "inputs": [
+   {
+    "name": "calls",
+    "type": "tuple[]",
+    "components": [
+     {
+      "name": "target",
+      "type": "address"
+     },
+     {
+      "name": "allowFailure",
+      "type": "bool"
+     },
+     {
+      "name": "value",
+      "type": "uint256"
+     },
+     {
+      "name": "callData",
+      "type": "bytes"
+     }
+    ]
+   }
+  ],
+  "outputs": [
+   {
+    "name": "returnData",
+    "type": "tuple[]",
+    "components": [
+     {
+      "name": "success",
+      "type": "bool"
+     },
+     {
+      "name": "returnData",
+      "type": "bytes"
+     }
+    ]
+   }
+  ],
+  "stateMutability": "payable"
+ },
+ {
+  "type": "function",
+  "name": "blockAndAggregate",
+  "inputs": [
+   {
+    "name": "calls",
+    "type": "tuple[]",
+    "components": [
+     {
+      "name": "target",
+      "type": "address"
+     },
+     {
+      "name": "callData",
+      "type": "bytes"
+     }
+    ]
+   }
+  ],
+  "outputs": [
+   {
+    "name": "blockNumber",
+    "type": "uint256"
+   },
+   {
+    "name": "blockHash",
+    "type": "bytes32"
+   },
+   {
+    "name": "returnData",
+    "type": "tuple[]",
+    "components": [
+     {
+      "name": "success",
+      "type": "bool"
+     },
+     {
+      "name": "returnData",
+      "type": "bytes"
+     }
+    ]
+   }
+  ],
+  "stateMutability": "payable"
+ },
+ {
+  "type": "function",
+  "name": "getBasefee",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "basefee",
+    "type": "uint256"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "getBlockHash",
+  "inputs": [
+   {
+    "name": "blockNumber",
+    "type": "uint256"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "blockHash",
+    "type": "bytes32"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "getBlockNumber",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "blockNumber",
+    "type": "uint256"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "getChainId",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "chainid",
+    "type": "uint256"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "getCurrentBlockCoinbase",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "coinbase",
+    "type": "address"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "getCurrentBlockDifficulty",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "difficulty",
+    "type": "uint256"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "getCurrentBlockGasLimit",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "gaslimit",
+    "type": "uint256"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "getCurrentBlockTimestamp",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "timestamp",
+    "type": "uint256"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "getEthBalance",
+  "inputs": [
+   {
+    "name": "addr",
+    "type": "address"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "balance",
+    "type": "uint256"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "getLastBlockHash",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "blockHash",
+    "type": "bytes32"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "tryAggregate",
+  "inputs": [
+   {
+    "name": "requireSuccess",
+    "type": "bool"
+   },
+   {
+    "name": "calls",
+    "type": "tuple[]",
+    "components": [
+     {
+      "name": "target",
+      "type": "address"
+     },
+     {
+      "name": "callData",
+      "type": "bytes"
+     }
+    ]
+   }
+  ],
+  "outputs": [
+   {
+    "name": "returnData",
+    "type": "tuple[]",
+    "components": [
+     {
+      "name": "success",
+      "type": "bool"
+     },
+     {
+      "name": "returnData",
+      "type": "bytes"
+     }
+    ]
+   }
+  ],
+  "stateMutability": "payable"
+ },
+ {
+  "type": "function",
+  "name": "tryBlockAndAggregate",
+  "inputs": [
+   {
+    "name": "requireSuccess",
+    "type": "bool"
+   },
+   {
+    "name": "calls",
+    "type": "tuple[]",
+    "components": [
+     {
+      "name": "target",
+      "type": "address"
+     },
+     {
+      "name": "callData",
+      "type": "bytes"
+     }
+    ]
+   }
+  ],
+  "outputs": [
+   {
+    "name": "blockNumber",
+    "type": "uint256"
+   },
+   {
+    "name": "blockHash",
+    "type": "bytes32"
+   },
+   {
+    "name": "returnData",
+    "type": "tuple[]",
+    "components": [
+     {
+      "name": "success",
+      "type": "bool"
+     },
+     {
+      "name": "returnData",
+      "type": "bytes"
+     }
+    ]
+   }
+  ],
+  "stateMutability": "payable"
+ }
+]

@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "_macros.html" as ui %}
 {% block title %}Transaction {{ truncate_hash(h=tx.hash, prefix=8, suffix=4) }} ⋅ nvnmchain Explorer{% endblock %}
 {% block content %}
 
@@ -19,12 +20,42 @@
     </div>
 </div>
 
+{# What the transaction did, in a sentence — the first thing to read. #}
+<div class="card summary summary-{{ summary.tone }} mb-6">
+    <div class="card-body">
+        <div class="flex items-start gap-3">
+            <span class="summary-mark">{% if summary.tone == 'failure' %}!{% else %}✓{% endif %}</span>
+            <div class="min-w-0">
+                <div class="summary-headline">{{ summary.headline }}</div>
+                {% if summary.error %}
+                <div class="text-sm mt-1.5 value-negative">{{ summary.error }}</div>
+                {% endif %}
+                {% for detail in summary.details %}
+                <div class="text-xs text-dim mt-1">{{ detail }}</div>
+                {% endfor %}
+            </div>
+        </div>
+        {% if known_events | length > 1 %}
+        <div class="mt-4 pt-4 space-y-1.5" style="border-top: 1px solid var(--border);">
+            {% for said in known_events %}
+            <div class="text-xs flex items-start gap-2">
+                <span class="badge {% if said.is_fee %}badge-warn{% else %}badge-info{% endif %}">{{ said.kind }}</span>
+                <span class="min-w-0">{{ said.headline }}{% if said.note %}<span class="text-dim"> — {{ said.note }}</span>{% endif %}</span>
+            </div>
+            {% endfor %}
+        </div>
+        {% endif %}
+    </div>
+</div>
+
 <div class="card mb-6">
     <div class="card-body grid grid-cols-1 md:grid-cols-2 gap-x-10 gap-y-4">
         <div class="space-y-3.5">
             <div class="kv-row">
                 <div class="kv-label">Hash</div>
-                <div class="kv-value mono text-xs break-all">{{ tx.hash }}</div>
+                <div class="kv-value mono text-xs break-all">
+                    {{ tx.hash }}{{ ui::copy(text=tx.hash, label="Copy transaction hash") }}
+                </div>
             </div>
             <div class="kv-row">
                 <div class="kv-label">Block</div>
@@ -39,13 +70,13 @@
             </div>
             <div class="kv-row">
                 <div class="kv-label">From</div>
-                <div class="kv-value mono text-xs"><a href="{{ get_address_url(address=tx.from_addr) }}" class="text-blue-400 break-all">{{ tx.from_addr }}</a></div>
+                <div class="kv-value mono text-xs">{{ ui::copy_address(address=tx.from_addr, full=true) }}</div>
             </div>
             <div class="kv-row">
                 <div class="kv-label">To</div>
                 <div class="kv-value mono text-xs">
                     {% if tx.to_addr %}
-                    <a href="{{ get_address_url(address=tx.to_addr) }}" class="text-blue-400 break-all">{{ tx.to_addr }}</a>
+                    {{ ui::copy_address(address=tx.to_addr, full=true) }}
                     {% else %}
                     <span class="text-faint">Contract creation
                     {%- if tx.contract_address %}
@@ -69,7 +100,7 @@
                 <div class="kv-label">Fee Payer</div>
                 <div class="kv-value mono text-xs">
                     {% if fee_payer %}
-                    <a href="{{ get_address_url(address=fee_payer) }}" class="text-blue-400 break-all">{{ fee_payer }}</a>
+                    {{ ui::copy_address(address=fee_payer, full=true) }}
                     {% else %}—{% endif %}
                 </div>
             </div>
@@ -175,6 +206,34 @@
     <div class="card-body text-center text-dim text-sm py-10">No balance changes.</div>
     {% endif %}
 </div>
+
+<!-- Fee Breakdown -->
+<div class="card mb-6">
+    <div class="card-header">Fee Breakdown</div>
+    <div class="card-body grid grid-cols-2 md:grid-cols-4 gap-4 text-xs">
+        <div>
+            <span class="text-faint">Charged</span>
+            <div class="mt-1 font-semibold mono">
+                {% if fee_breakdown.has_charge and fee_breakdown.charged %}{{ fee_breakdown.charged }}
+                {%- elif fee_breakdown.has_charge %}{{ fee_amount }}
+                {%- else %}—{% endif %}
+            </div>
+        </div>
+        <div>
+            <span class="text-faint">Gas × Price</span>
+            <div class="mt-1 font-semibold mono">{{ fee_breakdown.total_wei }}</div>
+            <div class="text-faint mt-0.5">{{ fee_breakdown.gas_used | comma }} × {{ fee_breakdown.gas_price | comma }}</div>
+        </div>
+        <div>
+            <span class="text-faint">Burnt (base fee)</span>
+            <div class="mt-1 font-semibold mono">{{ fee_breakdown.burnt_wei }}</div>
+        </div>
+        <div>
+            <span class="text-faint">Validator tip</span>
+            <div class="mt-1 font-semibold mono">{{ fee_breakdown.tip_wei }}</div>
+        </div>
+    </div>
+</div>
 {% endif %}
 
 {% if active_tab == 'overview' or active_tab == 'calls' %}
@@ -212,7 +271,12 @@
             </div>
             {% if call.decoded %}
             <div class="text-sm ml-4 mb-1">
-                <span class="text-violet-300">{{ call.decoded.signature | fallback(value=call.decoded.name) | fallback(value='Unknown') }}</span>
+                {# The selector as last resort: it names nothing, but it is searchable. #}
+                <span class="text-violet-300">{{ call.decoded.signature | fallback(value=call.decoded.name) | fallback(value=call.decoded.selector) | fallback(value='Unknown') }}</span>
+                {# A name from a public directory is a stranger's, not the chain's. #}
+                {% if call.decoded.source %}
+                <span class="badge badge-warn ml-1" title="Name from the {{ call.decoded.source }}, not from a built-in ABI">4byte</span>
+                {% endif %}
             </div>
             {% if call.decoded.params %}
             <div class="space-y-1 text-xs ml-6">
@@ -230,7 +294,22 @@
             {% if call.output and call.output != '0x' %}
             <div class="text-xs text-faint ml-4 mono">→ output: {{ call.output | truncate(length=80) }}</div>
             {% endif %}
-            {% if call.error %}
+            {% if call.revert %}
+            <div class="text-xs ml-4 mt-1">
+                <span class="badge badge-error">{{ call.revert.name }}</span>
+                <span class="value-negative ml-1">{{ call.revert.text }}</span>
+            </div>
+            {% if call.revert.params %}
+            <div class="space-y-1 text-xs ml-6 mt-1">
+                {% for param in call.revert.params %}
+                <div>
+                    <span class="text-faint">{{ param.type }} {{ param.name }}:</span>
+                    <span class="mono ml-1 break-all">{{ param.value }}</span>
+                </div>
+                {% endfor %}
+            </div>
+            {% endif %}
+            {% elif call.error %}
             <div class="text-xs text-red-400 ml-4 mono break-all">revert: {{ call.error }}</div>
             {% endif %}
         </div>
@@ -254,7 +333,24 @@
             {% if event.log_index %}
             <span class="text-faint">Log {{ event.log_index }}</span>
             {% endif %}
+            {% if event.known %}
+            <span class="badge {% if event.known.is_fee %}badge-warn{% else %}badge-method{% endif %}">{{ event.known.kind }}</span>
+            {% endif %}
         </div>
+        {# Lead with the reading; the decoded arguments stay below it. #}
+        {% if event.known %}
+        <div class="text-sm mb-2 font-medium">{{ event.known.headline }}</div>
+        {% if event.known.note %}
+        <div class="text-xs mb-2 memo">memo: {{ event.known.note }}</div>
+        {% endif %}
+        {% if event.known.details %}
+        <div class="text-xs mb-2 space-x-3">
+            {% for detail in event.known.details %}
+            <span class="text-faint">{{ detail.0 }}:</span><span class="ml-1">{{ detail.1 }}</span>
+            {% endfor %}
+        </div>
+        {% endif %}
+        {% endif %}
         <div class="text-sm mb-2">
             {% if event.name %}
             <span class="text-green-400">{{ event.name }}</span>
@@ -264,9 +360,9 @@
             <span class="mono text-xs ml-2">{{ event.topic0 | truncate(length=50) }}</span>
             {% endif %}
         </div>
-        <div class="text-xs">
+        <div class="text-xs mono">
             <span class="text-faint">Contract: </span>
-            <a href="{{ get_address_url(address=event.contract) }}" class="text-blue-400 mono">{{ event.contract }}</a>
+            {{ ui::copy_address(address=event.contract, full=true) }}
         </div>
         {% if event.params %}
         <div class="space-y-1 text-xs mt-1 ml-2">

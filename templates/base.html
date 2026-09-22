@@ -66,6 +66,15 @@
             transition: background 120ms ease;
         }
         .t-row:last-child { border-bottom: none; }
+        /* A live panel scrolls rather than growing the page under the reader. */
+        .feed { max-height: 32rem; overflow-y: auto; overscroll-behavior: contain; }
+        /* A step to the next block, or the end of the chain shown rather than hidden. */
+        .step {
+            padding: 3px 9px; border: 1px solid var(--border); border-radius: 6px;
+            color: var(--text-dim); text-decoration: none;
+        }
+        .step:hover { color: #93c5fd; border-color: #3b82f6; }
+        .step-off { opacity: .35; }
         .t-row:hover { background: rgba(255,255,255,0.025); }
         .badge {
             display: inline-flex;
@@ -150,6 +159,89 @@
         }
         .tab:hover { color: var(--text); }
         .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+        /* Search suggestions. */
+        .search-box { position: relative; }
+        .suggestions {
+            position: absolute;
+            top: calc(100% + 6px);
+            left: 0; right: 0;
+            z-index: 60;
+            background: var(--panel-2);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            box-shadow: 0 16px 40px rgba(0,0,0,0.45);
+            overflow: hidden;
+            max-height: 60vh;
+            overflow-y: auto;
+        }
+        .suggestion {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 9px 14px;
+            cursor: pointer;
+            border-bottom: 1px solid rgba(29,29,46,0.7);
+        }
+        .suggestion:last-child { border-bottom: none; }
+        .suggestion:hover, .suggestion[aria-selected="true"] { background: rgba(110,168,255,0.1); }
+        .suggestion-label { font-size: 13px; font-weight: 600; color: var(--text); }
+        .suggestion-sub {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 11px; color: var(--faint);
+            overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        }
+        .suggestion-kind {
+            margin-left: auto; flex-shrink: 0;
+            font-size: 10px; font-weight: 600; letter-spacing: 0.06em;
+            text-transform: uppercase; color: var(--faint);
+        }
+        /* Copy affordance. The button is quiet until its row is hovered, so a
+           table of a hundred addresses does not read as a table of buttons. */
+        .addr { display: inline-flex; align-items: center; gap: 6px; min-width: 0; max-width: 100%; }
+        .addr > a { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+        .copy-btn {
+            display: inline-flex; align-items: center; justify-content: center;
+            width: 20px; height: 20px; flex-shrink: 0;
+            border: none; border-radius: 6px; padding: 0; cursor: pointer;
+            background: transparent; color: var(--faint);
+            opacity: 0; transition: opacity 120ms ease, color 120ms ease, background 120ms ease;
+        }
+        .t-row:hover .copy-btn, .kv-value:hover .copy-btn, .card-body:hover .copy-btn,
+        .copy-btn:focus-visible { opacity: 1; }
+        .copy-btn:hover { color: var(--text); background: rgba(255,255,255,0.07); }
+        .copy-btn .copy-done { display: none; color: var(--green); font-size: 12px; font-weight: 700; }
+        .copy-btn.copied { opacity: 1; }
+        .copy-btn.copied svg { display: none; }
+        .copy-btn.copied .copy-done { display: inline; }
+        /* What the chain knows an address as — a precompile, a token, an alias. */
+        .addr-tag {
+            flex-shrink: 0;
+            font-family: 'Inter', sans-serif;
+            font-size: 10px; font-weight: 600;
+            letter-spacing: 0.02em;
+            padding: 1px 6px; border-radius: 999px;
+            background: rgba(129,140,248,0.14); color: #a5b4fc;
+            max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        }
+        /* The verdict card at the top of a transaction. */
+        .summary-headline { font-size: 16px; font-weight: 700; letter-spacing: -0.01em; }
+        .summary-mark {
+            width: 24px; height: 24px; border-radius: 8px; flex-shrink: 0;
+            display: inline-flex; align-items: center; justify-content: center;
+            font-weight: 800; font-size: 13px;
+        }
+        .summary-success .summary-mark { background: rgba(52,211,153,0.14); color: var(--green); }
+        .summary-success { border-color: rgba(52,211,153,0.28); }
+        .summary-failure .summary-mark { background: rgba(248,113,113,0.14); color: var(--red); }
+        .summary-failure { border-color: rgba(248,113,113,0.3); }
+        .summary-neutral .summary-mark { background: rgba(110,168,255,0.14); color: var(--accent); }
+        .memo {
+            background: rgba(167,139,250,0.08);
+            border-left: 2px solid var(--accent-2);
+            border-radius: 0 7px 7px 0;
+            padding: 6px 10px;
+            color: #cdc0f5;
+        }
         .pre-wrap { white-space: pre-wrap; word-break: break-all; }
         .divider { border-color: var(--border); }
         .pulse-dot {
@@ -239,7 +331,9 @@
                     <div class="hidden md:flex items-center gap-1">
                         <a href="/" class="nav-link">Home</a>
                         <a href="/blocks" class="nav-link">Blocks</a>
+                        <a href="/txs" class="nav-link">Transactions</a>
                         <a href="/tokens" class="nav-link">Tokens</a>
+                        <a href="/anchoring" class="nav-link">Anchoring</a>
                     </div>
                 </div>
                 <div class="flex items-center gap-3">
@@ -254,8 +348,12 @@
                 </div>
             </div>
             <div class="pb-4">
-                <form action="/search" method="GET" class="max-w-2xl mx-auto">
-                    <input type="text" name="q" placeholder="Search block, transaction, address or token…" class="search-input" value="{{ query }}">
+                <form action="/search" method="GET" class="max-w-2xl mx-auto search-box" role="search">
+                    <input type="text" name="q" id="search-input" placeholder="Search block, transaction, address or token…"
+                           class="search-input" value="{{ query | default(value='') }}"
+                           autocomplete="off" role="combobox" aria-expanded="false"
+                           aria-controls="search-suggestions" aria-autocomplete="list">
+                    <div id="search-suggestions" class="suggestions" role="listbox" hidden></div>
                 </form>
             </div>
         </div>
@@ -276,5 +374,154 @@
             </span>
         </div>
     </footer>
+    <script>
+        // One delegated listener for every copy button on the page.
+        document.addEventListener('click', (event) => {
+            const button = event.target.closest('[data-copy]');
+            if (!button) return;
+            event.preventDefault();
+            copyText(button.dataset.copy).then((ok) => {
+                if (!ok) return;
+                button.classList.add('copied');
+                setTimeout(() => button.classList.remove('copied'), 1200);
+            });
+        });
+
+        // The async clipboard API needs a secure context; an explorer served
+        // over plain HTTP on a private network is a normal deployment, so fall
+        // back to the selection-based copy there.
+        async function copyText(text) {
+            if (navigator.clipboard && window.isSecureContext) {
+                try {
+                    await navigator.clipboard.writeText(text);
+                    return true;
+                } catch (e) { /* fall through */ }
+            }
+            const field = document.createElement('textarea');
+            field.value = text;
+            field.setAttribute('readonly', '');
+            field.style.position = 'fixed';
+            field.style.opacity = '0';
+            document.body.appendChild(field);
+            field.select();
+            let ok = false;
+            try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+            document.body.removeChild(field);
+            return ok;
+        }
+
+        // Search suggestions. Every answer comes from the index, so a keystroke
+        // costs one cheap request; a request still in flight when the next
+        // keystroke lands is abandoned rather than raced.
+        (() => {
+            const input = document.getElementById('search-input');
+            const panel = document.getElementById('search-suggestions');
+            if (!input || !panel) return;
+
+            let items = [];
+            let active = -1;
+            let debounce;
+            let inFlight;
+
+            function close() {
+                panel.hidden = true;
+                panel.innerHTML = '';
+                input.setAttribute('aria-expanded', 'false');
+                items = [];
+                active = -1;
+            }
+
+            function select(index) {
+                active = index;
+                for (const [i, item] of items.entries()) {
+                    item.setAttribute('aria-selected', i === index ? 'true' : 'false');
+                }
+                if (index >= 0) items[index].scrollIntoView({ block: 'nearest' });
+            }
+
+            function render(results) {
+                if (!results.length) return close();
+                panel.innerHTML = '';
+                for (const result of results) {
+                    const row = document.createElement('a');
+                    row.className = 'suggestion';
+                    row.setAttribute('role', 'option');
+                    row.setAttribute('aria-selected', 'false');
+                    row.href = result.url;
+
+                    const text = document.createElement('div');
+                    text.style.minWidth = '0';
+                    const label = document.createElement('div');
+                    label.className = 'suggestion-label';
+                    label.textContent = result.label;
+                    const sub = document.createElement('div');
+                    sub.className = 'suggestion-sub';
+                    sub.textContent = result.sublabel;
+                    text.append(label, sub);
+
+                    const kind = document.createElement('span');
+                    kind.className = 'suggestion-kind';
+                    kind.textContent = result.type;
+
+                    row.append(text, kind);
+                    panel.append(row);
+                }
+                items = [...panel.querySelectorAll('.suggestion')];
+                active = -1;
+                panel.hidden = false;
+                input.setAttribute('aria-expanded', 'true');
+            }
+
+            async function suggest(query) {
+                if (inFlight) inFlight.abort();
+                inFlight = new AbortController();
+                try {
+                    const response = await fetch(
+                        `/api/search?q=${encodeURIComponent(query)}`,
+                        { signal: inFlight.signal },
+                    );
+                    if (!response.ok) return close();
+                    const body = await response.json();
+                    // A slower answer to an older query must not replace the
+                    // suggestions for what is in the box now.
+                    if (body.query.trim() !== input.value.trim()) return;
+                    render(body.results || []);
+                } catch (e) {
+                    if (e.name !== 'AbortError') close();
+                }
+            }
+
+            input.addEventListener('input', () => {
+                const query = input.value.trim();
+                clearTimeout(debounce);
+                if (!query) return close();
+                debounce = setTimeout(() => suggest(query), 140);
+            });
+
+            input.addEventListener('keydown', (event) => {
+                if (panel.hidden || !items.length) return;
+                if (event.key === 'ArrowDown') {
+                    event.preventDefault();
+                    select((active + 1) % items.length);
+                } else if (event.key === 'ArrowUp') {
+                    event.preventDefault();
+                    select((active - 1 + items.length) % items.length);
+                } else if (event.key === 'Enter' && active >= 0) {
+                    // Only when something is highlighted; otherwise the form
+                    // submits and /search decides, as it always has.
+                    event.preventDefault();
+                    window.location.href = items[active].href;
+                } else if (event.key === 'Escape') {
+                    close();
+                }
+            });
+
+            input.addEventListener('blur', () => setTimeout(close, 120));
+            input.addEventListener('focus', () => {
+                const query = input.value.trim();
+                if (query) suggest(query);
+            });
+        })();
+    </script>
 </body>
 </html>

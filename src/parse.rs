@@ -1,12 +1,11 @@
 //! Normalize raw RPC JSON into storage models (port of the `parse_*`
 //! functions in `app/rpc.py`).
 
-use num_bigint::BigInt;
 use serde_json::Value;
 
 use crate::db::now_ts;
 use crate::models::{Block, Transaction};
-use crate::rpc::{parse_int_any, str_field};
+use crate::rpc::{decimal_amount, parse_int_any, str_field};
 
 pub fn parse_block(raw: &Value) -> Block {
     let number = raw.get("number").map(parse_int_any).unwrap_or(0);
@@ -17,12 +16,7 @@ pub fn parse_block(raw: &Value) -> Block {
         .unwrap_or(0);
     let base_fee = raw
         .get("baseFeePerGas")
-        .and_then(Value::as_str)
-        .and_then(|s| {
-            s.strip_prefix("0x")
-                .and_then(|h| num_bigint::BigInt::parse_bytes(h.as_bytes(), 16))
-                .map(|n| n.to_string())
-        })
+        .map(decimal_amount)
         .unwrap_or_else(|| "0".into());
     let consensus = raw.get("consensusContext");
     let proposer = consensus
@@ -80,17 +74,7 @@ pub fn parse_transaction(tx: &Value, block: &Block) -> Transaction {
     let to_addr = tx_to_addr(tx);
     let fee_amount = tx
         .get("feeAmount")
-        .map(|v| match v {
-            Value::String(s) if s.starts_with("0x") => {
-                let s = &s[2..];
-                BigInt::parse_bytes(s.as_bytes(), 16)
-                    .map(|n| n.to_string())
-                    .unwrap_or_else(|| s.to_string())
-            }
-            Value::String(s) => s.clone(),
-            Value::Number(n) => n.to_string(),
-            _ => "0".into(),
-        })
+        .map(decimal_amount)
         .unwrap_or_else(|| "0".into());
     let input = {
         let input = str_field(tx, "input");
@@ -114,9 +98,9 @@ pub fn parse_transaction(tx: &Value, block: &Block) -> Transaction {
         fee_token: None,
         fee_amount,
         input,
-        // The canonical RLP bytes are fetched separately by the indexer
-        // (eth_getRawTransactionByHash) and parsed at runtime with the tempo
-        // primitives — nothing else is stored per column.
+        // The canonical RLP bytes are re-encoded by the indexer from the
+        // block's own transaction object and parsed at render time with the
+        // tempo primitives — nothing else is stored per column.
         raw: None,
         trace_data: None,
         receipt_data: None,

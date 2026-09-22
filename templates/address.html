@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "_macros.html" as ui %}
 {% block title %}Address {{ truncate_hash(h=address, prefix=8, suffix=4) }} ⋅ nvnmchain Explorer{% endblock %}
 {% block content %}
 
@@ -15,6 +16,7 @@
     <div class="card-body">
         <div class="flex items-center gap-2.5 mb-5 flex-wrap">
             <span class="mono text-sm break-all">{{ address }}</span>
+            {{ ui::copy(text=address, label="Copy address") }}
             {% if type == 'precompile' %}
             <span class="badge badge-precompile">{{ label | fallback(value='Precompile') }}</span>
             {% elif type == 'token' %}
@@ -25,6 +27,13 @@
             <span class="badge badge-info">Account</span>
             {% endif %}
         </div>
+        {% if virtual_address %}
+        <div class="memo text-xs mb-5">
+            TIP-1022 virtual address — TIP-20 transfers here are credited to the master wallet
+            registered for <span class="mono">{{ virtual_address.master_id }}</span>,
+            not to this address. User tag <span class="mono">{{ virtual_address.user_tag }}</span>.
+        </div>
+        {% endif %}
         <div class="grid grid-cols-2 md:grid-cols-4 gap-4 text-xs">
             <div>
                 <span class="text-faint">Type</span>
@@ -53,45 +62,109 @@
     <a href="?tab=transactions" class="tab {% if active_tab == 'transactions' %}active{% endif %}">Transactions</a>
     <a href="?tab=transfers" class="tab {% if active_tab == 'transfers' %}active{% endif %}">Transfers</a>
     <a href="?tab=holdings" class="tab {% if active_tab == 'holdings' %}active{% endif %}">Holdings</a>
+    {# `has_interface` covers precompiles and tokens (a test holds the label
+       and ABI tables together); 'contract' is code with no known interface. #}
+    {% if has_interface or type == 'contract' %}
+    <a href="?tab=contract" class="tab {% if active_tab == 'contract' %}active{% endif %}">Contract</a>
+    {% endif %}
 </div>
+
+{% if active_tab == 'contract' %}
+{% if token_meta %}
+<div class="card mb-6">
+    <div class="card-header">TIP-20 Token</div>
+    <div class="card-body grid grid-cols-2 md:grid-cols-5 gap-4 text-xs">
+        <div>
+            <span class="text-faint">Name</span>
+            <div class="mt-1 font-semibold">
+                <a href="{{ get_token_url(address=address) }}" class="text-blue-400">{{ token_meta.name | fallback(value='Unnamed') }}</a>
+            </div>
+        </div>
+        <div>
+            <span class="text-faint">Symbol</span>
+            <div class="mt-1 font-semibold">{{ token_meta.symbol | fallback(value='—') }}</div>
+        </div>
+        <div>
+            <span class="text-faint">Decimals</span>
+            <div class="mt-1 font-semibold">{{ token_meta.decimals }}</div>
+        </div>
+        <div>
+            <span class="text-faint">Total Supply</span>
+            <div class="mt-1 font-semibold mono">{{ format_token_amount(amount=token_meta.total_supply, decimals=token_meta.decimals) }}</div>
+        </div>
+        <div>
+            <span class="text-faint">Holders</span>
+            <div class="mt-1 font-semibold">{{ token_meta.holder_count | comma }}</div>
+        </div>
+    </div>
+</div>
+{% endif %}
+
+{% if has_interface %}
+<div class="card mb-6">
+    <div class="card-header">
+        Interface
+        <span class="text-faint font-normal">
+            ({{ interface.reads | length }} read, {{ interface.writes | length }} write,
+            {{ interface.events | length }} event{% if interface.events | length != 1 %}s{% endif %})
+        </span>
+    </div>
+    <div class="card-body space-y-5">
+        {% if interface.reads %}
+        <div>
+            <div class="section-title mb-2">Read</div>
+            <div class="space-y-1.5">
+                {% for fn in interface.reads %}{{ ui::abi_entry(id=fn.selector, signature=fn.signature) }}{% endfor %}
+            </div>
+        </div>
+        {% endif %}
+        {% if interface.writes %}
+        <div>
+            <div class="section-title mb-2">Write</div>
+            <div class="space-y-1.5">
+                {% for fn in interface.writes %}{{ ui::abi_entry(id=fn.selector, signature=fn.signature) }}{% endfor %}
+            </div>
+        </div>
+        {% endif %}
+        {% if interface.events %}
+        <div>
+            <div class="section-title mb-2">Events</div>
+            <div class="space-y-1.5">
+                {% for event in interface.events %}
+                {{ ui::abi_entry(id=truncate_hash(h=event.topic0, prefix=8, suffix=4), signature=event.signature, copy=event.topic0, kind="badge-info") }}
+                {% endfor %}
+            </div>
+        </div>
+        {% endif %}
+    </div>
+</div>
+{% endif %}
+
+<div class="card mb-6">
+    <div class="card-header">Bytecode</div>
+    {% if code %}
+    <div class="card-body">
+        {% if code.is_precompile_marker %}
+        <div class="text-sm text-dim">
+            A protocol precompile: it runs natively, so there is no EVM bytecode to show.
+            The chain reports the marker <span class="mono">{{ code.hex }}</span>.
+        </div>
+        {% else %}
+        <div class="text-xs text-faint mb-2">{{ code.bytes | comma }} bytes {{ ui::copy(text=code.hex, label="Copy bytecode") }}</div>
+        <pre class="text-xs mono pre-wrap" style="max-height: 24rem; overflow-y: auto;">{{ code.hex }}</pre>
+        {% endif %}
+    </div>
+    {% else %}
+    <div class="card-body text-center text-dim text-sm py-10">No code at this address.</div>
+    {% endif %}
+</div>
+{% endif %}
 
 {% if active_tab == 'transactions' %}
 <div class="card overflow-x-auto">
     <div class="card-header">Transactions</div>
     {% if html_transactions %}
-    <div class="min-w-[760px]">
-        <div class="flex table-header">
-            <div class="flex-1 px-3">Tx Hash</div>
-            <div class="w-24 px-3">Block</div>
-            <div class="w-32 px-3 hidden md:block">Method</div>
-            <div class="w-44 px-3 hidden md:block">From</div>
-            <div class="w-44 px-3 hidden md:block">To</div>
-            <div class="w-20 px-3 text-right">Time</div>
-        </div>
-        {% for tx in html_transactions %}
-        <div class="t-row flex text-xs">
-            <div class="flex-1 px-3 py-3">
-                <a href="/tx/{{ tx.tx_hash }}" class="mono text-blue-400 hover:text-blue-300">{{ truncate_hash(h=tx.tx_hash, prefix=10, suffix=6) }}</a>
-                {% if tx.tx_status == 0 %}<span class="badge badge-error ml-1">fail</span>{% endif %}
-            </div>
-            <div class="w-24 px-3 py-3">
-                <a href="/block/{{ tx.tx_block }}" class="mono text-blue-400 hover:text-blue-300">{{ tx.tx_block }}</a>
-            </div>
-            <div class="w-32 px-3 py-3 hidden md:block">
-                {% if tx.tx_method %}<span class="badge badge-method mono">{{ tx.tx_method }}</span>{% else %}<span class="text-faint">—</span>{% endif %}
-            </div>
-            <div class="w-44 px-3 py-3 hidden md:block mono truncate">
-                <a href="{{ get_address_url(address=tx.tx_from) }}" class="text-dim hover:text-blue-300">{{ truncate_hash(h=tx.tx_from) }}</a>
-            </div>
-            <div class="w-44 px-3 py-3 hidden md:block mono truncate">
-                {% if tx.tx_to %}
-                <a href="{{ get_address_url(address=tx.tx_to) }}" class="text-dim hover:text-blue-300">{{ truncate_hash(h=tx.tx_to) }}</a>
-                {% else %}<span class="text-faint">create</span>{% endif %}
-            </div>
-            <div class="w-20 px-3 py-3 text-right text-dim">{{ format_time_ago(timestamp=tx.tx_timestamp) }}</div>
-        </div>
-        {% endfor %}
-    </div>
+    {{ ui::tx_table(transactions=html_transactions) }}
     {% else %}
     <div class="card-body text-center text-dim text-sm py-10">No transactions found</div>
     {% endif %}
@@ -113,13 +186,13 @@
         {% for t in html_transactions %}
         <div class="t-row flex text-xs">
             <div class="flex-1 px-3 py-3">
-                <a href="/tx/{{ t.tx_hash }}" class="mono text-blue-400 hover:text-blue-300">{{ truncate_hash(h=t.tx_hash, prefix=10, suffix=6) }}</a>
+                {{ ui::copy_tx(hash=t.tx_hash) }}
             </div>
             <div class="w-36 px-3 py-3 hidden md:block mono truncate">
-                <a href="{{ get_address_url(address=t.from_addr) }}" class="text-dim hover:text-blue-300">{{ truncate_hash(h=t.from_addr) }}</a>
+                {{ ui::copy_address(address=t.from_addr) }}
             </div>
             <div class="w-36 px-3 py-3 hidden md:block mono truncate">
-                <a href="{{ get_address_url(address=t.to_addr) }}" class="text-dim hover:text-blue-300">{{ truncate_hash(h=t.to_addr) }}</a>
+                {{ ui::copy_address(address=t.to_addr) }}
             </div>
             <div class="w-40 px-3 py-3 text-right mono {% if t.to_addr == address %}value-positive{% else %}value-negative{% endif %}">
                 {{ t.amount_formatted | fallback(value=t.amount) }}
@@ -163,15 +236,5 @@
 </div>
 {% endif %}
 
-{% if total_pages > 1 %}
-<div class="flex justify-center gap-3 mt-5 text-xs items-center">
-    {% if page > 1 %}
-    <a href="?tab={{ active_tab }}&page={{ page - 1 }}" class="badge badge-info hover:text-blue-300">← Previous</a>
-    {% endif %}
-    <span class="text-dim">Page {{ page }} of {{ total_pages }}</span>
-    {% if page < total_pages %}
-    <a href="?tab={{ active_tab }}&page={{ page + 1 }}" class="badge badge-info hover:text-blue-300">Next →</a>
-    {% endif %}
-</div>
-{% endif %}
+{{ ui::pager(page=page, total_pages=total_pages, query="tab=" ~ active_tab ~ "&") }}
 {% endblock %}

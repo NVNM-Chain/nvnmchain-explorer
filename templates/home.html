@@ -7,11 +7,11 @@
 <div class="card mb-6">
     <div class="card-body">
         <div class="flex items-center justify-between gap-3 mb-2">
-            <span class="text-xs text-dim">Index progress — <span class="mono">{{ indexed_display }}</span> / <span class="mono">{{ head_display }}</span> blocks indexed</span>
-            <span class="mono text-xs text-blue-400">{{ index_pct_display }}%</span>
+            <span class="text-xs text-dim">Index progress — <span id="idx-indexed" class="mono">{{ indexed_display }}</span> / <span id="idx-head" class="mono">{{ head_display }}</span> blocks indexed</span>
+            <span id="idx-pct" class="mono text-xs text-blue-400">{{ index_pct_display }}%</span>
         </div>
         <div class="h-1.5 rounded-full" style="background: rgba(255,255,255,0.06); overflow: hidden;">
-            <div style="width: {{ index_pct_display }}%; height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-2));"></div>
+            <div id="idx-bar" style="width: {{ index_pct_display }}%; height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-2));"></div>
         </div>
     </div>
 </div>
@@ -28,19 +28,19 @@
         <div class="stat-label">Block Time</div>
     </div>
     <div class="card card-body">
-        <div class="stat-value">{% if stats %}{{ stats.tps_display }}{% else %}—{% endif %}</div>
+        <div id="stat-tps" class="stat-value">{% if stats %}{{ stats.tps_display }}{% else %}—{% endif %}</div>
         <div class="stat-label">TPS (100 blk)</div>
     </div>
     <div class="card card-body">
-        <div class="stat-value">{% if stats %}{{ stats.gas_util_display }}{% else %}—{% endif %}</div>
+        <div id="stat-gas" class="stat-value">{% if stats %}{{ stats.gas_util_display }}{% else %}—{% endif %}</div>
         <div class="stat-label">Gas Utilization</div>
     </div>
     <div class="card card-body">
-        <div class="stat-value">{% if stats %}{{ stats.total_txns }}{% else %}—{% endif %}</div>
+        <div id="stat-total-txns" class="stat-value">{% if stats %}{{ stats.total_txns | comma }}{% else %}—{% endif %}</div>
         <div class="stat-label">Total Txns</div>
     </div>
     <div class="card card-body">
-        <div class="stat-value">{% if stats %}{{ stats.token_count }}{% else %}—{% endif %}</div>
+        <div id="stat-tokens" class="stat-value">{% if stats %}{{ stats.token_count | comma }}{% else %}—{% endif %}</div>
         <div class="stat-label">Tokens</div>
     </div>
 </div>
@@ -93,7 +93,7 @@
             <a href="/blocks" class="text-xs text-blue-400 font-normal hover:text-blue-300">View all →</a>
         </div>
         {% if recent_blocks %}
-        <div id="latest-blocks-body">
+        <div id="latest-blocks-body" class="feed">
             {% for block in recent_blocks %}
             <div class="t-row flex items-center px-4 py-3 gap-3">
                 <div class="w-24 shrink-0">
@@ -131,7 +131,7 @@
             <span>Latest Transactions</span>
         </div>
         {% if recent_txs %}
-        <div id="latest-txs-body">
+        <div id="latest-txs-body" class="feed">
             {% for tx in recent_txs %}
             <div class="t-row px-4 py-3" data-tx-hash="{{ tx.hash }}">
                 <div class="flex items-center gap-2 mb-1">
@@ -173,6 +173,10 @@
 // (SSE), and we stream rows into the Latest Blocks and Latest Transactions
 // panels without polling.
 (function () {
+    // What the server rendered, so the stream trims to the height the panel
+    // loaded at. A larger cap here and the panel grows under the reader.
+    var BLOCK_CAP = {{ recent_block_count }};
+    var TX_CAP = {{ recent_tx_count }};
     var panel = document.getElementById('latest-blocks-body');
     var empty = document.getElementById('blocks-empty');
     var nav = document.getElementById('nav-latest-block');
@@ -192,6 +196,7 @@
         if (!txEmpty) return null;
         txPanel = document.createElement('div');
         txPanel.id = 'latest-txs-body';
+        txPanel.className = 'feed';
         txEmpty.parentNode.insertBefore(txPanel, txEmpty);
         txEmpty.parentNode.removeChild(txEmpty);
         txEmpty = null;
@@ -352,10 +357,37 @@
             if (panel.querySelector('[data-tx-hash="' + t.hash + '"]')) continue;
             panel.insertBefore(txRowFor(t), panel.firstChild);
         }
-        while (panel.children.length > 30) panel.removeChild(panel.lastChild);
+        // `lastElementChild`: Tera leaves whitespace between the rendered rows, and
+        // removing a text node would leave `children.length` unchanged.
+        while (panel.children.length > TX_CAP) panel.removeChild(panel.lastElementChild);
     }
 
     var es = new EventSource('/api/events');
+    // Stats refresh from the indexer's stats task: the tiles the per-block
+    // events cannot update (they need aggregates, not the newest block).
+    es.addEventListener('stats', function (e) {
+        var s;
+        try { s = JSON.parse(e.data).stats; } catch (_) { return; }
+        if (!s) return;
+        var put = function (id, text) {
+            var el = document.getElementById(id);
+            if (el && text != null) el.textContent = text;
+        };
+        var num = function (v) {
+            return typeof v === 'number' ? v.toLocaleString('en-US') : null;
+        };
+        put('stat-total-txns', num(s.total_txns));
+        put('stat-tokens', num(s.token_count));
+        if (typeof s.tps === 'number') put('stat-tps', s.tps.toFixed(2));
+        if (typeof s.gas_util_pct === 'number') put('stat-gas', s.gas_util_pct.toFixed(1) + '%');
+        put('idx-indexed', num(s.total_blocks));
+        put('idx-head', num(s.chain_head));
+        if (typeof s.index_pct === 'number') {
+            put('idx-pct', s.index_pct.toFixed(1) + '%');
+            var bar = document.getElementById('idx-bar');
+            if (bar) bar.style.width = s.index_pct.toFixed(1) + '%';
+        }
+    });
     es.addEventListener('block', function (e) {
         var ev;
         try { ev = JSON.parse(e.data); } catch (_) { return; }
@@ -384,7 +416,7 @@
         if (firstA && firstA.textContent === '#' + b.number) return;
         if (empty && empty.parentNode) empty.remove();
         panel.insertBefore(rowFor(b), panel.firstChild);
-        while (panel.children.length > 30) panel.removeChild(panel.lastChild);
+        while (panel.children.length > BLOCK_CAP) panel.removeChild(panel.lastElementChild);
     });
     es.onopen = function () { if (live) live.textContent = '· live'; };
     es.onerror = function () { if (live) live.textContent = '· reconnecting'; };

@@ -13,5 +13,5 @@ log them with `tracing` or propagate them.
 
 ## Tests
 
-- Unit tests (no network): `cargo test --test decoder`
-- Integration tests against the live chain RPC: `cargo test --test live_rpc`
+- No network: `cargo test --lib --test decoder --test anchoring --test pages`
+- Against the live chain RPC: `cargo test --test live_rpc`
