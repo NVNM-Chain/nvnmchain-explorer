@@ -60,4 +60,29 @@
 
 {{ ui::pager(page=page, total_pages=total_pages) }}
 
+<div class="card mt-4">
+    <div class="card-header flex items-center justify-between">
+        <span>{% if events_more %}Latest transactions{% else %}Transactions{% endif %}</span>
+        <span class="badge">{{ events | length }}{% if events_more %}+{% endif %}</span>
+    </div>
+    <div class="flex table-header">
+        <div class="w-40 px-3">Event</div>
+        <div class="flex-1 px-3">Transaction</div>
+        <div class="w-64 px-3">Caller</div>
+        <div class="w-28 px-3 text-right">Block</div>
+    </div>
+    {% for event in events %}
+    <div class="t-row flex text-xs items-center">
+        <div class="w-40 px-3 py-3"><span class="badge">{{ event.event }}</span>{% if event.record_id %} <span class="text-dim">#{{ event.record_id }}</span>{% endif %}</div>
+        <div class="flex-1 px-3 py-3 mono truncate"><a href="/tx/{{ event.tx_hash }}" class="text-blue-400 hover:text-blue-300">{{ event.tx_hash }}</a></div>
+        <div class="w-64 px-3 py-3 mono truncate"><a href="/address/{{ event.caller }}" class="text-blue-400 hover:text-blue-300">{{ event.caller }}</a></div>
+        <div class="w-28 px-3 py-3 text-right"><a href="/block/{{ event.block_number }}" class="text-blue-400 hover:text-blue-300">{{ event.block_number }}</a></div>
+    </div>
+    {% else %}
+    <div class="card-body text-center text-dim text-sm py-10">
+        No transaction indexed for this registry. One seeded at genesis has none.
+    </div>
+    {% endfor %}
+</div>
+
 {% endblock %}

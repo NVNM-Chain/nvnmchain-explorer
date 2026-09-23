@@ -122,6 +122,20 @@ pub struct TransferEvent {
     pub created_at: i64,
 }
 
+/// One write to the anchoring contract, listed on its registry's page.
+#[derive(Debug, Clone, Serialize)]
+pub struct AnchoringEvent {
+    pub tx_hash: String,
+    pub block_number: i64,
+    pub log_index: i64,
+    pub timestamp: i64,
+    pub event: String,
+    pub registry_id: i64,
+    /// 0 for a registry-level event such as `AddRegistry`.
+    pub record_id: i64,
+    pub caller: String,
+}
+
 /// One block and everything indexed alongside it: its transactions, the
 /// transfers their receipts carried, and metadata for newly seen tokens.
 #[derive(Debug, Clone)]
@@ -129,5 +143,6 @@ pub struct BlockBundle {
     pub block: Block,
     pub txs: Vec<Transaction>,
     pub transfers: Vec<TransferEvent>,
+    pub anchoring: Vec<AnchoringEvent>,
     pub tokens: Vec<crate::tokens::TokenMeta>,
 }

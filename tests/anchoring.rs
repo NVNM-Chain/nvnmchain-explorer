@@ -448,3 +448,107 @@ async fn the_search_box_takes_half_a_name_from_the_index() {
     let (_, none) = get(&bare, "/search?q=reg-2").await;
     assert_eq!(none["match"], Value::Null);
 }
+
+/// An `AddRegistry` log for registry `id` at `block`, as `eth_getLogs` returns it.
+fn add_registry_log(block: u64, id: u64) -> Value {
+    let name = hex::encode(format!("{:\0<32}", "reg"));
+    json!({
+        "address": nvnmchain_explorer::anchoring::ADDRESS,
+        "topics": [
+            alloy_primitives::keccak256("AddRegistry(address,uint64,string)").to_string(),
+            format!("0x{}{}", "00".repeat(12), "11".repeat(20)),
+        ],
+        "data": format!("0x{id:064x}{:064x}{:064x}{name}", 0x40, 3),
+        "blockNumber": format!("0x{block:x}"),
+        "logIndex": "0x0",
+        "transactionHash": format!("0x{}", "ab".repeat(32)),
+    })
+}
+
+/// A node that drops the first `eth_getLogs`, refuses ranges wider than 1,000 blocks, and
+/// holds writes at 1,500 and 1,700.
+async fn capped_log_node(calls: Arc<std::sync::atomic::AtomicUsize>) -> String {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use std::sync::atomic::Ordering;
+    let handler = move |State(calls): State<Arc<std::sync::atomic::AtomicUsize>>,
+                        Json(req): Json<Value>| async move {
+        let result = match req["method"].as_str().unwrap() {
+            "eth_blockNumber" => json!("0x7d0"),
+            "eth_getLogs" => {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return (StatusCode::BAD_GATEWAY, "upstream down").into_response();
+                }
+                let int = |k: &str| {
+                    u64::from_str_radix(
+                        req["params"][0][k]
+                            .as_str()
+                            .unwrap()
+                            .trim_start_matches("0x"),
+                        16,
+                    )
+                    .unwrap()
+                };
+                let (from, to) = (int("fromBlock"), int("toBlock"));
+                if to - from >= 1000 {
+                    let error =
+                        json!({"code": -32602, "message": "query exceeds max block range 1000"});
+                    return Json(json!({"jsonrpc": "2.0", "id": req["id"], "error": error}))
+                        .into_response();
+                }
+                json!([1500, 1700]
+                    .into_iter()
+                    .filter(|b| (from..=to).contains(b))
+                    .map(|b| add_registry_log(b, b))
+                    .collect::<Vec<_>>())
+            }
+            method => panic!("unexpected {method}"),
+        };
+        Json(json!({"jsonrpc": "2.0", "id": req["id"], "result": result})).into_response()
+    };
+    let app = Router::new().route("/", post(handler)).with_state(calls);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    format!("http://{addr}")
+}
+
+/// The backfill waits out a dropped request, narrows its window to the node's cap, stores
+/// the write in an indexed block and skips the one in a block not indexed yet.
+#[tokio::test]
+async fn backfill_narrows_to_the_node_cap_and_resumes_past_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = db::init_db(dir.path().join("backfill.db").to_str().unwrap()).unwrap();
+    let db = Arc::new(Mutex::new(conn));
+    let block = nvnmchain_explorer::parse::parse_block(&json!({
+        "number": "0x5dc",
+        "hash": format!("0x{}", "cd".repeat(32)),
+        "parentHash": format!("0x{}", "ef".repeat(32)),
+        "timestamp": "0x64",
+    }));
+    db::save_block(&db, &block).unwrap();
+
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let rpc =
+        nvnmchain_explorer::rpc::ChainRpc::new(&capped_log_node(calls.clone()).await).unwrap();
+    nvnmchain_explorer::indexer::backfill_anchoring(&rpc, &db)
+        .await
+        .expect("backfill");
+
+    let events = db::get_anchoring_events(&db, 1500, 25);
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        (events[0].event.as_str(), events[0].timestamp),
+        ("AddRegistry", 100)
+    );
+    assert!(
+        db::get_anchoring_events(&db, 1700, 25).is_empty(),
+        "block 1700 is not indexed"
+    );
+    assert_eq!(
+        db::get_kv(&db, "anchoring_backfilled_to").as_deref(),
+        Some("2000")
+    );
+    // One dropped, six refused on the way down to 781 blocks, then three windows.
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 10);
+}

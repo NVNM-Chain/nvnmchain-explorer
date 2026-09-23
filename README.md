@@ -85,7 +85,8 @@ Starter, deploy.
   schema migrations tracked by SQLite's `PRAGMA user_version`. Deploying a new
   binary over an old database upgrades it in place (additive `ALTER TABLE`
   steps, logged at startup); legacy databases also get a one-time rebuild of
-  the incremental token-balance table.
+  the incremental token-balance table, and their anchoring events read back
+  from the node's logs.
 - **Volume sizing** — a full backfill of this chain is ~1.2 GB of raw block
   JSON before indexes and transactions. Use at least 2 GB; the examples use
   5 GB (~$0.75/mo on Fly), which leaves comfortable headroom.

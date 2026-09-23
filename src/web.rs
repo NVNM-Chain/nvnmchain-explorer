@@ -1710,6 +1710,10 @@ pub async fn anchoring_registry_page(
     let page = page_param(&query);
     match anchoring::registry(&state.rpc, id, page.into(), PER_PAGE.into()).await {
         Ok(Some((registry, records, total))) => {
+            // One past the cap says whether there are more.
+            let mut events = db::get_anchoring_events(&state.db, id as i64, PER_PAGE + 1);
+            let events_more = events.len() > PER_PAGE as usize;
+            events.truncate(PER_PAGE as usize);
             let ctx = page_ctx(
                 &state,
                 json!({
@@ -1718,6 +1722,8 @@ pub async fn anchoring_registry_page(
                     "total": total,
                     "page": page,
                     "total_pages": total_pages(total as i64, PER_PAGE),
+                    "events": events,
+                    "events_more": events_more,
                 }),
             );
             html_or_json(&state, &headers, &query, "anchoring_registry.html", &ctx)
