@@ -11,7 +11,7 @@ use futures_util::StreamExt;
 use nvnmchain_explorer::config::{DEFAULT_CHAIN_ID, DEFAULT_RPC_URL, DEFAULT_WS_URL};
 use nvnmchain_explorer::db::{self, Db, TxColumns};
 use nvnmchain_explorer::indexer::{fetch_block_bundle, index_block};
-use nvnmchain_explorer::rpc::ChainRpc;
+use nvnmchain_explorer::rpc::{parse_int_any, ChainRpc};
 use nvnmchain_explorer::web::{self, AppState};
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
@@ -28,28 +28,69 @@ fn rpc() -> ChainRpc {
     ChainRpc::new(DEFAULT_RPC_URL).expect("rpc client")
 }
 
-/// A known block with a TIP-20 transfer on the nvnm chain.
-const TX_BLOCK: u64 = 527_321;
-const TX_HASH: &str = "0x70a29ffa8498bfea439958fd6c782bf64be6f0e526fc3afb1fef8d9bb81cbec7";
+/// A recent block that has transactions, and their hashes in block order.
+///
+/// Found rather than pinned: a constant block is a fixture on one chain, and
+/// this one has been reset out from under these tests once already.
+async fn block_with_txs(rpc: &ChainRpc) -> Option<(u64, Vec<String>)> {
+    let head = rpc.eth_block_number().await.ok()?;
+    // In batches: most blocks on a quiet chain are empty, and 600 of them one
+    // round trip at a time is a minute per test.
+    for chunk in (head.saturating_sub(600)..=head)
+        .rev()
+        .collect::<Vec<_>>()
+        .chunks(64)
+    {
+        let calls = chunk
+            .iter()
+            .map(|n| {
+                (
+                    "eth_getBlockByNumber".to_string(),
+                    json!([format!("0x{n:x}"), false]),
+                )
+            })
+            .collect();
+        for (number, res) in chunk.iter().zip(rpc.batch_call(calls).await.ok()?) {
+            let Ok(block) = res else { continue };
+            let hashes: Vec<String> = block
+                .get("transactions")
+                .and_then(Value::as_array)
+                .map(|txs| {
+                    txs.iter()
+                        .filter_map(|h| h.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !hashes.is_empty() {
+                return Some((*number, hashes));
+            }
+        }
+    }
+    None
+}
 
 #[tokio::test]
 async fn block_receipts_in_one_call() {
     let rpc = rpc();
+    let Some((number, hashes)) = block_with_txs(&rpc).await else {
+        eprintln!("skipping: no block with transactions near the head");
+        return;
+    };
     let receipts = rpc
-        .eth_get_block_receipts(TX_BLOCK)
+        .eth_get_block_receipts(number)
         .await
         .expect("eth_getBlockReceipts")
         .expect("receipts");
-    assert_eq!(receipts.len(), 1);
+    // One per transaction, in the block's own order.
     assert_eq!(
-        receipts[0].get("transactionHash").and_then(Value::as_str),
-        Some(TX_HASH)
+        receipts
+            .iter()
+            .filter_map(|r| r.get("transactionHash").and_then(Value::as_str))
+            .collect::<Vec<_>>(),
+        hashes.iter().map(String::as_str).collect::<Vec<_>>()
     );
     assert!(receipts[0].get("feeToken").is_some());
-    assert_eq!(
-        receipts[0].get("status").and_then(Value::as_str),
-        Some("0x1")
-    );
+    assert!(receipts[0].get("status").and_then(Value::as_str).is_some());
 }
 
 #[tokio::test]
@@ -76,16 +117,19 @@ async fn batched_calls_return_in_order() {
 #[tokio::test]
 async fn fetch_block_receipts_fallback() {
     let rpc = rpc();
-    let hashes = vec![TX_HASH.to_string()];
+    let Some((number, hashes)) = block_with_txs(&rpc).await else {
+        eprintln!("skipping: no block with transactions near the head");
+        return;
+    };
     let receipts = rpc
-        .fetch_block_receipts(TX_BLOCK, &hashes)
+        .fetch_block_receipts(number, &hashes)
         .await
         .expect("receipts")
         .expect("non-empty");
-    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts.len(), hashes.len());
     assert_eq!(
         receipts[0].get("transactionHash").and_then(Value::as_str),
-        Some(TX_HASH)
+        Some(hashes[0].as_str())
     );
 }
 
@@ -366,4 +410,45 @@ async fn web_api_serves_indexed_data() {
         "SSE should send a block event: {text}"
     );
     assert!(text.contains("data:"), "SSE should carry JSON data: {text}");
+}
+
+/// A registry written after the load can name the transaction that wrote it.
+/// The seeded ones cannot: they arrived in the dump, without an event.
+#[tokio::test]
+async fn anchoring_events_link_a_registry_to_its_tx() {
+    let rpc = rpc();
+    let (_dir, db) = temp_db();
+    let head = rpc.eth_block_number().await.expect("head");
+    // The latest write within the node's 100k-block log range.
+    let logs = rpc
+        .eth_get_logs(json!({
+            "address": nvnmchain_explorer::anchoring::ADDRESS,
+            "fromBlock": format!("0x{:x}", head.saturating_sub(99_999)),
+            "toBlock": format!("0x{head:x}"),
+        }))
+        .await
+        .expect("anchoring logs");
+    let Some(block) = logs.last().and_then(|l| l.get("blockNumber")) else {
+        eprintln!("skipping: no anchoring write in the last 100k blocks");
+        return;
+    };
+    let block = parse_int_any(block);
+    index_block(&rpc, &db, block as u64).await.expect("index");
+    let id: i64 = db::lock(&db)
+        .query_row(
+            "SELECT registry_id FROM anchoring_events LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .expect("the block's anchoring row");
+    let found = db::get_anchoring_events(&db, id, 25);
+    let event = &found[0];
+    assert_eq!(event.block_number, block);
+    println!(
+        "registry {} {} in tx {} block {}",
+        event.registry_id, event.event, event.tx_hash, event.block_number
+    );
+    assert!(event.tx_hash.starts_with("0x") && event.tx_hash.len() == 66);
+    assert!(event.caller.starts_with("0x"));
+    assert!(event.registry_id > 0);
 }

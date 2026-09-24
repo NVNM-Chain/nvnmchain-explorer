@@ -181,6 +181,7 @@ fn transfer_bundle() -> BlockBundle {
         block,
         txs: Vec::new(),
         transfers,
+        anchoring: Vec::new(),
         tokens: Vec::new(),
     }
 }
@@ -619,6 +620,7 @@ fn an_address_page_merges_sent_and_received_in_block_order() {
             block,
             txs,
             transfers: Vec::new(),
+            anchoring: Vec::new(),
             tokens: Vec::new(),
         };
         db::save_block_bundle(&db, &bundle).expect("save");
@@ -675,6 +677,7 @@ fn an_address_transfer_page_merges_sent_and_received_in_block_order() {
             block,
             txs: Vec::new(),
             transfers,
+            anchoring: Vec::new(),
             tokens: Vec::new(),
         };
         db::save_block_bundle(&db, &bundle).expect("save");

@@ -3,7 +3,7 @@ use nvnmchain_explorer::decoder::{
     checksum_address, decode_abi_args, decode_event, decode_function_call, extract_balance_changes,
     extract_calls, flatten_trace, TRANSFER_TOPIC,
 };
-use nvnmchain_explorer::models::{BlockBundle, Transaction, TransferEvent};
+use nvnmchain_explorer::models::{AnchoringEvent, BlockBundle, Transaction, TransferEvent};
 use nvnmchain_explorer::parse::{parse_block, parse_transaction};
 use nvnmchain_explorer::tokens::{
     decode_string_result, format_token_amount, has_control_chars, sanitize_metadata_text, TokenMeta,
@@ -606,6 +606,7 @@ fn blob_hex_round_trip() {
         block,
         txs: vec![tx],
         transfers: vec![],
+        anchoring: Vec::new(),
         tokens: vec![],
     };
     db::save_block_bundle(&db, &bundle).expect("save bundle");
@@ -679,6 +680,7 @@ fn counters_are_seeded_from_the_tables_of_an_older_database() {
             block,
             txs: vec![tx],
             transfers: vec![],
+            anchoring: Vec::new(),
             tokens: vec![],
         },
     )
@@ -726,6 +728,7 @@ fn holder_count_follows_the_balances() {
             block: block.clone(),
             txs: vec![tx.clone()],
             transfers: vec![transfer],
+            anchoring: Vec::new(),
             tokens: vec![meta.clone()],
         };
         db::save_block_bundle(&db, &bundle).expect("save");
@@ -763,6 +766,7 @@ fn duplicate_bundle_is_idempotent() {
         block,
         txs: vec![tx],
         transfers: vec![transfer],
+        anchoring: Vec::new(),
         tokens: vec![],
     };
     db::save_block_bundle(&db, &bundle).expect("first save");
@@ -811,6 +815,58 @@ fn duplicate_bundle_is_idempotent() {
     assert_eq!(sender, "-100", "sender delta applied exactly once");
 }
 
+/// An anchoring write reads back on its registry, newest first and the caller
+/// checksummed; re-writing the block adds no second row.
+#[test]
+fn anchoring_events_read_back_by_registry() {
+    let (_dir, db) = temp_db("anchoring.db");
+    let raw_block = sample_raw_block();
+    let block = parse_block(&raw_block);
+    let tx = parse_transaction(&raw_block["transactions"][0], &block);
+    let caller = "0x000000000000000000000000000000000000dead";
+    let event = |log_index: i64, event: &str, record_id: i64| AnchoringEvent {
+        tx_hash: tx.hash.clone(),
+        block_number: block.number,
+        log_index,
+        timestamp: block.timestamp,
+        event: event.into(),
+        registry_id: 2190,
+        record_id,
+        caller: caller.into(),
+    };
+    let bundle = BlockBundle {
+        block: block.clone(),
+        txs: vec![tx.clone()],
+        transfers: vec![],
+        anchoring: vec![event(0, "AddRegistry", 0), event(1, "AddRecord", 7)],
+        tokens: vec![],
+    };
+    db::save_block_bundle(&db, &bundle).expect("save");
+    db::save_block_bundle(&db, &bundle).expect("re-save");
+
+    let events = db::get_anchoring_events(&db, 2190, 25);
+    assert_eq!(
+        events.len(),
+        2,
+        "one row per log however often the block is written"
+    );
+    assert_eq!(events[0].event, "AddRecord");
+    assert_eq!(events[0].record_id, 7);
+    assert_eq!(events[0].tx_hash, tx.hash);
+    assert_eq!(events[0].caller, checksum_address(caller));
+    assert!(db::get_anchoring_events(&db, 2191, 25).is_empty());
+    let latest = db::get_anchoring_events(&db, 2190, 1);
+    assert_eq!(latest.len(), 1, "the limit holds");
+    assert_eq!(latest[0].event, "AddRecord", "and keeps the newest");
+
+    let conn = db::lock(&db);
+    assert_eq!(
+        db::get_block_timestamp(&conn, block.number),
+        Some(block.timestamp)
+    );
+    assert_eq!(db::get_block_timestamp(&conn, block.number + 1), None);
+}
+
 /// A transfer written by the indexer must read back through every listing that
 /// shows it. The columns are BLOBs; readers that bound TEXT against them
 /// matched nothing, so these tabs were permanently empty while the counters
@@ -835,6 +891,7 @@ fn indexed_transfer_reads_back_through_every_listing() {
         block,
         txs: vec![tx.clone()],
         transfers: vec![transfer],
+        anchoring: Vec::new(),
         tokens: vec![meta],
     };
     db::save_block_bundle(&db, &bundle).expect("save bundle");
@@ -951,6 +1008,7 @@ fn blob_storage_queries_match_text_params() {
         block,
         txs: vec![tx],
         transfers: vec![transfer],
+        anchoring: Vec::new(),
         tokens: vec![meta],
     };
     db::save_block_bundle(&db, &bundle).expect("save bundle");

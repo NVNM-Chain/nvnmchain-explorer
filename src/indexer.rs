@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use anyhow::Result;
-use rusqlite::params;
+use anyhow::{Context, Result};
+use rusqlite::{params, Connection};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, watch};
@@ -22,8 +22,8 @@ use tracing::{info, warn};
 use crate::config::Settings;
 use crate::contracts::RESERVED_TOKENS;
 use crate::db::{self, Db};
-use crate::decoder::{checksum_address, decode_event};
-use crate::models::{BlockBundle, Transaction, TransferEvent};
+use crate::decoder::{checksum_address, decode_event, DecodedEvent};
+use crate::models::{AnchoringEvent, BlockBundle, Transaction, TransferEvent};
 use crate::parse::{parse_block, parse_transaction};
 use crate::rpc::ChainRpc;
 use crate::tokens::{fetch_token_metadata, has_control_chars};
@@ -104,6 +104,7 @@ fn assemble_bundle(raw_block: &Value, receipts: Option<&Value>) -> BlockBundle {
         .unwrap_or(&[]);
     let mut txs = Vec::with_capacity(raw_txs.len());
     let mut transfers = Vec::new();
+    let mut anchoring = Vec::new();
     let mut next_log_index = 0u64;
 
     for tx_data in raw_txs {
@@ -122,7 +123,13 @@ fn assemble_bundle(raw_block: &Value, receipts: Option<&Value>) -> BlockBundle {
             tx.raw = Some(format!("0x{}", hex::encode(buf)));
         }
         if let Some(receipt) = receipt_by_hash.get(tx_hash) {
-            apply_receipt(&mut tx, receipt, &mut transfers, &mut next_log_index);
+            apply_receipt(
+                &mut tx,
+                receipt,
+                &mut transfers,
+                &mut anchoring,
+                &mut next_log_index,
+            );
         }
         txs.push(tx);
     }
@@ -131,6 +138,7 @@ fn assemble_bundle(raw_block: &Value, receipts: Option<&Value>) -> BlockBundle {
         block,
         txs,
         transfers,
+        anchoring,
         tokens: Vec::new(),
     }
 }
@@ -387,18 +395,29 @@ fn derive_fee_from_transfer(tx: &mut Transaction, log: &Value, to: &str, amount:
     }
 }
 
-/// Index one receipt log: a transfer lands in `transfers`, and may also tell the
-/// transaction what it was charged.
+/// Index one receipt log: an anchoring write lands in `anchoring`, a transfer in
+/// `transfers`, and a transfer may also tell the transaction what it was charged.
 fn index_log(
     tx: &mut Transaction,
     log: &Value,
     log_index: i64,
     transfers: &mut Vec<TransferEvent>,
+    anchoring: &mut Vec<AnchoringEvent>,
 ) {
     let emitter = log.get("address").and_then(Value::as_str).unwrap_or("");
     let Some(decoded) = decode_event(log) else {
         return;
     };
+    // Only the contract's own logs: any contract may emit under the same signature.
+    if emitter.eq_ignore_ascii_case(crate::anchoring::ADDRESS) {
+        anchoring.extend(anchoring_event(
+            &decoded,
+            &tx.hash,
+            tx.block_number,
+            log_index,
+            tx.timestamp,
+        ));
+    }
     // Transfers, so the address and token transfer tabs have data.
     if !matches!(
         decoded.name.as_deref(),
@@ -429,10 +448,34 @@ fn index_log(
     });
 }
 
+/// One anchoring row; `None` for a log that names no registry, whatever its topic0.
+fn anchoring_event(
+    decoded: &DecodedEvent,
+    tx_hash: &str,
+    block_number: i64,
+    log_index: i64,
+    timestamp: i64,
+) -> Option<AnchoringEvent> {
+    Some(AnchoringEvent {
+        tx_hash: tx_hash.to_string(),
+        block_number,
+        log_index,
+        timestamp,
+        event: decoded.name.clone()?,
+        registry_id: decoded.param("registryId")?.parse().ok()?,
+        record_id: decoded
+            .param("recordId")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        caller: decoded.param("caller").unwrap_or_default().to_string(),
+    })
+}
+
 fn apply_receipt(
     tx: &mut Transaction,
     receipt: &Value,
     transfers: &mut Vec<TransferEvent>,
+    anchoring: &mut Vec<AnchoringEvent>,
     next_log_index: &mut u64,
 ) {
     apply_receipt_fields(tx, receipt);
@@ -452,7 +495,7 @@ fn apply_receipt(
             .filter(|n| *n >= 0)
             .unwrap_or(*next_log_index as i64);
         *next_log_index = (*next_log_index).max(log_index as u64 + 1);
-        index_log(tx, log, log_index, transfers);
+        index_log(tx, log, log_index, transfers, anchoring);
     }
 }
 
@@ -463,6 +506,92 @@ pub async fn index_block(rpc: &ChainRpc, db: &Db, block_num: u64) -> Result<()> 
     };
     db::save_block_bundle(db, &bundle)?;
     Ok(())
+}
+
+/// The height the anchoring backfill has read the node's logs up to.
+const BACKFILL_KEY: &str = "anchoring_backfilled_to";
+
+/// Blocks per `eth_getLogs`; halved while the node refuses the range.
+const WINDOW: u64 = 50_000;
+
+/// Fill `anchoring_events` for blocks indexed before the table existed, from the
+/// node's logs rather than the blocks they sit in. Rows are keyed by (block, log
+/// index), so overlap with the block path is free, and the watermark lets a
+/// stopped run resume at its last window.
+pub async fn backfill_anchoring(rpc: &ChainRpc, db: &Db) -> Result<()> {
+    let done: u64 = db::get_kv(db, BACKFILL_KEY)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let head = rpc.eth_block_number().await.context("head for backfill")?;
+    if done >= head {
+        return Ok(());
+    }
+    info!("backfilling anchoring events from {done} to {head}");
+    let (mut from, mut wrote, mut window) = (done, 0usize, WINDOW);
+    let mut backoff = Duration::from_secs(1);
+    while from <= head {
+        let to = (from + window - 1).min(head);
+        let logs = match rpc
+            .eth_get_logs(json!({
+                "address": crate::anchoring::ADDRESS,
+                "fromBlock": format!("0x{from:x}"),
+                "toBlock": format!("0x{to:x}"),
+            }))
+            .await
+        {
+            Ok(logs) => logs,
+            // The node answered with an error: almost always its range cap.
+            Err(e) if e.downcast_ref::<crate::rpc::RpcError>().is_some() => {
+                if window == 1 {
+                    return Err(e).with_context(|| format!("anchoring logs {from}..{to}"));
+                }
+                window /= 2;
+                warn!("anchoring logs {from}..{to} refused ({e}); window now {window}");
+                continue;
+            }
+            // The node did not answer: wait and retry the same range.
+            Err(e) => {
+                warn!("anchoring logs {from}..{to} failed ({e:#}); retrying in {backoff:?}");
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+                continue;
+            }
+        };
+        backoff = Duration::from_secs(1);
+        // One transaction per window, watermark included, holding the shared
+        // connection only to write.
+        {
+            let mut conn = db::lock(db);
+            let txn = conn.transaction()?;
+            for log in &logs {
+                if let Some(event) = anchoring_event_from_log(&txn, log) {
+                    wrote += usize::from(db::insert_anchoring(&txn, &event)?);
+                }
+            }
+            db::set_kv(&txn, BACKFILL_KEY, &to.to_string())?;
+            txn.commit()?;
+        }
+        from = to + 1;
+        // Leave the node to the indexer between windows.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    info!("backfilled {wrote} anchoring event(s) to block {head}");
+    Ok(())
+}
+
+/// One row from a raw log, stamped from the block the indexer already holds. A
+/// block not indexed yet brings its own rows when it is.
+fn anchoring_event_from_log(conn: &Connection, log: &Value) -> Option<AnchoringEvent> {
+    let block_number = crate::rpc::parse_int_any(log.get("blockNumber")?);
+    let timestamp = db::get_block_timestamp(conn, block_number)?;
+    let decoded = decode_event(log)?;
+    anchoring_event(
+        &decoded,
+        decoded.transaction_hash.as_deref()?,
+        block_number,
+        crate::rpc::parse_int_any(log.get("logIndex")?),
+        timestamp,
+    )
 }
 
 /// Re-fetch rows the database cannot be trusted for: a name or symbol carrying
@@ -869,6 +998,14 @@ pub async fn run_forever(
     });
     let rebuild_db = db.clone();
     tokio::spawn(async move { repair_derived_tables(&rebuild_db) });
+    // Anchoring rows for blocks indexed before the table existed.
+    let anchoring_rpc = rpc.clone();
+    let anchoring_db = db.clone();
+    tokio::spawn(async move {
+        if let Err(e) = backfill_anchoring(&anchoring_rpc, &anchoring_db).await {
+            warn!("anchoring backfill failed: {e:#}");
+        }
+    });
 
     let (bundle_tx, mut bundle_rx) = mpsc::channel::<BlockBundle>(1024);
     let writer_db = db.clone();

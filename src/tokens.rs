@@ -351,8 +351,8 @@ mod tests {
     #[tokio::test]
     async fn a_reserved_token_is_named_by_the_chain() {
         let node = stub_node(vec![
-            (NAME_CALL, abi_string("nvmnUSD")),
-            (SYMBOL_CALL, abi_string("nvmnUSD")),
+            (NAME_CALL, abi_string("nUSD")),
+            (SYMBOL_CALL, abi_string("nUSD")),
             (DECIMALS_CALL, abi_uint(6)),
             (TOTAL_SUPPLY_CALL, abi_uint(42)),
         ])
@@ -362,7 +362,7 @@ mod tests {
         let meta = fetch_token_metadata(&rpc, RESERVED_TOKENS[0])
             .await
             .expect("fetched");
-        assert_eq!(meta.symbol, "nvmnUSD");
+        assert_eq!(meta.symbol, "nUSD");
         assert_eq!(meta.decimals, 6);
         assert_eq!(meta.total_supply, "42");
         assert_eq!(node.requests(), 1, "four views, one round trip");
