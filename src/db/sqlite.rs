@@ -23,7 +23,7 @@ pub struct Db(Arc<Mutex<Connection>>);
 /// indexes get the same reduction). Falls back to the raw string bytes for
 /// non-hex values (these columns always hold hashes/addresses, so this is
 /// purely defensive).
-fn hex_blob(s: &str) -> Vec<u8> {
+pub(crate) fn hex_blob(s: &str) -> Vec<u8> {
     let hexed = s.strip_prefix("0x").unwrap_or(s);
     match hex::decode(hexed) {
         Ok(b) => b,
@@ -32,14 +32,14 @@ fn hex_blob(s: &str) -> Vec<u8> {
 }
 
 /// Encode stored blob bytes back into a `0x`-prefixed hex string.
-fn blob_hex(bytes: &[u8]) -> String {
+pub(crate) fn blob_hex(bytes: &[u8]) -> String {
     format!("0x{}", hex::encode(bytes))
 }
 
 /// One stored address, in the checksummed form the rest of the explorer keys
 /// on — links, balance rows and metadata lookups all compare that spelling, and
 /// binary storage has dropped the case by the time it comes back.
-fn blob_addr(bytes: &[u8]) -> String {
+pub(crate) fn blob_addr(bytes: &[u8]) -> String {
     crate::decoder::checksum_address(&blob_hex(bytes))
 }
 
@@ -1163,7 +1163,7 @@ fn insert_transfer(conn: &Connection, transfer: &TransferEvent) -> Result<bool> 
 /// holding, and since balances sort by digit count it would head the list.
 const HOLDING: &str = "balance NOT LIKE '-%'";
 
-fn bigint(s: &str) -> num_bigint::BigInt {
+pub(crate) fn bigint(s: &str) -> num_bigint::BigInt {
     num_bigint::BigInt::parse_bytes(s.as_bytes(), 10).unwrap_or_else(|| num_bigint::BigInt::from(0))
 }
 

@@ -10,20 +10,16 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use num_bigint::BigInt;
-use sqlx::{PgConnection, Row};
+use sqlx::PgConnection;
 
 use super::plan::{apply_deltas, BalanceChanges, BatchPlan};
-use super::q::{self, PgQuery};
+use super::q::{exec, fetch_all, get, PgQuery};
 use super::shared::{bigint, hex_blob, without_nul};
-use super::writer::{timed, Budget, TxFuture};
+use super::writer::{Budget, TxFuture};
 use super::{DbError, PgDb};
 use crate::db::{now_ts, Holder};
-use crate::models::{AnchoringEvent, Block, BlockBundle, Transaction};
+use crate::models::{AnchoringEvent, Block, BlockBundle, Transaction, TransferEvent};
 use crate::tokens::TokenMeta;
-
-fn to_anyhow(e: DbError) -> anyhow::Error {
-    anyhow::Error::new(e)
-}
 
 /// The per-block counter semantics of the per-row writer: a block already
 /// stored is not counted again, nor are the transactions it already holds.
@@ -113,158 +109,94 @@ const BUMP_HOLDERS: &str =
 const SET_KV: &str = "INSERT INTO kv (key, value, updated_at) VALUES ($1, $2, $3)
      ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at";
 
-fn blocks_query(sql: &'static str, blocks: &[Block]) -> PgQuery {
-    let col = |f: fn(&Block) -> i64| blocks.iter().map(f).collect::<Vec<i64>>();
-    let bytes = |f: fn(&Block) -> &str| blocks.iter().map(|b| hex_blob(f(b))).collect::<Vec<_>>();
-    let text = |f: fn(&Block) -> &str| blocks.iter().map(|b| without_nul(f(b))).collect::<Vec<_>>();
-    sqlx::query(sql)
-        .bind(col(|b| b.number))
-        .bind(bytes(|b| &b.hash))
-        .bind(bytes(|b| &b.parent_hash))
-        .bind(col(|b| b.timestamp))
-        .bind(col(|b| b.timestamp_ms))
-        .bind(col(|b| b.gas_used))
-        .bind(col(|b| b.gas_limit))
-        .bind(text(|b| &b.base_fee))
-        .bind(col(|b| b.size))
-        .bind(text(|b| &b.extra_data))
-        .bind(col(|b| b.epoch))
-        .bind(col(|b| b.view))
-        .bind(bytes(|b| &b.proposer))
-        .bind(bytes(|b| &b.miner))
-        .bind(col(|b| b.tx_count))
-        .bind(col(|b| b.created_at))
+/// One column of `rows`, for an `UNNEST` parameter.
+fn col<R, T>(rows: &[R], f: impl Fn(&R) -> T) -> Vec<T> {
+    rows.iter().map(f).collect()
 }
 
-fn txs_query(sql: &'static str, txs: &[Transaction]) -> PgQuery {
-    let col = |f: fn(&Transaction) -> i64| txs.iter().map(f).collect::<Vec<i64>>();
-    let opt_bytes = |f: fn(&Transaction) -> Option<&str>| {
-        txs.iter()
-            .map(|t| f(t).map(hex_blob))
-            .collect::<Vec<Option<Vec<u8>>>>()
-    };
-    let opt_text = |f: fn(&Transaction) -> Option<&str>| {
-        txs.iter()
-            .map(|t| f(t).map(without_nul))
-            .collect::<Vec<Option<String>>>()
-    };
-    sqlx::query(sql)
-        .bind(txs.iter().map(|t| hex_blob(&t.hash)).collect::<Vec<_>>())
-        .bind(col(|t| t.block_number))
-        .bind(col(|t| t.position))
-        .bind(
-            txs.iter()
-                .map(|t| hex_blob(&t.from_addr))
-                .collect::<Vec<_>>(),
-        )
-        .bind(opt_bytes(|t| t.to_addr.as_deref()))
-        .bind(col(|t| t.status))
-        .bind(col(|t| t.gas_used))
-        .bind(
-            txs.iter()
-                .map(|t| without_nul(&t.base_fee))
-                .collect::<Vec<_>>(),
-        )
-        .bind(opt_bytes(|t| t.contract_address.as_deref()))
-        .bind(opt_bytes(|t| t.fee_token.as_deref()))
-        .bind(
-            txs.iter()
-                .map(|t| without_nul(&t.fee_amount))
-                .collect::<Vec<_>>(),
-        )
-        .bind(
-            txs.iter()
-                .map(|t| without_nul(&t.input))
-                .collect::<Vec<_>>(),
-        )
-        .bind(opt_bytes(|t| t.raw.as_deref()))
-        .bind(opt_text(|t| t.trace_data.as_deref()))
-        .bind(opt_text(|t| t.receipt_data.as_deref()))
-        .bind(col(|t| t.timestamp))
-        .bind(col(|t| t.created_at))
+fn blocks_query(blocks: &[Block]) -> PgQuery {
+    sqlx::query(UPSERT_BLOCKS)
+        .bind(col(blocks, |b| b.number))
+        .bind(col(blocks, |b| hex_blob(&b.hash)))
+        .bind(col(blocks, |b| hex_blob(&b.parent_hash)))
+        .bind(col(blocks, |b| b.timestamp))
+        .bind(col(blocks, |b| b.timestamp_ms))
+        .bind(col(blocks, |b| b.gas_used))
+        .bind(col(blocks, |b| b.gas_limit))
+        .bind(col(blocks, |b| without_nul(&b.base_fee)))
+        .bind(col(blocks, |b| b.size))
+        .bind(col(blocks, |b| without_nul(&b.extra_data)))
+        .bind(col(blocks, |b| b.epoch))
+        .bind(col(blocks, |b| b.view))
+        .bind(col(blocks, |b| hex_blob(&b.proposer)))
+        .bind(col(blocks, |b| hex_blob(&b.miner)))
+        .bind(col(blocks, |b| b.tx_count))
+        .bind(col(blocks, |b| b.created_at))
 }
 
-fn tokens_query(tokens: &[TokenMeta], now: i64) -> PgQuery {
+fn txs_query(txs: &[Transaction]) -> PgQuery {
+    sqlx::query(UPSERT_TXS)
+        .bind(col(txs, |t| hex_blob(&t.hash)))
+        .bind(col(txs, |t| t.block_number))
+        .bind(col(txs, |t| t.position))
+        .bind(col(txs, |t| hex_blob(&t.from_addr)))
+        .bind(col(txs, |t| t.to_addr.as_deref().map(hex_blob)))
+        .bind(col(txs, |t| t.status))
+        .bind(col(txs, |t| t.gas_used))
+        .bind(col(txs, |t| without_nul(&t.base_fee)))
+        .bind(col(txs, |t| t.contract_address.as_deref().map(hex_blob)))
+        .bind(col(txs, |t| t.fee_token.as_deref().map(hex_blob)))
+        .bind(col(txs, |t| without_nul(&t.fee_amount)))
+        .bind(col(txs, |t| without_nul(&t.input)))
+        .bind(col(txs, |t| t.raw.as_deref().map(hex_blob)))
+        .bind(col(txs, |t| t.trace_data.as_deref().map(without_nul)))
+        .bind(col(txs, |t| t.receipt_data.as_deref().map(without_nul)))
+        .bind(col(txs, |t| t.timestamp))
+        .bind(col(txs, |t| t.created_at))
+}
+
+fn transfers_query(ts: &[TransferEvent]) -> PgQuery {
+    sqlx::query(INSERT_TRANSFERS)
+        .bind(col(ts, |t| hex_blob(&t.tx_hash)))
+        .bind(col(ts, |t| t.block_number))
+        .bind(col(ts, |t| t.log_index))
+        .bind(col(ts, |t| hex_blob(&t.token_addr)))
+        .bind(col(ts, |t| hex_blob(&t.from_addr)))
+        .bind(col(ts, |t| hex_blob(&t.to_addr)))
+        .bind(col(ts, |t| without_nul(&t.amount)))
+        .bind(col(ts, |t| t.timestamp))
+        .bind(col(ts, |t| t.created_at))
+}
+
+fn tokens_query(tokens: &[TokenMeta]) -> PgQuery {
     sqlx::query(UPSERT_TOKENS)
-        .bind(
-            tokens
-                .iter()
-                .map(|m| hex_blob(&m.address))
-                .collect::<Vec<_>>(),
-        )
-        .bind(
-            tokens
-                .iter()
-                .map(|m| without_nul(&m.name))
-                .collect::<Vec<_>>(),
-        )
-        .bind(
-            tokens
-                .iter()
-                .map(|m| without_nul(&m.symbol))
-                .collect::<Vec<_>>(),
-        )
-        .bind(tokens.iter().map(|m| m.decimals).collect::<Vec<_>>())
-        .bind(
-            tokens
-                .iter()
-                .map(|m| without_nul(&m.currency))
-                .collect::<Vec<_>>(),
-        )
-        .bind(
-            tokens
-                .iter()
-                .map(|m| without_nul(&m.total_supply))
-                .collect::<Vec<_>>(),
-        )
-        .bind(tokens.iter().map(|m| m.address.clone()).collect::<Vec<_>>())
-        .bind(now)
+        .bind(col(tokens, |m| hex_blob(&m.address)))
+        .bind(col(tokens, |m| without_nul(&m.name)))
+        .bind(col(tokens, |m| without_nul(&m.symbol)))
+        .bind(col(tokens, |m| m.decimals))
+        .bind(col(tokens, |m| without_nul(&m.currency)))
+        .bind(col(tokens, |m| without_nul(&m.total_supply)))
+        .bind(col(tokens, |m| m.address.clone()))
+        .bind(now_ts())
 }
 
 fn anchoring_query(events: &[AnchoringEvent]) -> PgQuery {
     sqlx::query(INSERT_ANCHORING)
-        .bind(
-            events
-                .iter()
-                .map(|e| hex_blob(&e.tx_hash))
-                .collect::<Vec<_>>(),
-        )
-        .bind(events.iter().map(|e| e.block_number).collect::<Vec<_>>())
-        .bind(events.iter().map(|e| e.log_index).collect::<Vec<_>>())
-        .bind(events.iter().map(|e| e.timestamp).collect::<Vec<_>>())
-        .bind(
-            events
-                .iter()
-                .map(|e| without_nul(&e.event))
-                .collect::<Vec<_>>(),
-        )
-        .bind(events.iter().map(|e| e.registry_id).collect::<Vec<_>>())
-        .bind(events.iter().map(|e| e.record_id).collect::<Vec<_>>())
-        .bind(
-            events
-                .iter()
-                .map(|e| hex_blob(&e.caller))
-                .collect::<Vec<_>>(),
-        )
+        .bind(col(events, |e| hex_blob(&e.tx_hash)))
+        .bind(col(events, |e| e.block_number))
+        .bind(col(events, |e| e.log_index))
+        .bind(col(events, |e| e.timestamp))
+        .bind(col(events, |e| without_nul(&e.event)))
+        .bind(col(events, |e| e.registry_id))
+        .bind(col(events, |e| e.record_id))
+        .bind(col(events, |e| hex_blob(&e.caller)))
 }
 
-async fn exec(c: &mut PgConnection, what: &str, query: PgQuery) -> Result<u64, DbError> {
-    timed(what, q::exec(c, what, query)).await
-}
-
-async fn fetch_all(
-    c: &mut PgConnection,
-    what: &str,
-    query: PgQuery,
-) -> Result<Vec<sqlx::postgres::PgRow>, DbError> {
-    timed(what, q::fetch_all(c, what, query)).await
-}
-
-fn get<T: for<'r> sqlx::Decode<'r, sqlx::Postgres> + sqlx::Type<sqlx::Postgres>>(
-    row: &sqlx::postgres::PgRow,
-    i: usize,
-) -> Result<T, DbError> {
-    row.try_get(i).map_err(|e| DbError::from_sqlx("decode", e))
+fn kv_query(key: &str, value: &str) -> PgQuery {
+    sqlx::query(SET_KV)
+        .bind(key.to_string())
+        .bind(value.to_string())
+        .bind(now_ts())
 }
 
 /// The stored balances of `keys`.
@@ -304,19 +236,14 @@ async fn write_balances(
 async fn store_changes(c: &mut PgConnection, out: BalanceChanges) -> Result<(), DbError> {
     let now = now_ts();
     if !out.upserts.is_empty() {
-        let (mut t, mut h, mut b) = (Vec::new(), Vec::new(), Vec::new());
-        for (token, holder, balance) in out.upserts {
-            t.push(token);
-            h.push(holder);
-            b.push(balance);
-        }
+        let u = &out.upserts;
         exec(
             c,
             "upsert_bal",
             sqlx::query(UPSERT_BALANCES)
-                .bind(t)
-                .bind(h)
-                .bind(b)
+                .bind(col(u, |r| r.0.clone()))
+                .bind(col(u, |r| r.1.clone()))
+                .bind(col(u, |r| r.2.clone()))
                 .bind(now),
         )
         .await?;
@@ -331,16 +258,33 @@ async fn store_changes(c: &mut PgConnection, out: BalanceChanges) -> Result<(), 
         .await?;
     }
     if !out.holders.is_empty() {
-        let (t, by): (Vec<String>, Vec<i64>) = out.holders.into_iter().unzip();
-        let t: Vec<Vec<u8>> = t.iter().map(|a| hex_blob(a)).collect();
+        let h = &out.holders;
         exec(
             c,
             "holders",
-            sqlx::query(BUMP_HOLDERS).bind(t).bind(by).bind(now),
+            sqlx::query(BUMP_HOLDERS)
+                .bind(col(h, |r| hex_blob(&r.0)))
+                .bind(col(h, |r| r.1))
+                .bind(now),
         )
         .await?;
     }
     Ok(())
+}
+
+/// Run one statement in a transaction of its own on the writer, building the
+/// query afresh for each attempt.
+async fn write_one(
+    p: &PgDb,
+    what: &'static str,
+    query: impl Fn() -> PgQuery + Send + Sync + 'static,
+) -> Result<()> {
+    Ok(p.writer()?
+        .write(Budget::Batch, move |c| -> TxFuture<'_, ()> {
+            let q = query();
+            Box::pin(async move { exec(c, what, q).await.map(drop) })
+        })
+        .await?)
 }
 
 /// One batch of blocks in one transaction on the writer session.
@@ -349,14 +293,12 @@ pub(crate) async fn save_block_bundles(p: &PgDb, bundles: &[BlockBundle]) -> Res
         return Ok(());
     }
     let plan = Arc::new(BatchPlan::new(bundles));
-    p.writer()
-        .map_err(to_anyhow)?
+    Ok(p.writer()?
         .write(Budget::Batch, move |c| -> TxFuture<'_, ()> {
             let plan = plan.clone();
             Box::pin(async move { write_plan(c, &plan).await })
         })
-        .await
-        .map_err(to_anyhow)
+        .await?)
 }
 
 async fn write_plan(c: &mut PgConnection, plan: &BatchPlan) -> Result<(), DbError> {
@@ -368,117 +310,56 @@ async fn write_plan(c: &mut PgConnection, plan: &BatchPlan) -> Result<(), DbErro
     )
     .await?;
     let (new_txs, stored): (i64, i64) = (get(&probe[0], 0)?, get(&probe[0], 1)?);
-    exec(c, "blocks", blocks_query(UPSERT_BLOCKS, plan.blocks())).await?;
-    if !plan.txs().is_empty() {
-        exec(c, "txs", txs_query(UPSERT_TXS, plan.txs())).await?;
+    exec(c, "blocks", blocks_query(&plan.blocks)).await?;
+    if !plan.txs.is_empty() {
+        exec(c, "txs", txs_query(&plan.txs)).await?;
     }
     exec(
         c,
         "counters",
         sqlx::query(BUMP_COUNTERS)
-            .bind(plan.blocks().len() as i64 - stored)
+            .bind(plan.blocks.len() as i64 - stored)
             .bind(new_txs),
     )
     .await?;
     let mut fresh = HashSet::new();
-    if !plan.transfers().is_empty() {
-        let ts = plan.transfers();
-        let query = sqlx::query(INSERT_TRANSFERS)
-            .bind(ts.iter().map(|t| hex_blob(&t.tx_hash)).collect::<Vec<_>>())
-            .bind(ts.iter().map(|t| t.block_number).collect::<Vec<_>>())
-            .bind(ts.iter().map(|t| t.log_index).collect::<Vec<_>>())
-            .bind(
-                ts.iter()
-                    .map(|t| hex_blob(&t.token_addr))
-                    .collect::<Vec<_>>(),
-            )
-            .bind(
-                ts.iter()
-                    .map(|t| hex_blob(&t.from_addr))
-                    .collect::<Vec<_>>(),
-            )
-            .bind(ts.iter().map(|t| hex_blob(&t.to_addr)).collect::<Vec<_>>())
-            .bind(
-                ts.iter()
-                    .map(|t| without_nul(&t.amount))
-                    .collect::<Vec<_>>(),
-            )
-            .bind(ts.iter().map(|t| t.timestamp).collect::<Vec<_>>())
-            .bind(ts.iter().map(|t| t.created_at).collect::<Vec<_>>());
-        for row in fetch_all(c, "transfers", query).await? {
+    if !plan.transfers.is_empty() {
+        for row in fetch_all(c, "transfers", transfers_query(&plan.transfers)).await? {
             fresh.insert((get::<i64>(&row, 0)?, get::<i64>(&row, 1)?));
         }
     }
-    if !plan.anchoring().is_empty() {
-        exec(c, "anchoring", anchoring_query(plan.anchoring())).await?;
+    if !plan.anchoring.is_empty() {
+        exec(c, "anchoring", anchoring_query(&plan.anchoring)).await?;
     }
     // Metadata before balances, so a new token's count is seeded first.
-    if !plan.tokens().is_empty() {
-        exec(c, "tokens", tokens_query(plan.tokens(), now_ts())).await?;
+    if !plan.tokens.is_empty() {
+        exec(c, "tokens", tokens_query(&plan.tokens)).await?;
     }
-    let keys = plan.balance_keys(&fresh);
-    let old = read_balances(c, keys).await?;
-    store_changes(c, plan.apply(&fresh, old)).await
+    write_balances(c, plan.net(&fresh)).await
 }
 
 pub(crate) async fn save_block(p: &PgDb, block: &Block) -> Result<()> {
     let block = block.clone();
-    p.writer()
-        .map_err(to_anyhow)?
-        .write(Budget::Batch, move |c| -> TxFuture<'_, ()> {
-            let block = block.clone();
-            Box::pin(async move {
-                exec(
-                    c,
-                    "save_block",
-                    blocks_query(UPSERT_BLOCKS, std::slice::from_ref(&block)),
-                )
-                .await?;
-                Ok(())
-            })
-        })
-        .await
-        .map_err(to_anyhow)
+    write_one(p, "save_block", move || {
+        blocks_query(std::slice::from_ref(&block))
+    })
+    .await
 }
 
 pub(crate) async fn save_transaction(p: &PgDb, tx: &Transaction) -> Result<()> {
     let tx = tx.clone();
-    p.writer()
-        .map_err(to_anyhow)?
-        .write(Budget::Batch, move |c| -> TxFuture<'_, ()> {
-            let tx = tx.clone();
-            Box::pin(async move {
-                exec(
-                    c,
-                    "save_transaction",
-                    txs_query(UPSERT_TXS, std::slice::from_ref(&tx)),
-                )
-                .await?;
-                Ok(())
-            })
-        })
-        .await
-        .map_err(to_anyhow)
+    write_one(p, "save_transaction", move || {
+        txs_query(std::slice::from_ref(&tx))
+    })
+    .await
 }
 
 pub(crate) async fn save_token_metadata(p: &PgDb, meta: &TokenMeta) -> Result<()> {
     let meta = meta.clone();
-    p.writer()
-        .map_err(to_anyhow)?
-        .write(Budget::Batch, move |c| -> TxFuture<'_, ()> {
-            let meta = meta.clone();
-            Box::pin(async move {
-                exec(
-                    c,
-                    "save_token_metadata",
-                    tokens_query(std::slice::from_ref(&meta), now_ts()),
-                )
-                .await?;
-                Ok(())
-            })
-        })
-        .await
-        .map_err(to_anyhow)
+    write_one(p, "save_token_metadata", move || {
+        tokens_query(std::slice::from_ref(&meta))
+    })
+    .await
 }
 
 /// The indexer's view of the chain head, for the progress bar.
@@ -490,20 +371,7 @@ pub(crate) async fn set_chain_head(p: &PgDb, head: i64) {
 
 pub(crate) async fn set_kv(p: &PgDb, key: &str, value: &str) -> Result<()> {
     let (key, value) = (key.to_string(), value.to_string());
-    p.writer()
-        .map_err(to_anyhow)?
-        .write(Budget::Batch, move |c| -> TxFuture<'_, ()> {
-            let query = sqlx::query(SET_KV)
-                .bind(key.clone())
-                .bind(value.clone())
-                .bind(now_ts());
-            Box::pin(async move {
-                exec(c, "set_kv", query).await?;
-                Ok(())
-            })
-        })
-        .await
-        .map_err(to_anyhow)
+    write_one(p, "set_kv", move || kv_query(&key, &value)).await
 }
 
 /// Two passes, since the timestamps must be read inside the writer's
@@ -521,13 +389,10 @@ pub(crate) async fn save_anchoring_window(
         wanted.borrow_mut().push(n);
         None
     });
-    let mut numbers = wanted.into_inner();
-    numbers.sort_unstable();
-    numbers.dedup();
+    let numbers = wanted.into_inner();
     let events = Arc::new(Mutex::new(events));
     let (key, value) = (key.to_string(), value.to_string());
-    p.writer()
-        .map_err(to_anyhow)?
+    Ok(p.writer()?
         .write(Budget::Batch, move |c| -> TxFuture<'_, usize> {
             let (events, numbers, key, value) =
                 (events.clone(), numbers.clone(), key.clone(), value.clone());
@@ -547,7 +412,9 @@ pub(crate) async fn save_anchoring_window(
                     let events = events.lock().unwrap_or_else(|e| e.into_inner());
                     events(&|n| stamps.get(&n).copied())
                 };
-                let built = dedup_events(built);
+                // A repeated (block, log index) is skipped by `DO NOTHING`,
+                // and only rows inserted are returned, as `INSERT OR IGNORE`
+                // counts them.
                 let wrote = if built.is_empty() {
                     0
                 } else {
@@ -555,50 +422,28 @@ pub(crate) async fn save_anchoring_window(
                         .await?
                         .len()
                 };
-                exec(
-                    c,
-                    "watermark",
-                    sqlx::query(SET_KV).bind(key).bind(value).bind(now_ts()),
-                )
-                .await?;
+                exec(c, "watermark", kv_query(&key, &value)).await?;
                 Ok(wrote)
             })
         })
-        .await
-        .map_err(to_anyhow)
-}
-
-/// First copy of each (block, log index), as `INSERT OR IGNORE` keeps it.
-fn dedup_events(events: Vec<AnchoringEvent>) -> Vec<AnchoringEvent> {
-    let mut seen = HashSet::new();
-    events
-        .into_iter()
-        .filter(|e| seen.insert((e.block_number, e.log_index)))
-        .collect()
+        .await?)
 }
 
 /// Store the genesis balances not stored yet, add them to their holders',
-/// and move the cursor, in one transaction.
+/// and move the cursor, in one transaction. A repeated (token, holder) is
+/// skipped by `DO NOTHING`, and only rows inserted are returned.
 pub(crate) async fn save_genesis_balances(
     p: &PgDb,
     balances: &[(Holder, String)],
     cursor: i64,
 ) -> Result<()> {
-    let mut rows: Vec<(String, String, String)> = Vec::new();
-    let mut seen = HashSet::new();
-    for ((token, holder), balance) in balances {
-        if seen.insert((token.clone(), holder.clone())) {
-            rows.push((token.clone(), holder.clone(), balance.clone()));
-        }
-    }
-    let rows = Arc::new(rows);
-    p.writer()
-        .map_err(to_anyhow)?
+    let balances = Arc::new(balances.to_vec());
+    Ok(p.writer()?
         .write(Budget::Batch, move |c| -> TxFuture<'_, ()> {
-            let rows = rows.clone();
+            let balances = balances.clone();
             Box::pin(async move {
                 let mut net: HashMap<(String, String), BigInt> = HashMap::new();
-                if !rows.is_empty() {
+                if !balances.is_empty() {
                     let inserted = fetch_all(
                         c,
                         "genesis",
@@ -608,9 +453,9 @@ pub(crate) async fn save_genesis_balances(
                              ON CONFLICT (token_addr, holder_addr) DO NOTHING \
                              RETURNING token_addr, holder_addr, balance",
                         )
-                        .bind(rows.iter().map(|r| r.0.clone()).collect::<Vec<_>>())
-                        .bind(rows.iter().map(|r| r.1.clone()).collect::<Vec<_>>())
-                        .bind(rows.iter().map(|r| r.2.clone()).collect::<Vec<_>>()),
+                        .bind(col(&balances, |((t, _), _)| t.clone()))
+                        .bind(col(&balances, |((_, h), _)| h.clone()))
+                        .bind(col(&balances, |(_, b)| b.clone())),
                     )
                     .await?;
                     for row in &inserted {
@@ -622,17 +467,13 @@ pub(crate) async fn save_genesis_balances(
                 exec(
                     c,
                     "genesis cursor",
-                    sqlx::query(SET_KV)
-                        .bind("genesis_balances_cursor")
-                        .bind(cursor.to_string())
-                        .bind(now_ts()),
+                    kv_query("genesis_balances_cursor", &cursor.to_string()),
                 )
                 .await?;
                 Ok(())
             })
         })
-        .await
-        .map_err(to_anyhow)
+        .await?)
 }
 
 /// The lease's heartbeat, on the writer session.

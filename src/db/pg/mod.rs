@@ -14,14 +14,13 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{Connection, PgConnection, PgPool};
 use tokio::sync::watch;
 
-use super::config::PasswordSource;
 use super::{migrations, DbConfig, Role, Status};
 
 mod blocks;
 mod error;
 mod jobs;
 pub(crate) mod migrate;
-pub(crate) mod plan;
+mod plan;
 pub(crate) mod q;
 pub(crate) mod shared;
 mod tokens;
@@ -83,11 +82,11 @@ impl PgDb {
     }
 }
 
-/// `explorer-<role>/<build>/b<B>`, so `pg_stat_activity` says who is who.
+/// `explorer-<role>-<pool>/<version>/b<B>`, so `pg_stat_activity` says who is who.
 fn application_name(role: Role, what: &str) -> String {
     format!(
         "explorer-{role}-{what}/{}/b{}",
-        option_env!("GIT_SHA").unwrap_or(env!("CARGO_PKG_VERSION")),
+        env!("CARGO_PKG_VERSION"),
         migrations::binary_version()
     )
 }
@@ -107,9 +106,6 @@ fn pool(opts: PgConnectOptions, max: u32, min: u32) -> PgPool {
 /// Open the Postgres backend for `cfg.role`, publishing progress on `status`.
 pub(crate) async fn open(cfg: &DbConfig, status: &watch::Sender<Status>) -> Result<PgDb> {
     let base = cfg.pg_options()?;
-    if cfg.password_source() == PasswordSource::UrlOverEnv {
-        tracing::warn!("DATABASE_URL carries a password and PGPASSWORD is set; using the URL's");
-    }
     let read_max = cfg
         .tuning
         .pool_max
@@ -138,10 +134,7 @@ pub(crate) async fn open(cfg: &DbConfig, status: &watch::Sender<Status>) -> Resu
         0,
     );
     let writer = match cfg.role {
-        Role::Web => {
-            tokio::spawn(first_gate(read.clone(), status.clone()));
-            None
-        }
+        Role::Web => None,
         Role::Indexer | Role::All => {
             let opts = base.application_name(&application_name(cfg.role, "writer"));
             Some(writer::Writer::start(opts, read.clone(), cfg, status.clone()).await?)
@@ -152,23 +145,6 @@ pub(crate) async fn open(cfg: &DbConfig, status: &watch::Sender<Status>) -> Resu
         cache,
         writer,
     })
-}
-
-/// D for a web replica: read until it answers once. The follower keeps it
-/// current from there.
-async fn first_gate(read: PgPool, status: watch::Sender<Status>) {
-    loop {
-        match schema_version(&read).await {
-            Ok(d) => {
-                status.send_modify(|s| s.schema.db = Some(d));
-                return;
-            }
-            Err(e) => {
-                tracing::warn!("schema version: {e:#}");
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        }
-    }
 }
 
 /// D: the database's schema version, 0 before any migration ran. The table

@@ -1,11 +1,12 @@
-//! How a baseline's rows are compared, shared by the re-index check
+//! How a baseline is opened and its rows compared, shared by the re-index check
 //! (`tests/baseline.rs`), the Postgres round-trip (`tests/postgres.rs`), and
 //! the other suites that compare tables, on one backend or across both.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use rusqlite::types::Value as Sql;
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use serde_json::{json, Value};
 use sqlx::postgres::PgConnection;
 use sqlx::{AssertSqlSafe, Column as _, Row as _, TypeInfo as _};
@@ -65,12 +66,45 @@ pub const SPECS: &[Spec] = &[
     },
 ];
 
+/// Every fixture under `fixtures/baseline`, sorted.
+pub fn fixture_paths() -> Vec<PathBuf> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/baseline");
+    let mut found: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .map(|entry| entry.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "db"))
+        .collect();
+    found.sort();
+    assert!(!found.is_empty(), "no baselines under {}", dir.display());
+    found
+}
+
+/// A fixture, by its path from the crate root or an absolute one, opened
+/// read-only and immutable: nothing here can migrate or repair it.
+pub fn open_fixture(path: impl AsRef<Path>) -> Connection {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(path);
+    let abs = std::fs::canonicalize(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    Connection::open_with_flags(
+        format!("file:{}?immutable=1", abs.display()),
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .unwrap_or_else(|e| panic!("open {}: {e}", path.display()))
+}
+
 pub fn columns(conn: &Connection, table: &str) -> Vec<String> {
     let mut stmt = conn
         .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
         .unwrap();
     let names = stmt.query_map([], |r| r.get(0)).unwrap();
     names.map(Result::unwrap).collect()
+}
+
+/// The columns of `spec.table` that are compared: all but `spec.skip`.
+pub fn compared(conn: &Connection, spec: &Spec) -> Vec<String> {
+    columns(conn, spec.table)
+        .into_iter()
+        .filter(|c| !spec.skip.contains(&c.as_str()))
+        .collect()
 }
 
 pub fn tables(conn: &Connection) -> Vec<String> {
@@ -106,13 +140,8 @@ pub fn row_key(spec: &Spec, fields: &BTreeMap<String, Value>) -> String {
 }
 
 pub fn rows(conn: &Connection, spec: &Spec, cols: &[String]) -> Rows {
-    let list = cols
-        .iter()
-        .map(|c| format!("\"{c}\""))
-        .collect::<Vec<_>>()
-        .join(", ");
     let mut stmt = conn
-        .prepare(&format!("SELECT {list} FROM {}", spec.table))
+        .prepare(&format!("SELECT {} FROM {}", quoted(cols), spec.table))
         .unwrap();
     let mut out = Rows::new();
     let mut found = stmt.query([]).unwrap();
@@ -150,7 +179,16 @@ pub fn diff_rows(table: &str, base: &Rows, new: &Rows, sides: (&str, &str)) -> V
     diffs
 }
 
-fn quoted(cols: &[String]) -> String {
+/// Print the first 25 differences, and fail if there are any.
+pub fn report(what: &str, diffs: &[String]) {
+    for d in diffs.iter().take(25) {
+        eprintln!("  {d}");
+    }
+    assert!(diffs.is_empty(), "{what}: {} difference(s)", diffs.len());
+}
+
+/// The columns as a select list, each one quoted.
+pub fn quoted(cols: &[String]) -> String {
     cols.iter()
         .map(|c| format!("\"{c}\""))
         .collect::<Vec<_>>()

@@ -6,11 +6,10 @@
 //! then failing without `PG_TEST_URL`.
 
 use std::collections::BTreeMap;
-use std::path::Path;
 
-use nvnmchain_explorer::db::{self, Role, Status};
+use nvnmchain_explorer::db::{self, Role};
 use nvnmchain_explorer::models::BlockBundle;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 use sqlx::Connection as _;
 use sqlx::PgConnection;
 
@@ -18,7 +17,7 @@ use sqlx::PgConnection;
 mod backend;
 #[allow(dead_code)]
 mod common;
-use common::baseline::{columns, diff_rows, pg_rows, rows, tables, Spec};
+use common::baseline::{compared, diff_rows, open_fixture, pg_rows, report, rows, tables, Spec};
 
 #[path = "common/bundles.rs"]
 mod replay_bundles;
@@ -90,15 +89,7 @@ const KV_SKIPPED: &[&str] = &[
 #[tokio::test]
 #[ignore = "needs PG_TEST_URL; see AGENTS.md"]
 async fn both_backends_write_the_same_tables() {
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/baseline/canary-rich.db");
-    let fixture = Connection::open_with_flags(
-        format!(
-            "file:{}?immutable=1",
-            std::fs::canonicalize(fixture).unwrap().display()
-        ),
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-    )
-    .unwrap();
+    let fixture = open_fixture("fixtures/baseline/canary-rich.db");
     let bundles = replay_bundles::bundles(&fixture);
     let (genesis, cursor) = replay_bundles::genesis(&fixture);
 
@@ -107,12 +98,7 @@ async fn both_backends_write_the_same_tables() {
         let path = dir.path().join("differential.db");
         let sqlite = db::open(path.to_str().unwrap()).await.unwrap();
         let (_scratch, url) = backend::scratch_schema().await;
-        let pg = db::open_with(
-            &backend::pg_config(&url, Role::All),
-            tokio::sync::watch::channel(Status::starting(Role::All)).0,
-        )
-        .await
-        .unwrap();
+        let pg = backend::open(&backend::pg_config(&url, Role::All)).await;
 
         let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
         for (db, label) in [(&sqlite, "SQLite"), (&pg, "Postgres")] {
@@ -135,10 +121,7 @@ async fn both_backends_write_the_same_tables() {
                 continue;
             }
             let spec = spec_for(&table);
-            let cols: Vec<String> = columns(&lite, &table)
-                .into_iter()
-                .filter(|c| !spec.skip.contains(&c.as_str()))
-                .collect();
+            let cols = compared(&lite, &spec);
             let mut a = rows(&lite, &spec, &cols);
             let mut b = pg_rows(&mut conn, &spec, &cols).await;
             if table == "kv" {
@@ -150,13 +133,6 @@ async fn both_backends_write_the_same_tables() {
             }
             diffs.extend(diff_rows(&table, &a, &b, ("SQLite", "Postgres")));
         }
-        for d in diffs.iter().take(25) {
-            eprintln!("  seed {seed}: {d}");
-        }
-        assert!(
-            diffs.is_empty(),
-            "seed {seed}: {} difference(s)",
-            diffs.len()
-        );
+        report(&format!("seed {seed}"), &diffs);
     }
 }

@@ -1,6 +1,5 @@
 //! Database work the indexer runs, kept beside the storage layer so nothing
-//! outside `db` reaches the connection. The bodies were moved here unchanged
-//! from `indexer.rs`; an upstream edit to the old copy ports by path rewrite.
+//! outside `db` reaches the connection.
 
 use anyhow::Result;
 use rusqlite::params;
@@ -274,7 +273,7 @@ mod tests {
         while let Some(dir) = dirs.pop() {
             for entry in std::fs::read_dir(&dir).unwrap() {
                 let path = entry.unwrap().path();
-                if path == src.join("db") || path == src.join("db.rs") {
+                if path == src.join("db") {
                     continue;
                 }
                 if path.is_dir() {

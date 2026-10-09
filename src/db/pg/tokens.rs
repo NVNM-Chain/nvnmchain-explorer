@@ -74,14 +74,14 @@ pub(crate) async fn get_all_token_metas(p: &PgDb) -> Vec<TokenMetadata> {
 /// Every row, or the error: the label cache must not take a failed read for an
 /// empty table.
 pub(crate) async fn try_all_token_metas(p: &PgDb) -> anyhow::Result<Vec<TokenMetadata>> {
-    Ok(q::try_query_rows(
+    q::try_query_rows(
         &p.read,
         "try_all_token_metas",
         concat!("SELECT ", token_cols!(), " FROM token_metadata"),
         |q| q,
         token,
     )
-    .await?)
+    .await
 }
 
 pub(crate) async fn get_token_count(p: &PgDb) -> i64 {
@@ -296,7 +296,7 @@ pub(crate) async fn get_address_holdings(p: &PgDb, address: &str) -> Vec<Value> 
 /// the missing-metadata job's scan, or why they could not be read: a failed
 /// scan is not "none missing".
 pub(crate) async fn tokens_missing_metadata(p: &PgDb) -> anyhow::Result<Vec<String>> {
-    Ok(q::try_query_rows(
+    q::try_query_rows(
         &p.read,
         "tokens_missing_metadata",
         "SELECT a FROM (
@@ -308,5 +308,5 @@ pub(crate) async fn tokens_missing_metadata(p: &PgDb) -> anyhow::Result<Vec<Stri
         |q| q,
         |r| Ok(blob_addr(&r.try_get::<Vec<u8>, _>(0)?)),
     )
-    .await?)
+    .await
 }

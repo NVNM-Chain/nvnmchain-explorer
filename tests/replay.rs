@@ -5,40 +5,22 @@
 //! Network-free, but it needs a Postgres server: ignored unless run with
 //! `--include-ignored`, and then failing without `PG_TEST_URL`.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use nvnmchain_explorer::db::{self, Db, Role, Status};
-use rusqlite::{Connection, OpenFlags};
-use sqlx::{AssertSqlSafe, Connection as _, PgConnection};
+use nvnmchain_explorer::db::{self, Db, Role};
+use rusqlite::Connection;
+use sqlx::{Connection as _, PgConnection};
 
 #[path = "common/backend.rs"]
 mod backend;
 #[allow(dead_code)]
 mod common;
-use common::baseline::{columns, diff_rows, pg_rows, rows, SPECS};
+use common::baseline::{
+    compared, diff_rows, fixture_paths, open_fixture, pg_rows, report, rows, SPECS,
+};
 #[path = "common/bundles.rs"]
 mod bundles;
 use bundles::{bundles, genesis};
-
-fn fixtures() -> Vec<PathBuf> {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/baseline");
-    let mut found: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .filter(|p| p.extension().is_some_and(|e| e == "db"))
-        .collect();
-    found.sort();
-    found
-}
-
-fn open_fixture(path: &Path) -> Connection {
-    let abs = std::fs::canonicalize(path).unwrap();
-    Connection::open_with_flags(
-        format!("file:{}?immutable=1", abs.display()),
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-    )
-    .unwrap()
-}
 
 enum Target {
     Sqlite {
@@ -67,13 +49,7 @@ impl Target {
 
     async fn postgres() -> Target {
         let (scratch, url) = backend::scratch_schema().await;
-        let cfg = backend::pg_config(&url, Role::All);
-        let db = db::open_with(
-            &cfg,
-            tokio::sync::watch::channel(Status::starting(Role::All)).0,
-        )
-        .await
-        .unwrap();
+        let db = backend::open(&backend::pg_config(&url, Role::All)).await;
         Target::Postgres {
             _scratch: scratch,
             url,
@@ -99,13 +75,7 @@ impl Target {
             Target::Sqlite { path, .. } => {
                 Connection::open(path).unwrap().execute_batch(sql).unwrap();
             }
-            Target::Postgres { url, .. } => {
-                let mut conn = PgConnection::connect(url).await.unwrap();
-                sqlx::raw_sql(AssertSqlSafe(sql.to_string()))
-                    .execute(&mut conn)
-                    .await
-                    .unwrap();
-            }
+            Target::Postgres { url, .. } => backend::exec(url, sql).await,
         }
     }
 
@@ -116,10 +86,7 @@ impl Target {
             if only.is_some_and(|o| !o.contains(&spec.table)) {
                 continue;
             }
-            let cols: Vec<String> = columns(fixture, spec.table)
-                .into_iter()
-                .filter(|c| !spec.skip.contains(&c.as_str()))
-                .collect();
+            let cols = compared(fixture, spec);
             let base = rows(fixture, spec, &cols);
             let new = match self {
                 Target::Sqlite { path, .. } => rows(&Connection::open(path).unwrap(), spec, &cols),
@@ -152,19 +119,12 @@ async fn replay(target: &Target, fixture: &Connection) -> u64 {
     worst
 }
 
-fn report(what: &str, diffs: &[String]) {
-    for d in diffs.iter().take(25) {
-        eprintln!("  {d}");
-    }
-    assert!(diffs.is_empty(), "{what}: {} difference(s)", diffs.len());
-}
-
 /// One test, so nothing else in this binary sends statements while the
 /// round trips are counted.
 #[tokio::test]
 #[ignore = "needs PG_TEST_URL; see AGENTS.md"]
 async fn every_fixture_replays_into_both_backends() {
-    for path in fixtures() {
+    for path in fixture_paths() {
         let name = path.file_name().unwrap().to_str().unwrap().to_string();
         let fixture = open_fixture(&path);
         for target in [Target::sqlite(&name).await, Target::postgres().await] {

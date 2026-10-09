@@ -282,7 +282,6 @@ async fn web_api_serves_indexed_data() {
         chain_id: DEFAULT_CHAIN_ID,
         host: "127.0.0.1".into(),
         port: 0,
-        db_path: "unused".into(),
         recent_block_count: 5,
         recent_tx_count: 5,
         poll_seconds: 1.0,

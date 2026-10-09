@@ -22,7 +22,6 @@ async fn serve_down() -> String {
     let mut settings = Settings::from_env();
     settings.signature_lookup_url = None;
     settings.rpc_url = "http://127.0.0.1:1".into();
-    let shutdown = watch::channel(false).1;
     let state = AppState {
         tera: web::build_tera(db.clone()).unwrap(),
         db,
@@ -30,9 +29,9 @@ async fn serve_down() -> String {
         cfg: settings,
         block_events: tokio::sync::broadcast::channel(16).0,
         stats: std::sync::Arc::new(std::sync::RwLock::new(serde_json::Value::Null)),
-        shutdown: shutdown.clone(),
+        shutdown: watch::channel(false).1,
     };
-    let app = web::app(state).merge(web::health(status, shutdown));
+    let app = web::app(state).merge(web::health(status));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await });

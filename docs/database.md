@@ -56,49 +56,38 @@ A schema change is a pull request to `NVNM-Chain/nvnmchain-explorer`'s
   `src/db/pg/`;
 - in `tests/postgres.rs`, a `TRANSLATED` pin for each expression or partial
   index it adds or changes, and an `ALLOWED` entry for each difference
-  between the engines it means to make. Each entry names the versions it
-  holds for: the version that changes or drops what one describes ends it
-  there (`until`), and a changed definition gets a new pin from that version
-  on (`since`), so the parity test still holds every older version to its own.
+  between the engines it means to make. Each entry holds from its version
+  (`since`) on. None has an end version yet: the first migration that changes
+  or drops what one describes adds one, and pins a changed definition in a new
+  entry, so the parity test still holds every older version to its own.
 
-Each file starts with headers, which `the_shipped_migrations_follow_the_rules`
-checks:
+Files are plain SQL, with no headers. A twin with nothing to do is empty or
+holds only comments.
 
-- `-- kind: expand` or `-- kind: contract`, required and equal in both twins;
-- `-- no-transaction`, Postgres only, for concurrent index builds;
-- `-- noop: postgres-only` (in the SQLite twin) or `-- noop: sqlite-only` (in
-  the Postgres twin), for a backend with nothing to do; the file then holds no
-  statements.
+**Expand or contract.** Review enforces both rules: a new column is nullable
+or has a default, and a change that removes or rewrites what the code uses (a
+contract) ships one release after the code stops using it, naming that
+release in its pull request.
 
-**Expand or contract.** An expand may not `DROP TABLE`, `RENAME`,
-`SET NOT NULL`, `TRUNCATE` or `DELETE FROM`, nor drop or alter anything with
-`ALTER TABLE` (`COLUMN` written or not); may add a constraint (`ADD CONSTRAINT`, `UNIQUE`, `CHECK`, `REFERENCES`) only on a
-table the same file creates; and may drop an index only to re-create it in the
-same file. A new column must also be nullable or have a default, which review
-checks. Anything else is a contract, which ships one release after the code
-stops using what it removes, and names that release in its pull request.
-
-**Postgres files.** In a transactional file, never `DROP INDEX`, and never
-`CREATE INDEX` on `transactions` or `transfer_events`: both lock writers out.
-Use a `-- no-transaction` file instead, holding only
-`DROP INDEX CONCURRENTLY IF EXISTS x;` followed by
-`CREATE [UNIQUE] INDEX CONCURRENTLY x …;`, never with `IF NOT EXISTS`, which
-would hide an index a failed build left INVALID. The runner sends such a file
-a statement at a time, split at a `;` that ends a line, so each statement
-ends its last line with its `;` and nothing after it.
+**Postgres files.** Each runs in one transaction. A plain `CREATE INDEX`
+blocks writes to its table but not reads, so pages keep serving while it
+builds. Never put `DROP INDEX`, `ALTER TABLE` or anything else that takes an
+`ACCESS EXCLUSIVE` lock in the same file as a `CREATE INDEX` on a big table
+(`transactions`, `transfer_events`): reads of that table would wait for the
+whole build.
 
 **The commute rule (SQLite).** `init_db` still runs on every open, so a SQLite
 migration must commute with it: it must not drop, by name, an object `init_db`
 creates, nor create a name on `init_db`'s DROP list.
 `every_migration_commutes_with_init_db` checks every version. The patterns:
 
-| Change                                 | SQLite twin                                                                                                     | Postgres twin                                                                                                                  |
-|----------------------------------------|-----------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------|
-| New table, column or index             | As usual                                                                                                        | As usual; a new index is a no-transaction file                                                                                 |
-| Re-keyed index (two releases)          | Expand N: `CREATE INDEX x_v2 …`. Contract N+1: `DROP INDEX x; CREATE INDEX x ON t(col) WHERE 0` (an empty stub) | Expand N: `DROP INDEX CONCURRENTLY IF EXISTS x_v2; CREATE INDEX CONCURRENTLY x_v2 …`. Contract N+1: `DROP INDEX CONCURRENTLY IF EXISTS x` |
-| Retired index                          | The stub                                                                                                        | `DROP INDEX CONCURRENTLY IF EXISTS x`                                                                                          |
-| Re-keyed derived table                 | `DROP TABLE t; CREATE TABLE t (…)`, `init_db`'s index names on it, and `DELETE FROM kv WHERE key = '…'`        | The same, in one transaction                                                                                                   |
-| Retired table                          | `DELETE FROM t`, plus stub indexes                                                                              | `DROP TABLE t`                                                                                                                 |
+| Change                        | SQLite twin                                                                                                     | Postgres twin                                                 |
+|-------------------------------|-----------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------|
+| New table, column or index    | As usual                                                                                                        | As usual                                                      |
+| Re-keyed index (two releases) | Expand N: `CREATE INDEX x_v2 …`. Contract N+1: `DROP INDEX x; CREATE INDEX x ON t(col) WHERE 0` (an empty stub) | Expand N: `CREATE INDEX x_v2 …`. Contract N+1: `DROP INDEX x` |
+| Retired index                 | The stub                                                                                                        | `DROP INDEX x`                                                |
+| Re-keyed derived table        | `DROP TABLE t; CREATE TABLE t (…)`, `init_db`'s index names on it, and `DELETE FROM kv WHERE key = '…'`         | The same, in one transaction                                  |
+| Retired table                 | `DELETE FROM t`, plus stub indexes                                                                              | `DROP TABLE t`                                                |
 
 ### Who assigns version numbers
 
@@ -112,8 +101,8 @@ A version number must mean the same file everywhere: a database that ran one
   pair if another pull request merges a migration first. Renaming a file that
   has not merged is allowed.
 - `main` requires a pull request to be up to date before it merges, with the
-  test suite as a required check, so the header test always sees the latest
-  numbers.
+  test suite as a required check, so the migration list test always sees the
+  latest numbers.
 
 ## The startup shape check
 
@@ -196,9 +185,7 @@ way.
 
 Sync upstream through a pull request, not GitHub's "Sync fork" button, which
 pushes straight to `main`, where `docker.yml` publishes `:latest` whether or
-not CI passes. The full recipe is in
-`docs/superpowers/specs/2026-10-01-db-boundary-design.md`. Three checks matter
-for the schema:
+not CI passes. Three checks matter for the schema:
 
 - **Pins A and B** (`src/db/sqlite/migrate.rs`) fail when a merge edits
   `init_db`. Rewrite the change as a migration pair (see "Adding a schema
@@ -222,23 +209,16 @@ false 404. Chain data is written only by the indexer's writer session, which
 holds a session-level advisory lock (`src/db/pg/writer.rs`); a web replica
 writes only the selector-name and trace caches.
 
-Configuration (`src/db/config.rs`):
-
-| Variable          | Meaning                                                                                          |
-|-------------------|--------------------------------------------------------------------------------------------------|
-| `DATABASE_URL`    | Postgres; `postgres://…`, or `host:port[/db][?params]`. Wins over `DB_PATH`. Plaintext only     |
-| `PGUSER`          | The user, when the URL names none                                                                |
-| `PGPASSWORD`      | The password, when the URL carries none; never logged                                            |
-| `PGSSLMODE`       | Only `disable`, or unset; the URL's own `sslmode` wins over it                                   |
-| `ROLE`            | `all` (default), `web` or `indexer`; the last two need Postgres                                  |
-| `DB_WEB_ROLE`     | The web replicas' database user, which the indexer grants to (default `explorer_web`)           |
-| `FOLLOW_POLL_MS`  | How often a web replica polls for new blocks (default 500)                                       |
+Configuration: `DATABASE_URL`, `PGUSER`, `PGPASSWORD`, `PGSSLMODE`, `ROLE`,
+`DB_WEB_ROLE` and `FOLLOW_POLL_MS`, read by `src/db/config.rs`; `README.md`'s
+table has their defaults and meaning.
 
 `ROLE=all` on Postgres is supported for development, CI and small
 self-hosting. Production runs `ROLE=indexer` and `ROLE=web`
 (`deploy/k8s/README.md`, `docs/runbook.md`). Under `ROLE=all` on Postgres, a
-token page opened while the database is down hangs until it is back, then
-returns 503: its metadata save waits on the writer.
+token page opened while the database is down hangs until it is back (plus up
+to 30 s of writer backoff), then returns 503: its metadata save waits on the
+writer, and runs on after the client leaves.
 
 ### Running the Postgres tests
 
@@ -246,9 +226,8 @@ returns 503: its metadata save waits on the writer.
 docker compose up -d --wait
 export PG_TEST_URL=postgres://explorer:explorer@localhost:5432/explorer
 
-# The usual suites, on Postgres. The db::lock tests are SQLite-only.
-TEST_DB=postgres cargo test --test decoder --test anchoring --test pages -- \
-    --skip duplicate_bundle_is_idempotent --skip anchoring_events_read_back_by_registry
+# The usual suites, on Postgres.
+TEST_DB=postgres cargo test --test decoder --test anchoring --test pages
 
 # The Postgres suites: replay, the differential, the parity grid (with its
 # coverage gate), migrations, locks and outages.
@@ -269,8 +248,7 @@ URL to match. The Postgres tests are `#[ignore]`d so plain `cargo test` needs
 no server, and with `--include-ignored` but no `PG_TEST_URL` they fail rather
 than skip. Each test works in a schema of its own, dropped when it passes and
 kept to inspect when it fails. The next run sweeps the `t_<pid>_<n>` ones whose
-process is gone; `tests/postgres.rs` names its own `t_<test>_<pid>`, which
-are dropped by hand. The compose file starts Postgres with `max_connections=300`,
+process is gone. The compose file starts Postgres with `max_connections=300`,
 since every test opens pools of its own.
 
 CI runs the same in `.github/workflows/postgres.yml`, against PostgreSQL 18

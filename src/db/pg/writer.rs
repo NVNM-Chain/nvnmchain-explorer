@@ -24,7 +24,7 @@ use sqlx::postgres::PgConnectOptions;
 use sqlx::{Connection, PgConnection, PgPool, Row};
 use tokio::sync::{watch, Mutex};
 
-use super::q::{self, PgQuery};
+use super::q;
 use super::{connect, migrate, DbError};
 use crate::db::{migrations, now_ts, DbConfig, Preflight, Status, Tuning, WriterState};
 
@@ -42,27 +42,6 @@ pub(crate) enum Budget {
     /// Migrations, repairs and rebuilds: no statement timeout, supervised by a
     /// watchdog that checks the lock is still held.
     Long,
-}
-
-tokio::task_local! {
-    /// The client deadline a writer statement runs under, by budget.
-    static DEADLINE: Option<Duration>;
-}
-
-/// Run one writer statement under the attempt's client deadline.
-pub(crate) async fn timed<T>(
-    what: &str,
-    fut: impl Future<Output = Result<T, DbError>>,
-) -> Result<T, DbError> {
-    match DEADLINE.try_with(|d| *d).ok().flatten() {
-        Some(limit) => match tokio::time::timeout(limit, fut).await {
-            Ok(r) => r,
-            Err(_) => Err(DbError::Unavailable(anyhow!(
-                "{what}: no answer within {limit:?}"
-            ))),
-        },
-        None => fut.await,
-    }
 }
 
 const BUMP_WRITER_SEQ: &str = "INSERT INTO kv (key, value, updated_at) VALUES ('writer_seq', $1 || ':1', $2)
@@ -164,17 +143,17 @@ impl Writer {
         F: for<'c> Fn(&'c mut PgConnection) -> TxFuture<'c, T> + Send + Sync + 'static,
     {
         let this = self.clone();
-        tokio::spawn(async move { this.write_retrying(budget, f).await }).await?
+        match tokio::spawn(async move { this.write_retrying(budget, f).await }).await {
+            Ok(r) => r,
+            Err(e) => std::panic::resume_unwind(e.into_panic()),
+        }
     }
 
-    async fn write_retrying<T, F>(&self, budget: Budget, f: F) -> Result<T, DbError>
+    async fn write_retrying<T, F>(&self, mut budget: Budget, f: F) -> Result<T, DbError>
     where
         F: for<'c> Fn(&'c mut PgConnection) -> TxFuture<'c, T> + Send + Sync,
     {
-        let mut budget = budget;
-        let mut escalated = false;
         let mut backoff = Duration::from_secs(1);
-        let (mut same, mut last) = (0u32, String::new());
         loop {
             let mut slot = self.0.slot.lock().await;
             let mut conn = match slot.take() {
@@ -182,7 +161,7 @@ impl Writer {
                 None => self.reacquire_session().await?,
             };
             let deadline = (budget == Budget::Batch).then_some(Duration::from_secs(70));
-            let attempt = DEADLINE.scope(deadline, self.attempt(&mut conn, budget, &f));
+            let attempt = q::DEADLINE.scope(deadline, self.attempt(&mut conn, budget, &f));
             let r = if budget == Budget::Long {
                 tokio::select! {
                     r = attempt => r,
@@ -202,30 +181,15 @@ impl Writer {
                     *slot = Some(conn);
                     return Err(e);
                 }
-                Err(DbError::Retry(e)) => {
-                    tracing::warn!("writer: {e:#}; retrying at once");
-                    *slot = Some(conn);
-                }
                 Err(DbError::Unavailable(e)) => {
                     // The session goes, and the lock with it; the next attempt
                     // has to win `try_lock` again.
                     drop(conn);
                     drop(slot);
-                    let text = format!("{e:#}");
-                    if text.contains("57014") && budget == Budget::Batch && !escalated {
+                    if format!("{e:#}").contains("57014") {
                         budget = Budget::Long;
-                        escalated = true;
                     }
-                    if text == last {
-                        same += 1;
-                    } else {
-                        (same, last) = (1, text.clone());
-                    }
-                    if same >= 10 {
-                        tracing::error!("writer: {same} identical failures: {text}");
-                    } else {
-                        tracing::warn!("writer: {text}; retrying in {backoff:?}");
-                    }
+                    tracing::warn!("writer: {e:#}; retrying in {backoff:?}");
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(30));
                 }
@@ -244,31 +208,20 @@ impl Writer {
     where
         F: for<'c> Fn(&'c mut PgConnection) -> TxFuture<'c, T> + Send + Sync,
     {
-        q::count_statement();
-        let mut tx = timed("begin", async {
-            conn.begin()
-                .await
-                .map_err(|e| DbError::from_sqlx("begin", e))
-        })
-        .await?;
+        let mut tx = q::run("begin", conn.begin()).await?;
         if budget == Budget::Long {
             q::raw(&mut tx, "budget", "SET LOCAL statement_timeout = 0").await?;
         }
         let v = f(&mut tx).await?;
-        let bump: PgQuery = sqlx::query(BUMP_WRITER_SEQ)
-            .bind(self.0.run_id.clone())
-            .bind(now_ts());
-        let seq: i64 = timed("seq", q::fetch_one(&mut tx, "writer_seq", bump))
-            .await?
-            .try_get(0)
-            .map_err(|e| DbError::from_sqlx("writer_seq", e))?;
-        q::count_statement();
-        timed("commit", async {
-            tx.commit()
-                .await
-                .map_err(|e| DbError::from_sqlx("commit", e))
-        })
+        let seq: i64 = q::run(
+            "writer_seq",
+            sqlx::query_scalar(BUMP_WRITER_SEQ)
+                .bind(&self.0.run_id)
+                .bind(now_ts())
+                .fetch_one(&mut *tx),
+        )
         .await?;
+        q::run("commit", tx.commit()).await?;
         Ok((v, seq))
     }
 
@@ -278,42 +231,38 @@ impl Writer {
         let mut misses = 0;
         loop {
             tokio::time::sleep(self.0.tuning.watchdog).await;
-            match self.holds_lock().await {
-                Ok(true) => misses = 0,
-                Ok(false) | Err(_) => {
-                    misses += 1;
-                    tracing::warn!("writer watchdog: lock not confirmed ({misses} of 4)");
-                    if misses >= 4 {
-                        return DbError::Unavailable(anyhow!(
-                            "the watchdog lost sight of the lock"
-                        ));
-                    }
+            if self.holds_lock().await {
+                misses = 0;
+            } else {
+                misses += 1;
+                tracing::warn!("writer watchdog: lock not confirmed ({misses} of 4)");
+                if misses >= 4 {
+                    return DbError::Unavailable(anyhow!("the watchdog lost sight of the lock"));
                 }
             }
         }
     }
 
-    async fn holds_lock(&self) -> Result<bool> {
+    /// Whether `pg_locks` shows this process's backend holding the lock; a
+    /// failed read is a no.
+    async fn holds_lock(&self) -> bool {
         let pid = self.0.pid.load(Relaxed);
-        let (k1, k2) = self.lock_ids();
-        Ok(q::try_query_opt(
+        let (k1, k2) = self.0.key;
+        let held = q::try_query_opt(
             &self.0.read,
             "holds_lock",
             "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND classid::int8 = $1 \
              AND objid::int8 = $2 AND objsubid = 2 AND pid = $3 AND granted)",
-            |q| q.bind(k1).bind(k2).bind(pid),
+            // The keys as `pg_locks` shows them: unsigned, in `oid` columns.
+            |q| {
+                q.bind(i64::from(k1 as u32))
+                    .bind(i64::from(k2 as u32))
+                    .bind(pid)
+            },
             |r| r.try_get::<bool, _>(0),
         )
-        .await?
-        .unwrap_or(false))
-    }
-
-    /// The two keys as `pg_locks` shows them: unsigned, in `oid` columns.
-    fn lock_ids(&self) -> (i64, i64) {
-        (
-            i64::from(self.0.key.0 as u32),
-            i64::from(self.0.key.1 as u32),
-        )
+        .await;
+        matches!(held, Ok(Some(true)))
     }
 
     /// The lease's heartbeat: `SELECT 1` on the writer session within 5 s. A
@@ -367,15 +316,20 @@ impl Writer {
 
     /// A new session holding the lock, after a failure dropped the last one.
     /// An unreachable database is waited out however long it takes. Gives up
-    /// once another session has kept the lock for `lost_after` (exit 3) or the
-    /// server has stayed in recovery that long (exit 1), and exits 4 when the
-    /// database is not at this process's `writer_seq`.
+    /// once another session has kept the lock for `lost_after` (exit 3), exits
+    /// 1 on a replica, and exits 4 when the database is not at this process's
+    /// `writer_seq`.
     async fn reacquire_session(&self) -> Result<PgConnection, DbError> {
         self.set_state(WriterState::Reacquiring);
-        let mut patience = Patience::new(self.0.tuning.lost_after);
+        let window = self.0.tuning.lost_after;
+        let mut patience = Patience {
+            window,
+            busy_since: None,
+        };
         let mut backoff = Duration::from_secs(1);
         loop {
-            let seen = match self.try_reacquire().await {
+            // Whether another session holds the lock.
+            let busy = match self.try_reacquire().await {
                 Ok(Some(mut conn)) => match self.check_seq(&mut conn).await {
                     Ok(()) => match self.lead(&mut conn).await {
                         Ok(()) => {
@@ -386,31 +340,29 @@ impl Writer {
                         }
                         Err(DbError::Unavailable(e)) => {
                             tracing::warn!("writer: {e:#}");
-                            if e.downcast_ref::<InRecovery>().is_some() {
-                                Seen::InRecovery
-                            } else {
-                                Seen::Unreachable
-                            }
+                            false
                         }
                         Err(e) => return Err(e),
                     },
                     Err(e @ DbError::Fatal(_)) => return Err(e),
                     Err(e) => {
                         tracing::warn!("writer re-acquire: {e:#}");
-                        Seen::Unreachable
+                        false
                     }
                 },
-                Ok(None) => Seen::Busy,
+                Ok(None) => true,
                 Err(e) => {
                     tracing::warn!("writer re-acquire: {e:#}");
-                    Seen::Unreachable
+                    false
                 }
             };
-            if let Some(give_up) = patience.observe(seen, Instant::now()) {
-                let (code, why) = give_up.exit(self.0.tuning.lost_after);
-                return Err(self.fatal(code, why));
+            if patience.lost(busy, Instant::now()) {
+                return Err(self.fatal(
+                    3,
+                    format!("writer lost the lock: another session has held it for {window:?}"),
+                ));
             }
-            if seen == Seen::Busy {
+            if busy {
                 tokio::time::sleep(self.0.tuning.candidate_retry.min(backoff)).await;
                 continue;
             }
@@ -423,7 +375,7 @@ impl Writer {
     /// ask for the lock. `None` when another session has it.
     async fn try_reacquire(&self) -> Result<Option<PgConnection>> {
         let old = self.0.pid.load(Relaxed);
-        if old != 0 && self.holds_lock().await.unwrap_or(false) {
+        if old != 0 && self.holds_lock().await {
             tracing::warn!("writer: terminating backend {old}, which still holds the lock");
             q::try_query_opt(
                 &self.0.read,
@@ -448,19 +400,12 @@ impl Writer {
         if last == 0 {
             return Ok(());
         }
-        let stored: Option<String> = match q::fetch_optional(
-            conn,
+        let stored: Option<String> = q::run(
             "writer_seq",
-            sqlx::query("SELECT value FROM kv WHERE key = 'writer_seq'"),
+            sqlx::query_scalar("SELECT value FROM kv WHERE key = 'writer_seq'")
+                .fetch_optional(&mut *conn),
         )
-        .await?
-        {
-            Some(r) => Some(
-                r.try_get(0)
-                    .map_err(|e| DbError::from_sqlx("writer_seq", e))?,
-            ),
-            None => None,
-        };
+        .await?;
         let (run, n) = stored
             .as_deref()
             .and_then(|v| v.split_once(':'))
@@ -487,7 +432,7 @@ impl Writer {
     /// move. The migrations have no statement timeout, so like other `Long`
     /// work they run under the watchdog.
     async fn lead(&self, conn: &mut PgConnection) -> Result<(), DbError> {
-        let pid = self_checks(conn).await?;
+        let pid = self.self_checks(conn).await?;
         self.0.pid.store(pid, Relaxed);
         let migrate = async {
             match migrate::preflight(conn).await {
@@ -513,114 +458,66 @@ impl Writer {
         tracing::info!("writer: leader (backend {pid})");
         Ok(())
     }
-}
 
-/// What one re-acquire attempt found.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Seen {
-    /// `try_lock` returned false: another session holds the lock.
-    Busy,
-    /// The lock was granted, but the server is a replica.
-    InRecovery,
-    /// Anything else: no answer, a dropped connection, a failed read.
-    Unreachable,
-}
-
-/// Why a re-acquire gives up.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GiveUp {
-    LockHeld,
-    Replica,
-}
-
-impl GiveUp {
-    /// The exit code and the message to exit with.
-    fn exit(self, window: Duration) -> (i32, String) {
-        match self {
-            GiveUp::LockHeld => (
-                3,
-                format!("writer lost the lock: another session has held it for {window:?}"),
-            ),
-            GiveUp::Replica => (
+    /// A primary, and exactly one granted lock row: ours. A replica (the
+    /// Kubernetes `-ro` Service, a read-replica address) is a misconfiguration
+    /// that waiting cannot fix, so it exits 1 at once.
+    async fn self_checks(&self, conn: &mut PgConnection) -> Result<i32, DbError> {
+        let (primary, pid, locks): (bool, i32, i64) = q::run(
+            "self_checks",
+            sqlx::query_as(
+                "SELECT NOT pg_is_in_recovery(), pg_backend_pid(), \
+                 (SELECT COUNT(*) FROM pg_locks WHERE locktype = 'advisory' \
+                  AND pid = pg_backend_pid() AND objsubid = 2 AND granted)",
+            )
+            .fetch_one(&mut *conn),
+        )
+        .await?;
+        if !primary {
+            return Err(self.fatal(
                 1,
-                format!(
-                    "the server has been in recovery for {window:?}: DATABASE_URL points at a \
-                     replica, such as the Kubernetes -ro Service, not the primary"
-                ),
-            ),
+                "the server is in recovery: DATABASE_URL points at a replica, such as the \
+                 Kubernetes -ro Service, not the primary"
+                    .to_string(),
+            ));
         }
+        if locks != 1 {
+            return Err(DbError::Unavailable(anyhow!(
+                "this session holds {locks} advisory locks, not 1"
+            )));
+        }
+        Ok(pid)
     }
 }
 
-/// How long a re-acquire keeps trying. Only the same finding, `Busy` or
-/// `InRecovery`, seen without a break for the whole window gives up; an
-/// unreachable database is an outage, waited out however long it takes, and
-/// starts the window over.
+/// How long a re-acquire keeps trying. Only another session holding the lock
+/// for the whole window gives up; an unreachable database is an outage,
+/// waited out however long it takes, and starts the window over.
 struct Patience {
     window: Duration,
-    since: Option<(Seen, Instant)>,
+    busy_since: Option<Instant>,
 }
 
 impl Patience {
-    fn new(window: Duration) -> Self {
-        Patience {
-            window,
-            since: None,
+    /// Whether the lock is lost, given whether this try found it held.
+    fn lost(&mut self, busy: bool, now: Instant) -> bool {
+        if !busy {
+            self.busy_since = None;
+            return false;
         }
-    }
-
-    fn observe(&mut self, seen: Seen, now: Instant) -> Option<GiveUp> {
-        if seen == Seen::Unreachable {
-            self.since = None;
-            return None;
-        }
-        let start = match self.since {
-            Some((s, at)) if s == seen => at,
-            _ => {
-                self.since = Some((seen, now));
-                now
-            }
-        };
-        if now.duration_since(start) <= self.window {
-            return None;
-        }
-        Some(match seen {
-            Seen::Busy => GiveUp::LockHeld,
-            _ => GiveUp::Replica,
-        })
+        now.duration_since(*self.busy_since.get_or_insert(now)) > self.window
     }
 }
 
-/// The self-checks found a server in recovery: a replica, not the primary.
-#[derive(Debug)]
-struct InRecovery;
-
-impl std::fmt::Display for InRecovery {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(
-            "the server is in recovery: a replica, such as the Kubernetes -ro Service, \
-             not the primary",
-        )
-    }
-}
-
-impl std::error::Error for InRecovery {}
-
+/// A hash of the clock and the process: enough to tell two runs apart.
 fn run_id() -> String {
-    let mut bytes = [0u8; 8];
-    getrandom(&mut bytes);
-    hex::encode(bytes)
-}
-
-/// Random bytes from the clock and the process: enough to tell two runs apart.
-fn getrandom(out: &mut [u8; 8]) {
     let seed = format!(
         "{:?}{}{:?}",
         std::time::SystemTime::now(),
         std::process::id(),
         std::thread::current().id()
     );
-    out.copy_from_slice(&Sha3_256::digest(seed.as_bytes())[..8]);
+    hex::encode(&Sha3_256::digest(seed.as_bytes())[..8])
 }
 
 /// The writer's own settings, in its startup options.
@@ -720,43 +617,9 @@ async fn candidate(
     }
 }
 
-/// A primary, and exactly one granted lock row: ours. A replica (the
-/// Kubernetes `-ro` Service, a read-replica address) is `Unavailable`.
-async fn self_checks(conn: &mut PgConnection) -> Result<i32, DbError> {
-    let row = q::fetch_one(
-        conn,
-        "self_checks",
-        sqlx::query(
-            "SELECT NOT pg_is_in_recovery(), pg_backend_pid(), \
-             (SELECT COUNT(*) FROM pg_locks WHERE locktype = 'advisory' \
-              AND pid = pg_backend_pid() AND objsubid = 2 AND granted)",
-        ),
-    )
-    .await?;
-    let (primary, pid, locks): (bool, i32, i64) = (
-        row.try_get(0)
-            .map_err(|e| DbError::from_sqlx("self_checks", e))?,
-        row.try_get(1)
-            .map_err(|e| DbError::from_sqlx("self_checks", e))?,
-        row.try_get(2)
-            .map_err(|e| DbError::from_sqlx("self_checks", e))?,
-    );
-    if !primary {
-        return Err(DbError::Unavailable(anyhow::Error::new(InRecovery)));
-    }
-    if locks != 1 {
-        return Err(DbError::Unavailable(anyhow!(
-            "this session holds {locks} advisory locks, not 1"
-        )));
-    }
-    Ok(pid)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const LIMIT: Duration = Duration::from_secs(120);
 
     fn at(t0: Instant, secs: u64) -> Instant {
         t0 + Duration::from_secs(secs)
@@ -767,40 +630,15 @@ mod tests {
     #[test]
     fn a_held_lock_gives_up_after_the_window_and_an_outage_never_does() {
         let t0 = Instant::now();
-        let mut p = Patience::new(LIMIT);
-        assert_eq!(p.observe(Seen::Busy, at(t0, 0)), None);
-        assert_eq!(p.observe(Seen::Busy, at(t0, 119)), None);
-        assert_eq!(p.observe(Seen::Unreachable, at(t0, 200)), None);
-        assert_eq!(p.observe(Seen::Unreachable, at(t0, 10_000)), None);
-        assert_eq!(p.observe(Seen::Busy, at(t0, 10_001)), None);
-        assert_eq!(
-            p.observe(Seen::Busy, at(t0, 10_122)),
-            Some(GiveUp::LockHeld)
-        );
-    }
-
-    /// A replica answers and grants the lock, so only its own window ends it,
-    /// with a message that names the likely misconfiguration.
-    #[test]
-    fn a_replica_gives_up_after_the_window_naming_it() {
-        let t0 = Instant::now();
-        let mut p = Patience::new(LIMIT);
-        assert_eq!(p.observe(Seen::InRecovery, at(t0, 0)), None);
-        assert_eq!(p.observe(Seen::Busy, at(t0, 60)), None);
-        assert_eq!(p.observe(Seen::InRecovery, at(t0, 61)), None);
-        assert_eq!(p.observe(Seen::InRecovery, at(t0, 180)), None);
-        let give_up = p.observe(Seen::InRecovery, at(t0, 182)).unwrap();
-        assert_eq!(give_up, GiveUp::Replica);
-        let (code, why) = give_up.exit(LIMIT);
-        assert_eq!(code, 1);
-        assert!(why.contains("replica"), "{why}");
-        assert!(why.contains("DATABASE_URL"), "{why}");
-    }
-
-    #[test]
-    fn a_held_lock_exits_3() {
-        let (code, why) = GiveUp::LockHeld.exit(LIMIT);
-        assert_eq!(code, 3);
-        assert!(why.contains("another session"), "{why}");
+        let mut p = Patience {
+            window: Duration::from_secs(120),
+            busy_since: None,
+        };
+        assert!(!p.lost(true, at(t0, 0)));
+        assert!(!p.lost(true, at(t0, 119)));
+        assert!(!p.lost(false, at(t0, 200)));
+        assert!(!p.lost(false, at(t0, 10_000)));
+        assert!(!p.lost(true, at(t0, 10_001)));
+        assert!(p.lost(true, at(t0, 10_122)));
     }
 }

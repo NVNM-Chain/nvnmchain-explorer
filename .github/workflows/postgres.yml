@@ -1,8 +1,4 @@
 # The Postgres backend's suites. ci.yml runs everything that needs no server.
-#
-# Postgres is a service container. `command` starts it with
-# `-c max_connections=300`, as docker-compose.yml does: every test opens small
-# pools of its own.
 name: Postgres
 
 on:
@@ -59,16 +55,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # The network-free suites on Postgres. The db::lock tests are SQLite-only
-      # test hooks, so they are skipped by name rather than edited.
       - name: Network-free suites on Postgres
         if: matrix.suite == 'backend-matrix'
         env:
           TEST_DB: postgres
-        run: >
-          cargo test --test decoder --test anchoring --test pages --
-          --skip duplicate_bundle_is_idempotent
-          --skip anchoring_events_read_back_by_registry
+        run: cargo test --test decoder --test anchoring --test pages
 
       # The tests are #[ignore]d so plain `cargo test` needs no server; here
       # they must run, and fail rather than skip if PG_TEST_URL is missing.

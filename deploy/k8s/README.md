@@ -48,10 +48,10 @@ cluster (an operator such as CloudNativePG). PostgreSQL 15 or later.
 | Credentials         | Password users; `PGPASSWORD` from Secret Manager through a synced Secret                               | The operator-generated Secret's `username` and `password`                                                      |
 | Not usable          | Managed Connection Pooling and the Auth Proxy: transaction pooling forbids session locks, and a proxy hides a dead client | The same, for the same reasons                                                                                 |
 
-The writer refuses a replica: a session that is in recovery is treated as
-unavailable and retried, and after 120 s the indexer exits with code 1,
-naming the likely misconfiguration. An unreachable database is never a
-reason to exit: the indexer waits for it, however long it takes.
+The writer refuses a replica: a session that is in recovery makes the
+indexer exit with code 1 at once, naming the likely misconfiguration. An
+unreachable database is never a reason to exit: the indexer waits for it,
+however long it takes.
 
 **No TLS.** The explorer's Postgres client is built without TLS: every
 connection is plaintext, so the database must be reachable only over a
@@ -91,8 +91,8 @@ pod about 10. Keep the HPA's `maxReplicas × 10 + 12` within the server's
   restarts nothing. The port answers before the database opens.
 - **Readiness** is `/readyz`. It reads the status the process publishes and
   never takes a connection. The indexer is Ready once its preflight passed;
-  a web pod once the schema gate passed and no shutdown has begun. Its body
-  says why: `{role, schema: {db, binary}, writer, preflight, sync}`.
+  a web pod once the schema gate passed. Its body says why:
+  `{role, schema: {db, binary}, writer, preflight, sync}`.
 - **Shutdown** takes at most 3 s after SIGTERM. Web pods sleep 10 s in
   `preStop` first, so the endpoints drop them before they stop accepting.
 

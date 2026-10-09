@@ -12,19 +12,12 @@ use sqlx::{PgConnection, Row};
 
 use super::q;
 use super::shared::blob_addr;
-use super::writer::{timed, Budget, TxFuture};
+use super::writer::{Budget, TxFuture};
 use super::{DbError, PgDb};
 use crate::db::{now_ts, Holder};
 use crate::summary::ZERO_ADDRESS;
 
 const GENESIS_CURSOR: &str = "genesis_balances_cursor";
-
-fn get<T: for<'r> sqlx::Decode<'r, sqlx::Postgres> + sqlx::Type<sqlx::Postgres>>(
-    row: &sqlx::postgres::PgRow,
-    i: usize,
-) -> Result<T, DbError> {
-    row.try_get(i).map_err(|e| DbError::from_sqlx("decode", e))
-}
 
 /// The home page's numbers, from the counters the writer keeps and the blocks
 /// of the last day, stored in `kv` to seed the next start.
@@ -84,11 +77,7 @@ pub(crate) async fn compute_and_store_stats(p: &PgDb) -> Result<Value> {
     let (min_ms, max_ms, tx_sum, gas_sum, gas_den, n) = window;
     let span_ms = (max_ms - min_ms).max(1) as f64;
     let avg_block_time_ms = if n > 1 { span_ms / (n - 1) as f64 } else { 0.0 };
-    let tps = if span_ms > 0.0 {
-        tx_sum as f64 / span_ms * 1000.0
-    } else {
-        0.0
-    };
+    let tps = tx_sum as f64 / span_ms * 1000.0;
     let gas_util_pct = if gas_den > 0.0 {
         gas_sum / gas_den * 100.0
     } else {
@@ -167,24 +156,17 @@ pub(crate) async fn repair_derived_tables(p: &PgDb) {
 /// `adjust_balance`'s rule: a zero balance has no row, a negative one stays.
 /// One aggregate keyed on bytes; the keys are checksummed here.
 pub(crate) async fn rebuild_token_balances(c: &mut PgConnection) -> Result<(), DbError> {
-    timed(
+    q::exec(c, "rebuild", sqlx::query("DELETE FROM token_balances")).await?;
+    let rows = q::fetch_all(
+        c,
         "rebuild",
-        q::exec(c, "rebuild", sqlx::query("DELETE FROM token_balances")),
-    )
-    .await?;
-    let rows = timed(
-        "rebuild",
-        q::fetch_all(
-            c,
-            "rebuild",
-            sqlx::query(
-                "SELECT tok, holder, SUM(d)::text FROM (
-                   SELECT token_addr tok, from_addr holder, -(amount::numeric) d FROM transfer_events
-                   UNION ALL SELECT token_addr, to_addr, amount::numeric FROM transfer_events
-                   UNION ALL SELECT decode(substr(token_addr, 3), 'hex'), decode(substr(holder_addr, 3), 'hex'),
-                                    balance::numeric FROM genesis_balances) s
-                 GROUP BY tok, holder HAVING SUM(d) <> 0",
-            ),
+        sqlx::query(
+            "SELECT tok, holder, SUM(d)::text FROM (
+               SELECT token_addr tok, from_addr holder, -(amount::numeric) d FROM transfer_events
+               UNION ALL SELECT token_addr, to_addr, amount::numeric FROM transfer_events
+               UNION ALL SELECT decode(substr(token_addr, 3), 'hex'), decode(substr(holder_addr, 3), 'hex'),
+                                balance::numeric FROM genesis_balances) s
+             GROUP BY tok, holder HAVING SUM(d) <> 0",
         ),
     )
     .await?;
@@ -192,7 +174,7 @@ pub(crate) async fn rebuild_token_balances(c: &mut PgConnection) -> Result<(), D
     let (mut tokens, mut owners, mut balances) = (Vec::new(), Vec::new(), Vec::new());
     for row in &rows {
         let (tok, holder, balance): (Vec<u8>, Vec<u8>, String) =
-            (get(row, 0)?, get(row, 1)?, get(row, 2)?);
+            (q::get(row, 0)?, q::get(row, 1)?, q::get(row, 2)?);
         if !balance.starts_with('-') {
             *holders.entry(tok.clone()).or_default() += 1;
         }
@@ -206,57 +188,48 @@ pub(crate) async fn rebuild_token_balances(c: &mut PgConnection) -> Result<(), D
         .zip(owners.chunks(10_000))
         .zip(balances.chunks(10_000))
     {
-        timed(
+        q::exec(
+            c,
             "rebuild insert",
-            q::exec(
-                c,
-                "rebuild insert",
-                sqlx::query(
-                    "INSERT INTO token_balances (token_addr, holder_addr, balance, updated_at) \
-                     SELECT u.t, u.h, u.b, $4 FROM UNNEST($1::text[], $2::text[], $3::text[]) AS u(t, h, b)",
-                )
-                .bind(t.to_vec())
-                .bind(h.to_vec())
-                .bind(b.to_vec())
-                .bind(now),
-            ),
+            sqlx::query(
+                "INSERT INTO token_balances (token_addr, holder_addr, balance, updated_at) \
+                 SELECT u.t, u.h, u.b, $4 FROM UNNEST($1::text[], $2::text[], $3::text[]) AS u(t, h, b)",
+            )
+            .bind(t.to_vec())
+            .bind(h.to_vec())
+            .bind(b.to_vec())
+            .bind(now),
         )
         .await?;
     }
     // Every token the history touches gets its count, zero included, as the
     // per-row rebuild recounts each token it touched.
-    let touched = timed(
+    let touched = q::fetch_all(
+        c,
         "rebuild tokens",
-        q::fetch_all(
-            c,
-            "rebuild tokens",
-            sqlx::query(
-                "SELECT DISTINCT token_addr FROM transfer_events
-                 UNION SELECT decode(substr(token_addr, 3), 'hex') FROM genesis_balances",
-            ),
+        sqlx::query(
+            "SELECT DISTINCT token_addr FROM transfer_events
+             UNION SELECT decode(substr(token_addr, 3), 'hex') FROM genesis_balances",
         ),
     )
     .await?;
     let mut addrs = Vec::with_capacity(touched.len());
     let mut counts = Vec::with_capacity(touched.len());
     for row in &touched {
-        let tok: Vec<u8> = get(row, 0)?;
+        let tok: Vec<u8> = q::get(row, 0)?;
         counts.push(holders.get(&tok).copied().unwrap_or(0));
         addrs.push(tok);
     }
-    timed(
+    q::exec(
+        c,
         "rebuild counts",
-        q::exec(
-            c,
-            "rebuild counts",
-            sqlx::query(
-                "UPDATE token_metadata m SET holder_count = u.n, updated_at = $3 \
-                 FROM UNNEST($1::bytea[], $2::int8[]) AS u(a, n) WHERE m.address = u.a",
-            )
-            .bind(addrs)
-            .bind(counts)
-            .bind(now),
-        ),
+        sqlx::query(
+            "UPDATE token_metadata m SET holder_count = u.n, updated_at = $3 \
+             FROM UNNEST($1::bytea[], $2::int8[]) AS u(a, n) WHERE m.address = u.a",
+        )
+        .bind(addrs)
+        .bind(counts)
+        .bind(now),
     )
     .await?;
     tracing::info!("rebuilt token balances: {} row(s)", rows.len());
@@ -265,20 +238,17 @@ pub(crate) async fn rebuild_token_balances(c: &mut PgConnection) -> Result<(), D
 
 /// Recount the holders of every token that has balance rows, in one statement.
 pub(crate) async fn sync_holder_counts(c: &mut PgConnection) -> Result<(), DbError> {
-    timed(
+    q::exec(
+        c,
         "sync_holder_counts",
-        q::exec(
-            c,
-            "sync_holder_counts",
-            sqlx::query(
-                "UPDATE token_metadata m SET holder_count = s.n, updated_at = $1
-                 FROM (SELECT decode(substr(token_addr, 3), 'hex') AS a,
-                              COUNT(*) FILTER (WHERE balance NOT LIKE '-%') AS n
-                       FROM token_balances GROUP BY token_addr) s
-                 WHERE m.address = s.a",
-            )
-            .bind(now_ts()),
-        ),
+        sqlx::query(
+            "UPDATE token_metadata m SET holder_count = s.n, updated_at = $1
+             FROM (SELECT decode(substr(token_addr, 3), 'hex') AS a,
+                          COUNT(*) FILTER (WHERE balance NOT LIKE '-%') AS n
+                   FROM token_balances GROUP BY token_addr) s
+             WHERE m.address = s.a",
+        )
+        .bind(now_ts()),
     )
     .await?;
     Ok(())

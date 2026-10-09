@@ -9,7 +9,6 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::ops::RangeInclusive;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -674,18 +673,12 @@ struct Indexer {
     known_tokens: Arc<Mutex<HashSet<String>>>,
     bundle_tx: mpsc::Sender<BlockBundle>,
     shutdown: watch::Receiver<bool>,
-    tip_lag: Arc<AtomicU64>,
     sync: SyncTracker,
 }
 
 impl Indexer {
     fn shutting_down(&self) -> bool {
         *self.shutdown.borrow()
-    }
-
-    fn set_tip_lag(&self, lag: u64) {
-        self.tip_lag.store(lag, Ordering::Relaxed);
-        self.sync.tip_lag(lag);
     }
 
     /// Fetch `from..=to` as multi-block RPC batches, returning bundles in
@@ -846,7 +839,8 @@ async fn forward_loop(mut ix: Indexer, block_events: broadcast::Sender<Value>) {
             head = drain_heads(&mut head_rx, head);
             db::set_chain_head(&ix.db, head as i64).await;
             let end = sent.saturating_add(ix.cfg.batch).min(head);
-            ix.set_tip_lag(head.saturating_sub(sent));
+            ix.sync
+                .update(|s| s.tip_lag = Some(head.saturating_sub(sent) as i64));
             let bundles = ix.fetch_from(sent + 1, end).await;
             // Nothing past `sent` came back: the fetch failed, or the node has
             // not caught up with the head it announced. Ask again after a
@@ -872,7 +866,7 @@ async fn forward_loop(mut ix: Indexer, block_events: broadcast::Sender<Value>) {
             }
             sent = reached;
         }
-        ix.set_tip_lag(0);
+        ix.sync.update(|s| s.tip_lag = Some(0));
     }
     warn!("forward loop stopped (head feed closed)");
 }
@@ -896,7 +890,7 @@ async fn backfill_loop(mut ix: Indexer) {
         if ix.shutting_down() {
             break;
         }
-        if ix.tip_lag.load(Ordering::Relaxed) > TIP_YIELD_LAG {
+        if ix.sync.get().tip_lag.unwrap_or(0) > TIP_YIELD_LAG as i64 {
             if sleep_or_shutdown(&mut ix.shutdown, Duration::from_millis(50)).await {
                 break;
             }
@@ -908,13 +902,10 @@ async fn backfill_loop(mut ix: Indexer) {
                 if sleep_or_shutdown(&mut ix.shutdown, ix.cfg.poll).await {
                     break;
                 }
-                match db::try_min_block_number(&ix.db).await {
-                    Ok(min) => {
-                        frontier = min.map(|n| n as u64);
-                        ix.sync.lowest(min);
-                    }
-                    Err(e) => warn!("backfill frontier read failed; keeping {frontier:?}: {e:#}"),
-                }
+                let Some(min) = lowest_block(&mut ix).await else {
+                    break;
+                };
+                frontier = min;
                 continue;
             }
             None => match ix.rpc.eth_block_number().await {
@@ -959,7 +950,7 @@ async fn lowest_block(ix: &mut Indexer) -> Option<Option<u64>> {
     loop {
         match db::try_min_block_number(&ix.db).await {
             Ok(min) => {
-                ix.sync.lowest(min);
+                ix.sync.update(|s| s.lowest_block = min);
                 return Some(min.map(|n| n as u64));
             }
             Err(e) => {
@@ -978,10 +969,7 @@ async fn lowest_block(ix: &mut Indexer) -> Option<Option<u64>> {
 struct SyncTracker {
     db: Db,
     report: bool,
-    lowest: Arc<AtomicI64>,
-    tip_lag: Arc<AtomicI64>,
-    genesis: Arc<AtomicBool>,
-    anchoring: Arc<AtomicBool>,
+    sync: Arc<Mutex<db::Sync>>,
 }
 
 impl SyncTracker {
@@ -989,59 +977,26 @@ impl SyncTracker {
         SyncTracker {
             report: db::role(&db) == db::Role::Indexer,
             db,
-            lowest: Arc::new(AtomicI64::new(-1)),
-            tip_lag: Arc::new(AtomicI64::new(-1)),
-            genesis: Arc::new(AtomicBool::new(false)),
-            anchoring: Arc::new(AtomicBool::new(false)),
+            sync: Arc::default(),
         }
     }
 
-    fn lowest(&self, min: Option<i64>) {
-        self.lowest.store(min.unwrap_or(-1), Ordering::Relaxed);
-        self.publish();
+    fn get(&self) -> db::Sync {
+        *self.sync.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn reached_block_one(&self) -> bool {
-        self.lowest.load(Ordering::Relaxed) == 1
-    }
-
-    fn tip_lag(&self, lag: u64) {
-        self.tip_lag.store(lag as i64, Ordering::Relaxed);
-        self.publish();
-    }
-
-    fn genesis_done(&self) {
-        self.genesis.store(true, Ordering::Relaxed);
-        self.publish();
-    }
-
-    fn anchoring_done(&self) {
-        self.anchoring.store(true, Ordering::Relaxed);
-        self.publish();
-    }
-
-    fn publish(&self) {
-        if !self.report {
-            return;
+    /// Apply `f`, work out `complete` again, and publish the result.
+    fn update(&self, f: impl FnOnce(&mut db::Sync)) {
+        let mut s = self.sync.lock().unwrap_or_else(|e| e.into_inner());
+        f(&mut s);
+        s.complete = s.lowest_block == Some(1)
+            && s.tip_lag.is_some_and(|l| l <= TIP_YIELD_LAG as i64)
+            && s.genesis
+            && s.anchoring;
+        if self.report {
+            let s = *s;
+            db::update_status(&self.db, |st| st.sync = Some(s));
         }
-        let known = |v: i64| (v >= 0).then_some(v);
-        let lowest = known(self.lowest.load(Ordering::Relaxed));
-        let tip_lag = known(self.tip_lag.load(Ordering::Relaxed));
-        let genesis = self.genesis.load(Ordering::Relaxed);
-        let anchoring = self.anchoring.load(Ordering::Relaxed);
-        let complete = lowest == Some(1)
-            && tip_lag.is_some_and(|l| l <= TIP_YIELD_LAG as i64)
-            && genesis
-            && anchoring;
-        db::update_status(&self.db, |s| {
-            s.sync = Some(db::Sync {
-                lowest_block: lowest,
-                tip_lag,
-                genesis,
-                anchoring,
-                complete,
-            })
-        });
     }
 }
 
@@ -1154,23 +1109,13 @@ async fn missing_metadata_loop(
     }
 }
 
-/// A core indexer task ended while the process was not shutting down.
-#[derive(Debug)]
-pub struct CoreEnded(pub &'static str);
-
-impl std::fmt::Display for CoreEnded {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "the indexer's {} task ended", self.0)
-    }
-}
-
 /// Wait for the first of the core tasks to end. Outside a shutdown that is a
 /// failure, and the process should exit (code 5) so it restarts; during one,
 /// wait for the rest.
 async fn supervise(
     tasks: Vec<(&'static str, tokio::task::JoinHandle<()>)>,
     shutdown: &watch::Receiver<bool>,
-) -> Result<(), CoreEnded> {
+) -> Result<()> {
     let (names, handles): (Vec<_>, Vec<_>) = tasks.into_iter().unzip();
     let (result, i, rest) = futures_util::future::select_all(handles).await;
     if let Err(e) = result {
@@ -1184,7 +1129,7 @@ async fn supervise(
         }
         Ok(())
     } else {
-        Err(CoreEnded(names[i]))
+        Err(anyhow::anyhow!("the indexer's {} task ended", names[i]))
     }
 }
 
@@ -1200,7 +1145,7 @@ pub async fn run_forever(
     block_events: broadcast::Sender<Value>,
     stats: Arc<RwLock<Value>>,
     shutdown: watch::Receiver<bool>,
-) -> Result<(), CoreEnded> {
+) -> Result<()> {
     let stats_interval = cfg.stats_interval;
     let sync = SyncTracker::new(db.clone());
     let stats_db = db.clone();
@@ -1255,7 +1200,7 @@ pub async fn run_forever(
     let anchoring_sync = sync.clone();
     tokio::spawn(async move {
         match backfill_anchoring(&anchoring_rpc, &anchoring_db).await {
-            Ok(()) => anchoring_sync.anchoring_done(),
+            Ok(()) => anchoring_sync.update(|s| s.anchoring = true),
             // Runs once per start: `sync.anchoring` stays false until a restart.
             Err(e) => warn!("anchoring backfill failed: {e:#}"),
         }
@@ -1325,7 +1270,6 @@ pub async fn run_forever(
         known_tokens,
         bundle_tx: bundle_tx.clone(),
         shutdown: shutdown.clone(),
-        tip_lag: Arc::new(AtomicU64::new(0)),
         sync,
     };
     let forward = tokio::spawn(forward_loop(ix.clone(), block_events));
@@ -1359,9 +1303,9 @@ async fn genesis_loop(
     loop {
         // Done once a pass that began after backfill reached block 1 finds no
         // holder left.
-        let after_backfill = sync.reached_block_one();
+        let after_backfill = sync.get().lowest_block == Some(1);
         match add_genesis_balances(&rpc, &db).await {
-            Ok(0) if after_backfill => sync.genesis_done(),
+            Ok(0) if after_backfill => sync.update(|s| s.genesis = true),
             Ok(_) => {}
             Err(e) => warn!("genesis balances: {e:#}"),
         }

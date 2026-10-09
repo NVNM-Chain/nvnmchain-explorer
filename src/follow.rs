@@ -7,7 +7,6 @@
 //! and the schema gate when the version moves. Every 30 s it also reloads the
 //! token labels, which is how a replica sees the indexer's inserts.
 
-use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -16,7 +15,7 @@ use serde_json::{json, Value};
 use tokio::sync::{broadcast, watch};
 
 use crate::db::{self, Db, TxColumns};
-use crate::models::{block_event_json, STREAM_TX_CAP};
+use crate::models::block_events;
 
 /// The most blocks one tick broadcasts; the rest come on the next.
 const MAX_BLOCKS: i64 = 256;
@@ -107,31 +106,22 @@ impl Follower {
         // A failed read comes back empty, as on a page; `track_failures` tells
         // the two apart, and the failure is logged where it happened.
         let db = &self.db;
-        let ((mut blocks, block_txs), failed) = db::track_failures(async {
-            let blocks = db::get_blocks_in_range(db, from, to).await;
-            if blocks.is_empty() {
-                return (blocks, Vec::new());
-            }
-            let txs = db::get_transactions_in_range(db, from, to, TxColumns::List).await;
-            (blocks, txs)
+        let ((blocks, txs), failed) = db::track_failures(async {
+            (
+                db::get_blocks_in_range(db, from, to).await,
+                db::get_transactions_in_range(db, from, to, TxColumns::List).await,
+            )
         })
         .await;
         if failed || blocks.is_empty() {
             return;
         }
-        blocks.sort_by_key(|b| b.number);
-        let mut txs: HashMap<i64, Vec<_>> = HashMap::new();
-        for tx in block_txs {
-            txs.entry(tx.block_number).or_default().push(tx);
+        for event in block_events(&blocks, &txs) {
+            let _ = self.events.send(event);
         }
-        for block in &blocks {
-            let block_txs = txs.get(&block.number).map(Vec::as_slice).unwrap_or(&[]);
-            let _ = self
-                .events
-                .send(block_event_json(block, block_txs, STREAM_TX_CAP));
-            crate::metrics::latest_block_timestamp(block.timestamp);
-        }
-        self.last = blocks.last().map(|b| b.number);
+        // Newest first, as the range read returns them.
+        crate::metrics::latest_block_timestamp(blocks[0].timestamp);
+        self.last = Some(blocks[0].number);
     }
 }
 

@@ -66,7 +66,7 @@ After the switch, every release rolls `explorer-indexer` first, then
 
 | Code | Meaning                                                    | What to do                                                                 |
 |------|------------------------------------------------------------|----------------------------------------------------------------------------|
-| 1    | The preflight refused the database, or the config is wrong, including a `DATABASE_URL` that points at a replica (the server stayed in recovery for 120 s) | Read the log line; see "Preflight refusals" below                          |
+| 1    | The preflight refused the database, or the config is wrong, including a `DATABASE_URL` that points at a replica (the server is in recovery) | Read the log line; see "Preflight refusals" below                          |
 | 3    | Leadership lost: another session held the lock for 120 s   | Another writer holds the lock. Normal during a rollout; otherwise look for a second indexer |
 | 4    | The database is not at this process's `writer_seq`         | Commits were lost (a restore, or a crash with `synchronous_commit=off`). The restart re-derives them; nothing to do |
 | 5    | An indexer core task ended                                 | The pod restarts; read the log for why                                     |
@@ -88,10 +88,6 @@ it waited, and exits 1 the same way:
   never change.
 - **"newer than this binary"** (D > B): an older image against a migrated
   database. Roll forward.
-- **"INVALID index(es)"**: a concurrent index build was interrupted outside a
-  migration. Drop the index with `DROP INDEX CONCURRENTLY` and run the
-  migration's `CREATE` again. A `REINDEX CONCURRENTLY` in progress
-  (`*_ccnew`, `*_ccold`) never blocks a start.
 
 ## Database restarts and maintenance
 
@@ -117,10 +113,3 @@ A container's environment is fixed when it starts. Change the password in the
 database and in Secret Manager, wait for the synced Secret, then
 `kubectl rollout restart` both deployments, indexer first. Open sessions
 survive the change; new ones use the password the pod started with.
-
-## `ROLE=all` on Postgres
-
-Supported for development, CI and small self-hosting only. A token page
-opened while the database is down hangs until it is back (plus up to 30 s of
-writer backoff), then returns 503: its metadata save waits on the writer, and
-runs on after the client leaves.

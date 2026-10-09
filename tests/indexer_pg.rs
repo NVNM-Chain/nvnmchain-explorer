@@ -1,12 +1,12 @@
 //! What the indexer leans on in the database under `ROLE=indexer`, and what a
 //! web replica's follower does when a read fails.
 //!
-//! Needs a Postgres server: ignored unless run with `--include-ignored`, and
-//! then failing without `PG_TEST_URL`.
+//! The tests that need a Postgres server are ignored unless run with
+//! `--include-ignored`, and then fail without `PG_TEST_URL`.
 
 use std::sync::{Arc, RwLock};
 
-use nvnmchain_explorer::db::{self, Db, Role, Status};
+use nvnmchain_explorer::db::{self, Db, Role};
 use nvnmchain_explorer::decoder::checksum_address;
 use nvnmchain_explorer::follow::Follower;
 use nvnmchain_explorer::models::{Block, BlockBundle, Transaction, TransferEvent};
@@ -16,12 +16,7 @@ use nvnmchain_explorer::tokens::TokenMeta;
 mod backend;
 
 async fn open(url: &str, role: Role) -> Db {
-    db::open_with(
-        &backend::pg_config(url, role),
-        tokio::sync::watch::channel(Status::starting(role)).0,
-    )
-    .await
-    .unwrap()
+    backend::open(&backend::pg_config(url, role)).await
 }
 
 fn bundle(number: i64, token: &str, fee_token: &str) -> BlockBundle {
@@ -142,10 +137,7 @@ async fn only_the_indexer_notes() {
 /// Backfill's frontier: an outage must read as an error, never as an empty
 /// table, or backfill would re-walk the chain from the head.
 #[tokio::test]
-#[ignore = "needs PG_TEST_URL; see AGENTS.md"]
 async fn the_frontier_read_fails_rather_than_reading_empty() {
-    let (_scratch, url) = backend::scratch_schema().await;
-    drop(open(&url, Role::Indexer).await);
     // A web replica pointed at a port nothing listens on.
     let web = open(
         "postgres://explorer:explorer@127.0.0.1:1/explorer",
@@ -184,18 +176,12 @@ async fn credentials_come_from_pguser_and_pgpassword() {
         ("PGPASSWORD", password.clone()),
     ]);
     let cfg = db::DbConfig::from_env(|key| env.get(key).cloned()).unwrap();
-    assert_eq!(cfg.password_source(), db::PasswordSource::Env);
     let db::DbTarget::Postgres(target) = &cfg.target else {
         panic!("not Postgres: {:?}", cfg.target);
     };
     assert!(!target.has_password(), "{target}");
 
-    let db = db::open_with(
-        &cfg,
-        tokio::sync::watch::channel(Status::starting(Role::Indexer)).0,
-    )
-    .await
-    .expect("connect with PGUSER and PGPASSWORD");
+    let db = backend::open(&cfg).await;
     db::save_block_bundle(
         &db,
         &bundle(
@@ -215,7 +201,6 @@ async fn credentials_come_from_pguser_and_pgpassword() {
 #[tokio::test]
 #[ignore = "needs PG_TEST_URL; see AGENTS.md"]
 async fn the_follower_retries_a_failed_transactions_read() {
-    use sqlx::Connection as _;
     let (_scratch, url) = backend::scratch_schema().await;
     let indexer = open(&url, Role::Indexer).await;
     db::save_block_bundle(&indexer, &bundle(1, NAMED, FEE))
@@ -233,16 +218,9 @@ async fn the_follower_retries_a_failed_transactions_read() {
         .await
         .unwrap();
     // follow_point and the blocks read still work; the transactions read fails.
-    let mut admin = sqlx::PgConnection::connect(&url).await.unwrap();
-    sqlx::raw_sql("ALTER TABLE transactions RENAME TO transactions_away")
-        .execute(&mut admin)
-        .await
-        .unwrap();
+    backend::exec(&url, "ALTER TABLE transactions RENAME TO transactions_away").await;
     follower.tick().await.unwrap();
-    sqlx::raw_sql("ALTER TABLE transactions_away RENAME TO transactions")
-        .execute(&mut admin)
-        .await
-        .unwrap();
+    backend::exec(&url, "ALTER TABLE transactions_away RENAME TO transactions").await;
     follower.tick().await.unwrap();
 
     let sent: Vec<serde_json::Value> = std::iter::from_fn(|| rx.try_recv().ok())
@@ -264,7 +242,6 @@ async fn the_follower_retries_a_failed_transactions_read() {
 #[tokio::test]
 #[ignore = "needs PG_TEST_URL; see AGENTS.md"]
 async fn a_failed_read_of_the_tip_is_read_again() {
-    use sqlx::Connection as _;
     let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();
     let _local = metrics::set_default_local_recorder(&recorder);
@@ -281,17 +258,10 @@ async fn a_failed_read_of_the_tip_is_read_again() {
     let series = "explorer_latest_block_timestamp_seconds";
 
     // The tip's number reads, but its row does not.
-    let mut admin = sqlx::PgConnection::connect(&url).await.unwrap();
-    sqlx::raw_sql("ALTER TABLE blocks RENAME COLUMN hash TO hash_away")
-        .execute(&mut admin)
-        .await
-        .unwrap();
+    backend::exec(&url, "ALTER TABLE blocks RENAME COLUMN hash TO hash_away").await;
     follower.tick().await.unwrap();
     assert!(!handle.render().contains(series), "the tip's read failed");
-    sqlx::raw_sql("ALTER TABLE blocks RENAME COLUMN hash_away TO hash")
-        .execute(&mut admin)
-        .await
-        .unwrap();
+    backend::exec(&url, "ALTER TABLE blocks RENAME COLUMN hash_away TO hash").await;
 
     // No block arrives, as in a stall: only a second read reports the tip.
     follower.tick().await.unwrap();

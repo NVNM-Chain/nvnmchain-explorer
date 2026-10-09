@@ -6,11 +6,9 @@
 //! only when `PG_CONTAINER` names the container (`docker compose ps`), e.g.
 //! `PG_CONTAINER=nvnmchain-explorer-postgres-1`.
 
-use std::path::Path;
 use std::time::Duration;
 
-use nvnmchain_explorer::db::{self, Role, Status};
-use rusqlite::{Connection, OpenFlags};
+use nvnmchain_explorer::db::{self, Role};
 use sqlx::{Connection as _, PgConnection};
 
 #[path = "common/backend.rs"]
@@ -19,30 +17,17 @@ mod backend;
 mod bundles;
 #[allow(dead_code)]
 mod common;
-use common::baseline::{columns, diff_rows, pg_rows, rows, SPECS};
+use common::baseline::{compared, diff_rows, open_fixture, pg_rows, report, rows, SPECS};
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "restarts the Postgres container; set PG_CONTAINER and run alone"]
 async fn a_database_restart_mid_replay_loses_nothing() {
     let container = std::env::var("PG_CONTAINER").expect("PG_CONTAINER");
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/baseline/canary-rich.db");
-    let fixture = Connection::open_with_flags(
-        format!(
-            "file:{}?immutable=1",
-            std::fs::canonicalize(path).unwrap().display()
-        ),
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-    )
-    .unwrap();
+    let fixture = open_fixture("fixtures/baseline/canary-rich.db");
     let (_scratch, url) = backend::scratch_schema().await;
     let mut cfg = backend::pg_config(&url, Role::Indexer);
     cfg.tuning.lost_after = Duration::from_secs(120);
-    let db = db::open_with(
-        &cfg,
-        tokio::sync::watch::channel(Status::starting(Role::Indexer)).0,
-    )
-    .await
-    .unwrap();
+    let db = backend::open(&cfg).await;
 
     let chunks: Vec<Vec<_>> = bundles::bundles(&fixture)
         .chunks(16)
@@ -67,22 +52,12 @@ async fn a_database_restart_mid_replay_loses_nothing() {
     let mut conn = PgConnection::connect(&url).await.unwrap();
     let mut diffs = Vec::new();
     for spec in SPECS {
-        let cols: Vec<String> = columns(&fixture, spec.table)
-            .into_iter()
-            .filter(|c| !spec.skip.contains(&c.as_str()))
-            .collect();
+        let cols = compared(&fixture, spec);
         let (base, new) = (
             rows(&fixture, spec, &cols),
             pg_rows(&mut conn, spec, &cols).await,
         );
         diffs.extend(diff_rows(spec.table, &base, &new, ("fixture", "Postgres")));
     }
-    for d in diffs.iter().take(25) {
-        eprintln!("  {d}");
-    }
-    assert!(
-        diffs.is_empty(),
-        "{} difference(s) after the restart",
-        diffs.len()
-    );
+    report("after the restart", &diffs);
 }

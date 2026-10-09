@@ -8,6 +8,7 @@
 //! returned to the pool. `try_*` variants return the error instead, for the
 //! callers that must not mistake a failure for an empty table.
 
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Duration;
 
@@ -24,6 +25,11 @@ pub(crate) const READ_DEADLINE: Duration = Duration::from_secs(7);
 /// A cache write's round trip: `statement_timeout` (2 s) plus 2 s.
 pub(crate) const CACHE_DEADLINE: Duration = Duration::from_secs(4);
 
+tokio::task_local! {
+    /// The client deadline a writer statement runs under, by budget.
+    pub(crate) static DEADLINE: Option<Duration>;
+}
+
 static STATEMENTS: AtomicU64 = AtomicU64::new(0);
 
 /// Statements sent so far by this process, for the round-trip budget tests.
@@ -35,52 +41,37 @@ pub(crate) fn count_statement() {
     STATEMENTS.fetch_add(1, Relaxed);
 }
 
-/// Why a read failed: the database's error, or the deadline.
-#[derive(Debug)]
-pub(crate) enum ReadError {
-    Sql(sqlx::Error),
-    Deadline,
-}
-
-impl std::fmt::Display for ReadError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ReadError::Sql(e) => write!(f, "{e}"),
-            ReadError::Deadline => f.write_str("no answer within the client deadline"),
-        }
-    }
-}
-
-impl std::error::Error for ReadError {}
-
 /// Run `$body` on a connection from `$pool` under `$deadline`, with the
 /// connection bound to `$c`. A connection that misses the deadline may be
-/// half-open, so it is closed rather than returned to the pool.
+/// half-open, so it is closed rather than returned to the pool. A sqlx error
+/// keeps only its own text, which already includes its source's.
 macro_rules! on_pool {
     ($pool:expr, $deadline:expr, |$c:ident| $body:expr) => {{
-        let mut conn = $pool.acquire().await.map_err(ReadError::Sql)?;
+        let mut conn = $pool.acquire().await.map_err(|e| anyhow::anyhow!("{e}"))?;
         count_statement();
         let $c = &mut *conn;
         match tokio::time::timeout($deadline, $body).await {
-            Ok(r) => r.map_err(ReadError::Sql),
+            Ok(r) => r.map_err(|e| anyhow::anyhow!("{e}")),
             Err(_) => {
                 conn.close_on_drop();
-                Err(ReadError::Deadline)
+                Err(anyhow::anyhow!("no answer within the client deadline"))
             }
         }
     }};
 }
 
-fn degrade(what: &str, e: &ReadError) {
-    tracing::warn!("{what}: {e}");
-    flag_failure();
-}
-
-/// Whether a read in this request already failed. The response will be a 503
-/// whatever the rest find, so they degrade at once rather than each waiting
-/// out the database.
-fn already_failed() -> bool {
-    super::DB_FAILED.try_with(|f| f.get()).unwrap_or(false)
+/// `read`, or no data when it fails: logged, and `DB_FAILED` set. Once a read
+/// in this request has failed, the response will be a 503 whatever the rest
+/// find, so they degrade at once rather than each waiting out the database.
+async fn degrading<T: Default>(what: &str, read: impl Future<Output = anyhow::Result<T>>) -> T {
+    if super::DB_FAILED.try_with(|f| f.get()).unwrap_or(false) {
+        return T::default();
+    }
+    read.await.unwrap_or_else(|e| {
+        tracing::warn!("{what}: {e}");
+        flag_failure();
+        T::default()
+    })
 }
 
 /// Map every row, dropping (and logging) the ones that do not decode, as
@@ -113,7 +104,7 @@ pub(crate) async fn try_query_rows<T>(
     sql: &'static str,
     bind: impl FnOnce(PgQuery) -> PgQuery,
     map: impl Fn(&PgRow) -> Result<T, sqlx::Error>,
-) -> Result<Vec<T>, ReadError> {
+) -> anyhow::Result<Vec<T>> {
     let q = bind(sqlx::query(sql));
     let rows = on_pool!(pool, READ_DEADLINE, |c| q.fetch_all(c))?;
     Ok(map_rows(what, rows, map))
@@ -127,16 +118,7 @@ pub(crate) async fn query_rows<T>(
     bind: impl FnOnce(PgQuery) -> PgQuery,
     map: impl Fn(&PgRow) -> Result<T, sqlx::Error>,
 ) -> Vec<T> {
-    if already_failed() {
-        return Vec::new();
-    }
-    match try_query_rows(pool, what, sql, bind, map).await {
-        Ok(rows) => rows,
-        Err(e) => {
-            degrade(what, &e);
-            Vec::new()
-        }
-    }
+    degrading(what, try_query_rows(pool, what, sql, bind, map)).await
 }
 
 pub(crate) async fn try_query_opt<T>(
@@ -145,19 +127,10 @@ pub(crate) async fn try_query_opt<T>(
     sql: &'static str,
     bind: impl FnOnce(PgQuery) -> PgQuery,
     map: impl Fn(&PgRow) -> Result<T, sqlx::Error>,
-) -> Result<Option<T>, ReadError> {
+) -> anyhow::Result<Option<T>> {
     let q = bind(sqlx::query(sql));
     let row = on_pool!(pool, READ_DEADLINE, |c| q.fetch_optional(c))?;
-    Ok(match row {
-        None => None,
-        Some(row) => match map(&row) {
-            Ok(v) => Some(v),
-            Err(e) => {
-                tracing::warn!("{what}: dropped 1 undecodable row(s); first: {e}");
-                None
-            }
-        },
-    })
+    Ok(map_rows(what, row.into_iter().collect(), map).pop())
 }
 
 /// The first row, or `None` when there is none or the query fails.
@@ -168,16 +141,7 @@ pub(crate) async fn query_opt<T>(
     bind: impl FnOnce(PgQuery) -> PgQuery,
     map: impl Fn(&PgRow) -> Result<T, sqlx::Error>,
 ) -> Option<T> {
-    if already_failed() {
-        return None;
-    }
-    match try_query_opt(pool, what, sql, bind, map).await {
-        Ok(v) => v,
-        Err(e) => {
-            degrade(what, &e);
-            None
-        }
-    }
+    degrading(what, try_query_opt(pool, what, sql, bind, map)).await
 }
 
 /// A single `int8`, or 0 when the query fails.
@@ -195,8 +159,8 @@ pub(crate) async fn query_count(
 }
 
 /// A write to a true cache (selector names, traces), on the cache pool. A
-/// failure is logged and returned, and never sets `DB_FAILED`: the page that
-/// asked has its answer either way.
+/// failure is returned for the caller to log, and never sets `DB_FAILED`: the
+/// page that asked has its answer either way.
 pub(crate) async fn exec_best_effort(
     pool: &PgPool,
     what: &str,
@@ -204,25 +168,33 @@ pub(crate) async fn exec_best_effort(
     bind: impl FnOnce(PgQuery) -> PgQuery,
 ) -> anyhow::Result<()> {
     let q = bind(sqlx::query(sql));
-    let run = async { on_pool!(pool, CACHE_DEADLINE, |c| q.execute(c)) };
-    match run.await {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            tracing::warn!("{what}: {e}");
-            Err(anyhow::anyhow!("{what}: {e}"))
-        }
-    }
+    async { on_pool!(pool, CACHE_DEADLINE, |c| q.execute(c)) }
+        .await
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("{what}: {e}"))
 }
 
 // Writer-side helpers: one statement on the writer's transaction, counted, with
 // the error classified for the retry loop.
 
-pub(crate) async fn exec(c: &mut PgConnection, what: &str, q: PgQuery) -> Result<u64, DbError> {
+/// Run one writer statement: counted, under the attempt's client deadline
+/// (`Batch` only), with its error classified.
+pub(crate) async fn run<T>(
+    what: &str,
+    fut: impl Future<Output = Result<T, sqlx::Error>>,
+) -> Result<T, DbError> {
     count_statement();
-    q.execute(c)
-        .await
-        .map(|r| r.rows_affected())
-        .map_err(|e| DbError::from_sqlx(what, e))
+    let r = match DEADLINE.try_with(|d| *d).ok().flatten() {
+        Some(limit) => tokio::time::timeout(limit, fut).await.map_err(|_| {
+            DbError::Unavailable(anyhow::anyhow!("{what}: no answer within {limit:?}"))
+        })?,
+        None => fut.await,
+    };
+    r.map_err(|e| DbError::from_sqlx(what, e))
+}
+
+pub(crate) async fn exec(c: &mut PgConnection, what: &str, q: PgQuery) -> Result<u64, DbError> {
+    run(what, q.execute(c)).await.map(|r| r.rows_affected())
 }
 
 pub(crate) async fn fetch_all(
@@ -230,32 +202,7 @@ pub(crate) async fn fetch_all(
     what: &str,
     q: PgQuery,
 ) -> Result<Vec<PgRow>, DbError> {
-    count_statement();
-    q.fetch_all(c)
-        .await
-        .map_err(|e| DbError::from_sqlx(what, e))
-}
-
-pub(crate) async fn fetch_optional(
-    c: &mut PgConnection,
-    what: &str,
-    q: PgQuery,
-) -> Result<Option<PgRow>, DbError> {
-    count_statement();
-    q.fetch_optional(c)
-        .await
-        .map_err(|e| DbError::from_sqlx(what, e))
-}
-
-pub(crate) async fn fetch_one(
-    c: &mut PgConnection,
-    what: &str,
-    q: PgQuery,
-) -> Result<PgRow, DbError> {
-    count_statement();
-    q.fetch_one(c)
-        .await
-        .map_err(|e| DbError::from_sqlx(what, e))
+    run(what, q.fetch_all(c)).await
 }
 
 /// A statement with no parameters, sent as a simple query.
@@ -264,10 +211,13 @@ pub(crate) async fn raw(
     what: &str,
     sql: &'static str,
 ) -> Result<(), DbError> {
-    count_statement();
-    sqlx::raw_sql(sql)
-        .execute(c)
-        .await
-        .map(|_| ())
-        .map_err(|e| DbError::from_sqlx(what, e))
+    run(what, sqlx::raw_sql(sql).execute(c)).await.map(|_| ())
+}
+
+/// Column `i` of a row a writer statement returned.
+pub(crate) fn get<T: for<'r> sqlx::Decode<'r, Postgres> + sqlx::Type<Postgres>>(
+    row: &PgRow,
+    i: usize,
+) -> Result<T, DbError> {
+    sqlx::Row::try_get(row, i).map_err(|e| DbError::from_sqlx("decode", e))
 }

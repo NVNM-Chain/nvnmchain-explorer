@@ -13,11 +13,11 @@
 
 use std::collections::BTreeMap;
 
-use nvnmchain_explorer::db::{self, Db, Role, Status, TxColumns};
+use nvnmchain_explorer::db::{self, Db, Role, TxColumns};
 use nvnmchain_explorer::decoder::checksum_address;
 use nvnmchain_explorer::models::{AnchoringEvent, Block, BlockBundle, Transaction, TransferEvent};
 use nvnmchain_explorer::tokens::TokenMeta;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 use serde_json::{json, Value};
 
 #[path = "common/backend.rs"]
@@ -26,6 +26,7 @@ mod backend;
 mod bundles;
 #[allow(dead_code)]
 mod common;
+use common::baseline::open_fixture;
 
 const TIED_TOKEN: &str = "0x20c0000000000000000000000000000000000abc";
 
@@ -46,7 +47,7 @@ fn meta(address: &str, symbol: &str, name: &str) -> TokenMeta {
 
 /// 30 holders with equal balances of one token, across a 25-row page
 /// boundary, and tokens whose holder counts tie, for the tie-aware rules.
-fn tie_bundles() -> Vec<BlockBundle> {
+fn tie_bundle() -> BlockBundle {
     let block = |number: i64| Block {
         number,
         hash: format!("0x{number:064x}"),
@@ -84,7 +85,6 @@ fn tie_bundles() -> Vec<BlockBundle> {
         timestamp: 1_800_000_000 + number,
         created_at: 0,
     };
-    let mut out = Vec::new();
     let number = 9_000_000;
     let t = tx(number);
     let transfers = (0..30)
@@ -101,7 +101,7 @@ fn tie_bundles() -> Vec<BlockBundle> {
             created_at: 0,
         })
         .collect();
-    out.push(BlockBundle {
+    BlockBundle {
         block: block(number),
         txs: vec![t],
         transfers,
@@ -135,8 +135,7 @@ fn tie_bundles() -> Vec<BlockBundle> {
                 "tie breaker",
             ),
         ],
-    });
-    out
+    }
 }
 
 /// Results as JSON: compare exactly.
@@ -161,12 +160,6 @@ fn tie_aware(pages: &[Vec<Value>], key: impl Fn(&Value) -> Value) -> Value {
     let mut all: Vec<String> = pages.iter().flatten().map(|v| v.to_string()).collect();
     all.sort();
     json!({"keys": keys, "rows": all})
-}
-
-/// The stats blob, wall-clock fields left out. Its floats stay numbers, which
-/// `agree` compares within a relative 1e-9.
-fn stats(v: &Value) -> Value {
-    without_clock(v.clone())
 }
 
 /// Wall-clock fields, which differ between any two writes, dropped wherever
@@ -420,7 +413,7 @@ async fn answers(db: &Db) -> BTreeMap<String, Value> {
     put("follow_point", json!([newest, version]));
     put(
         "compute_and_store_stats",
-        stats(&db::compute_and_store_stats(db).await.unwrap()),
+        db::compute_and_store_stats(db).await.unwrap(),
     );
     out
 }
@@ -434,14 +427,14 @@ async fn load(db: &Db, fixture: &Connection) {
     db::save_genesis_balances(db, &genesis, cursor)
         .await
         .unwrap();
-    let ties = tie_bundles();
-    db::save_block_bundle(db, &ties[0]).await.unwrap();
+    let tie = tie_bundle();
+    db::save_block_bundle(db, &tie).await.unwrap();
     db::save_block(
         db,
         &Block {
             number: 9_000_100,
             hash: format!("0x{:064x}", 9_000_100),
-            ..ties[0].block.clone()
+            ..tie.block.clone()
         },
     )
     .await
@@ -450,12 +443,12 @@ async fn load(db: &Db, fixture: &Connection) {
         db,
         &Transaction {
             trace_data: None,
-            ..ties[0].txs[0].clone()
+            ..tie.txs[0].clone()
         },
     )
     .await
     .unwrap();
-    db::set_trace(db, &ties[0].txs[0].hash, "{\"calls\":[]}")
+    db::set_trace(db, &tie.txs[0].hash, "{\"calls\":[]}")
         .await
         .unwrap();
     db::set_chain_head(db, 9_000_200).await;
@@ -499,27 +492,13 @@ async fn load(db: &Db, fixture: &Connection) {
 #[tokio::test]
 #[ignore = "needs PG_TEST_URL; see AGENTS.md"]
 async fn every_function_answers_the_same_on_both_backends() {
-    let path =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/baseline/canary-rich.db");
-    let fixture = Connection::open_with_flags(
-        format!(
-            "file:{}?immutable=1",
-            std::fs::canonicalize(path).unwrap().display()
-        ),
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-    )
-    .unwrap();
+    let fixture = open_fixture("fixtures/baseline/canary-rich.db");
     let dir = tempfile::tempdir().unwrap();
     let sqlite = db::open(dir.path().join("grid.db").to_str().unwrap())
         .await
         .unwrap();
     let (_scratch, url) = backend::scratch_schema().await;
-    let pg = db::open_with(
-        &backend::pg_config(&url, Role::All),
-        tokio::sync::watch::channel(Status::starting(Role::All)).0,
-    )
-    .await
-    .unwrap();
+    let pg = backend::open(&backend::pg_config(&url, Role::All)).await;
 
     load(&sqlite, &fixture).await;
     load(&pg, &fixture).await;
@@ -572,9 +551,10 @@ fn agree(a: &Value, b: &Value) -> bool {
 /// agrees even across a rounding boundary, and nothing else is loosened.
 #[test]
 fn stats_agree_within_a_relative_1e_9() {
-    let sqlite = stats(&json!({"gas_util_pct": 1.00000000049, "total_blocks": 5, "updated_at": 1}));
+    let sqlite =
+        without_clock(json!({"gas_util_pct": 1.00000000049, "total_blocks": 5, "updated_at": 1}));
     let pg = |gas: f64, blocks: i64| {
-        stats(&json!({"gas_util_pct": gas, "total_blocks": blocks, "updated_at": 2}))
+        without_clock(json!({"gas_util_pct": gas, "total_blocks": blocks, "updated_at": 2}))
     };
     // 2e-11 apart, but either side of the tenth significant digit.
     assert!(agree(&sqlite, &pg(1.00000000051, 5)));

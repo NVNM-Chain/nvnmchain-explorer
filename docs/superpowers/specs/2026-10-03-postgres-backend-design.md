@@ -1,6 +1,6 @@
 # Phase 3: Postgres as a second permanent backend
 
-Status: draft, awaiting review
+Status: implemented
 Date: 2026-10-03
 Follows: `2026-10-01-db-boundary-design.md` (phase 1) and
 `2026-10-02-schema-two-dialects-design.md` (phase 2)
@@ -203,11 +203,11 @@ becomes the fallback.
 | `src/db/indexer_jobs.rs`, `src/db/schema_check.rs`        | Unchanged paths, loaded through `#[path]` from `sqlite.rs`                                                                                                                                                                                                                                                             | section 4        |
 | `src/db/sqlite/migrate.rs`                                | SQLite runner (v1 = `init_db`), shape hash, `init_db` pins, commute guard                                                                                                                                                                                                                                              | ~160             |
 | `src/db/sqlite/extra.rs`                                  | New SQLite queries, which never edit existing ones (e.g. `tokens_missing_metadata`)                                                                                                                                                                                                                                    | ~40              |
-| `src/db/migrations.rs`                                    | Shared version list (`include_str!` of both dialects), header parsing, checksums, the web schema gate                                                                                                                                                                                                                  | ~150             |
+| `src/db/migrations.rs`                                    | Shared version list (`include_str!` of both dialects), checksums, the applied-version checks, the web schema gate                                                                                                                                                                                                      | ~150             |
 | `src/db/pg/mod.rs`                                        | `PgDb`, pools, the version floor, session settings, `DbError` and its classifier, `DB_FAILED`, preflight                                                                                                                                                                                                               | ~350             |
 | `src/db/pg/writer.rs`                                     | Candidate loop, lock and self-checks, spawned and cancel-safe `with_txn`, budgets, watchdog, lease, `writer_seq`, leadership watch                                                                                                                                                                                     | ~380             |
-| `src/db/pg/q.rs`                                          | `query_rows`, `try_query_rows`, `query_opt`, `try_query_opt`, `query_count`, `fetch_one`, `fetch_all`, `exec`, `exec_best_effort`, all with client deadlines; statement counter                                                                                                                                        | ~170             |
-| `src/db/pg/shared.rs`                                     | Copies of `hex_blob`, `blob_hex`, `blob_addr`, `bigint`; column-list macros; the `HOLDING` text                                                                                                                                                                                                                        | ~70              |
+| `src/db/pg/q.rs`                                          | `query_rows`, `try_query_rows`, `query_opt`, `try_query_opt`, `query_count`, `exec_best_effort`, and the writer's `run`, `exec`, `fetch_all` and `raw`, all with client deadlines; statement counter                                                                                                                   | ~170             |
+| `src/db/pg/shared.rs`                                     | Re-exports of `sqlite.rs`'s `hex_blob`, `blob_hex`, `blob_addr`, `bigint`; column-list macros; the `HOLDING` text                                                                                                                                                                                                      | ~70              |
 | `src/db/pg/{blocks,txs,tokens,transfers,kv,selectors}.rs` | Read SQL and row mappers                                                                                                                                                                                                                                                                                               | ~1,200           |
 | `src/db/pg/plan.rs`                                       | Pure batch planner: dedup, net balance deltas, holder deltas. Dropped if stage 4b falls back to the per-row writer                                                                                                                                                                                                     | ~200             |
 | `src/db/pg/{write,jobs,migrate}.rs`                       | Set-based writes, jobs, the Postgres runner and grants                                                                                                                                                                                                                                                                 | ~900             |
@@ -334,7 +334,7 @@ The hand-written wrappers name their twins too, so the same holds for them.
 | `keepalive` (new)                                                                                                    | Postgres: `SELECT 1` on the writer session, bounded to 5 s. SQLite: nothing                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `token_label(db, addr) -> Option<String>` (new, sync)                                                                | Reads the label cache. Used by the Tera `address_label` function (`web.rs:2284-2290`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `take_tokens_without_metadata(db) -> Vec<String>` (new, sync)                                                        | In memory, not a `db_fn!` entry. Drains the addresses the bundle wrappers noted, for the missing-metadata job (section 6). An address with an empty-label cache entry counts as known, so this is not `token_label(..).is_none()`                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| `#[doc(hidden)] pub use sqlite::{init_db, counter, get_block_timestamp, rebuild_token_balances, sync_holder_counts}` | Sync, SQLite-only test hooks, unchanged                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `#[doc(hidden)] pub use sqlite::{init_db, counter, get_block_timestamp, sync_holder_counts}`                         | Sync, SQLite-only test hooks, unchanged                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `pub fn lock(db: &Db) -> MutexGuard<'_, Connection>`                                                                 | Same text. SQLite: `sqlite::lock(s)`. Postgres: panics "SQLite-only test hook"                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 
 **The 7 `db::lock` call sites in tests stay byte-identical**
@@ -450,7 +450,7 @@ lock:
 ```rust
 pub(crate) async fn save_block_bundles(p: &PgDb, bundles: &[BlockBundle]) -> Result<()> {
     if bundles.is_empty() { return Ok(()); }
-    let plan = Arc::new(plan::BatchPlan::new(bundles)); // blocks/txs/tokens last-wins; transfers/anchoring first-wins
+    let plan = Arc::new(plan::BatchPlan::new(bundles)); // blocks/txs/tokens last-wins; transfers first-wins; anchoring repeats left to DO NOTHING
     p.writer()?.write(Budget::Batch, move |c| { let plan = plan.clone(); Box::pin(async move {
         let (new_txs, stored): (i64, i64) = q::fetch_one(c, "probe", PROBE, plan.probe_binds()).await?;
         q::exec(c, "blocks", UPSERT_BLOCKS, plan.block_binds()).await?;
@@ -459,8 +459,9 @@ pub(crate) async fn save_block_bundles(p: &PgDb, bundles: &[BlockBundle]) -> Res
         let fresh: Vec<(i64, i64)> = q::fetch_all(c, "transfers", INSERT_TRANSFERS, plan.transfer_binds()).await?;
         q::exec(c, "anchoring", INSERT_ANCHORING, plan.anchoring_binds()).await?;
         q::exec(c, "tokens", UPSERT_TOKENS, plan.token_binds()).await?;   // metadata before balances
-        let old = q::fetch_all(c, "balances", READ_BALANCES, plan.balance_keys(&fresh)).await?;
-        let out = plan.apply(&fresh, old);  // same rule as adjust_balance (db.rs:1169-1206); 0 ⇒ delete
+        let net = plan.net(&fresh);
+        let old = q::fetch_all(c, "balances", READ_BALANCES, net.keys()).await?;
+        let out = plan::apply_deltas(net, &old);  // same rule as adjust_balance (db.rs:1169-1206); 0 ⇒ delete
         q::exec(c, "upsert_bal", UPSERT_BALANCES, out.upserts()).await?;
         q::exec(c, "delete_bal", DELETE_BALANCES, out.deletes()).await?;
         q::exec(c, "holders", BUMP_HOLDERS, out.holder_deltas()).await?;
@@ -590,9 +591,9 @@ blocking pool.
 `try_all_token_metas`, so existing bodies are never edited. `db_fn!`'s
 `extra` marker calls them.
 
-**Postgres copies the helpers it needs** into `pg/shared.rs` (about 30
-lines), instead of widening their visibility in `sqlite.rs`. The parity
-grid proves the copies agree.
+**Postgres reuses the helpers it needs.** `pg/shared.rs` re-exports
+`hex_blob`, `blob_hex`, `blob_addr` and `bigint`, which are `pub(crate)` in
+`sqlite.rs`; their bodies are unchanged.
 
 ## 5. Migrations on both backends
 
@@ -617,30 +618,14 @@ grid proves the copies agree.
 - **From 0002 on, every version is a twin pair**
   (`migrations/sqlite/NNNN_name.sql` and `migrations/postgres/NNNN_name.sql`),
   with the same number and name.
-- **Headers:**
-  - `-- kind: expand|contract`: required, and equal in both twins.
-  - `-- no-transaction`: Postgres only (rules below).
-  - `-- noop: sqlite-only` or `-- noop: postgres-only`: for a backend with
-    nothing to do.
-- **A header test checks:** contiguous, unique versions, twin pairing,
-  matching kinds and well-formed headers. It also enforces the
-  no-transaction rules and forbids, in transactional Postgres files,
-  `DROP INDEX` without `CONCURRENTLY` and `CREATE INDEX` without
-  `CONCURRENTLY` on `transactions` and `transfer_events`.
-- **It checks the bodies of `expand` files** in both dialects, so `kind`
-  means something:
-  - an expand file may not contain `DROP TABLE`, `DROP COLUMN`, `RENAME`,
-    `SET NOT NULL`, `ALTER COLUMN`, `TRUNCATE` or `DELETE FROM`;
-  - it may use `ADD CONSTRAINT`, `UNIQUE`, `CHECK` or `REFERENCES` only on
-    a table the same file creates, in its `CREATE TABLE` or in a
-    `CREATE [UNIQUE] INDEX` on it;
-  - it may not `DROP INDEX x` unless the same file then re-creates `x`;
-  - the check matches whole keywords and skips `--` comment lines.
-
-  These operations must therefore be labelled `contract`, and so follow
-  the contract rule in "Version skew and deploy order" below: a contract
-  ships one release after the code stops using the object, and its PR
-  names that release.
+- **A list test checks** contiguous, unique versions, and that every file
+  on disk is in the list. The `migrations!` macro pairs the twins: a missing
+  file does not compile.
+- **No headers.** Files are plain SQL; a twin with nothing to do is empty.
+  Stage 2 shipped `-- kind: expand|contract` with an expand-body check,
+  `-- noop:` and `-- no-transaction` headers. No migration used them, so they
+  were dropped; the expand/contract rule is left to review ("Version skew and
+  deploy order" below).
 
 **Table** (the same on both backends, with INTEGER types on SQLite):
 
@@ -657,7 +642,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 ### Checksums and immutability
 
 - **Checksum of a file:** sha3-256 of its `include_str!` text, with CRLF
-  normalized, computed when the process starts.
+  normalized, computed when the runner or the preflight checks it.
 - **SQLite v1's checksum:** the constant `BASELINE_SHA3`. It is the sha3 of
   `SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name`
   over `init_db(":memory:")`.
@@ -687,7 +672,7 @@ numbers:
   allowed: the CI immutability step protects only files already on the
   base branch.
 - **NVNM-Chain's `main` requires a PR to be up to date before it merges,**
-  with the header test as a required check, so that test always runs
+  with the list test as a required check, so that test always runs
   against the latest numbers. Without it, two PRs that each add a `0003`
   under different names pass their own CI and clash only on `main`, where
   `docker.yml` has already built an image from the clash. Today the org
@@ -762,9 +747,9 @@ A guard test checks every N: temp file → `init_db` → 0002..N → hash →
 
 | Change                                 | SQLite twin                                                                                                                                                                                                                    | Postgres twin                                                                                                                                                                                                                       |
 |----------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| New table, column or index             | As usual. `init_db`'s `IF NOT EXISTS` ignores objects it does not know                                                                                                                                                         | As usual. A new index is a no-transaction CIC file                                                                                                                                                                                  |
-| Re-keyed index: two releases, new name | **Expand N:** `CREATE INDEX x_v2 ON t(new key)`; queries move to the new key. **Contract N+1:** `DROP INDEX x; CREATE INDEX x ON t(col) WHERE 0` (an empty stub that costs nothing per insert, and that `IF NOT EXISTS` skips) | **Expand N:** no-transaction `DROP INDEX CONCURRENTLY IF EXISTS x_v2; CREATE INDEX CONCURRENTLY x_v2 …`. **Contract N+1:** no-transaction `DROP INDEX CONCURRENTLY IF EXISTS x`. Postgres never has a window without a usable index |
-| Retired index                          | The stub, as above                                                                                                                                                                                                             | `DROP INDEX CONCURRENTLY IF EXISTS x`                                                                                                                                                                                               |
+| New table, column or index             | As usual. `init_db`'s `IF NOT EXISTS` ignores objects it does not know                                                                                                                                                         | As usual, in one transaction                                                                                                                                                                                                        |
+| Re-keyed index: two releases, new name | **Expand N:** `CREATE INDEX x_v2 ON t(new key)`; queries move to the new key. **Contract N+1:** `DROP INDEX x; CREATE INDEX x ON t(col) WHERE 0` (an empty stub that costs nothing per insert, and that `IF NOT EXISTS` skips) | **Expand N:** `CREATE INDEX x_v2 ON t(new key)`. **Contract N+1:** `DROP INDEX x`. Postgres never has a window without a usable index                                                                                               |
+| Retired index                          | The stub, as above                                                                                                                                                                                                             | `DROP INDEX x`                                                                                                                                                                                                                      |
 | Re-keyed derived table                 | `DROP TABLE t; CREATE TABLE t (…)`, recreate `init_db`'s index names on it (stubs where needed), and `DELETE FROM kv WHERE key = '…'` for its watermark                                                                        | The same, in one transaction                                                                                                                                                                                                        |
 | Retired table                          | `DELETE FROM t`, plus stub indexes                                                                                                                                                                                             | `DROP TABLE t`                                                                                                                                                                                                                      |
 
@@ -793,46 +778,32 @@ runner, since a newer release may have migrated while it waited:
   unknown. The remedy is the same;
 - a checksum mismatch;
 - D > B. There is no override: rolling back across a migration means
-  rolling forward;
-- an index left INVALID, where `pg_index.indisvalid = false`. Two kinds
-  are excluded:
-  - indexes named `%_ccnew` and `%_ccold`, so a DBA's
-    `REINDEX CONCURRENTLY` cannot block a start;
-  - indexes created by a `-- no-transaction` file whose version is not yet
-    in `schema_migrations`. The preflight reads their names from the file's
-    `CREATE INDEX CONCURRENTLY` lines, which the header test constrains. A
-    restart during that file's CREATE leaves its index INVALID, and the
-    runner drops and rebuilds it when it re-runs the file. Refusing it
-    would stop the indexer from ever reaching that re-run.
+  rolling forward.
 
-**Transactional files** run as:
+Stage 4a also refused an index left INVALID. Only an interrupted concurrent
+build leaves one, which no migration runs any more (below), so the refusal
+was dropped with the no-transaction files.
+
+**Every file** runs as one transaction:
 
 1. `BEGIN; SET LOCAL statement_timeout = 0; SET LOCAL lock_timeout = '5s'`;
 2. the body;
 3. the version row;
 4. `COMMIT`.
 
-A `55P03` (lock timeout) is retried up to 5 times.
+Any failure, a `55P03` (lock timeout) included, is `Unavailable`: the
+writer drops the session and runs the preflight and the runner again on a
+new one, backing off from 1 s to 30 s between tries. The rolled-back file
+re-runs from the top.
 
-**`-- no-transaction` files:**
-
-- **Allowed statements:** only `DROP INDEX CONCURRENTLY IF EXISTS …` and
-  `CREATE [UNIQUE] INDEX CONCURRENTLY …`. Every `CREATE … CONCURRENTLY x`
-  must come after a `DROP INDEX CONCURRENTLY IF EXISTS x` in the same
-  file. Never write `IF NOT EXISTS`, because it would hide an INVALID index.
-- **How the runner executes them:**
-  1. On the writer session, outside `with_txn`, it sets
-     `SET statement_timeout = 0` and `SET lock_timeout = '5s'`.
-  2. It runs each statement as its own autocommit `execute`, split at a `;`
-     at line end, with no `$$` bodies. One multi-statement query would form
-     an implicit transaction block, which `CONCURRENTLY` refuses.
-  3. It inserts the version row only after the last statement succeeds.
-  4. It `RESET`s both settings.
-- **Supervision:** the `Long` watchdog, with no client timeout.
-- **Recovery:** re-running the file after any interruption restarts from
-  its DROP. That covers a kill during the CREATE, and a crash after the
-  CREATE but before the row is written. A `55P03` or `57014` is retried by
-  re-running the whole file.
+**No concurrent index builds.** Stage 4a also ran `-- no-transaction` files
+of `CREATE INDEX CONCURRENTLY`, a statement at a time. No migration used
+them, so they were dropped; they come back with the first migration that
+needs one. A plain `CREATE INDEX` blocks writes to its table but not reads,
+so web replicas keep serving while it builds, and the writer runs no chain
+writes until the runner finishes. A file must never pair a long index
+build with a statement that takes `ACCESS EXCLUSIVE` (`DROP INDEX`,
+`ALTER TABLE`, …), which would block reads for the whole build.
 
 **Grants.** After migrations, the runner re-applies the web role's grants
 on every start. GRANT is idempotent, so this also restores grants lost when
@@ -851,9 +822,9 @@ database-wide, and it returns without unlocking on error
 | Indexer | D > B                  | refuses at preflight |
 | Web     | any                    | ready when D ≥ B     |
 
-- **What `expand` allows** is what the expand-body check lets through
-  (section 5, "The model"). A new column must also be nullable or have a
-  default. The check cannot see that, so the PR review does.
+- **What `expand` allows** is decided in PR review: it adds, and a new
+  column is nullable or has a default. Anything that removes or rewrites
+  what the code uses is a contract.
 - **When a `contract` ships.** One release after the code stops using the
   object, and the PR names that release. The previous release's web
   replicas then never touch what the contract removes. A re-keyed derived
@@ -898,7 +869,7 @@ Each connection carries its own settings in its startup `options` (sent as
 
 | Connection      | Used by                                    | Settings                                                                                                                                                                                                                                                                                                                    |
 |-----------------|--------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `read: PgPool`  | `all`; web (max 8); indexer (max 4); min 1 | `acquire_timeout` 3 s (sqlx default 30 s). `test_before_acquire(false)`, since the default pings on every acquire. `idle_timeout` 5 min. `statement_timeout=5s`, `idle_session_timeout=0`, `default_transaction_read_only=on`, `idle_in_transaction_session_timeout=10s`, `application_name=explorer-<role>/<sha>/b<B>`     |
+| `read: PgPool`  | `all`; web (max 8); indexer (max 4); min 1 | `acquire_timeout` 3 s (sqlx default 30 s). `test_before_acquire(false)`, since the default pings on every acquire. `idle_timeout` 5 min. `statement_timeout=5s`, `idle_session_timeout=0`, `default_transaction_read_only=on`, `idle_in_transaction_session_timeout=10s`, `application_name=explorer-<role>/<version>/b<B>` |
 | `cache: PgPool` | `all`, web (max 2)                         | `statement_timeout=2s`, `idle_session_timeout=0`, `idle_in_transaction_session_timeout=5s`                                                                                                                                                                                                                                  |
 | **Writer**      | `all`, indexer                             | **One owned `PgConnection`, never pooled**, in `tokio::sync::Mutex<Option<PgConnection>>`. `statement_timeout=60s`, `lock_timeout=5s`, `idle_session_timeout=30s`, `idle_in_transaction_session_timeout=30s`, `tcp_keepalives_idle/interval/count=10/5/3`, `tcp_user_timeout=20000`, `client_connection_check_interval=10s` |
 
@@ -948,7 +919,7 @@ re-derivable and `writer_seq` catches a lost suffix.
 ```mermaid
 stateDiagram-v2
     [*] --> Preflight: open_with (ROLE=indexer or all)
-    Preflight --> Candidate: schema, no gaps, checksums, D ≤ B, indexes valid
+    Preflight --> Candidate: schema, no gaps, checksums, D ≤ B
     Preflight --> [*]: refuse (exit 1, never Ready)
     Candidate --> Candidate: try_lock false, retry every 5 s on the same session
     Candidate --> Leader: try_lock true, self-checks, preflight, migrate, grants
@@ -972,9 +943,9 @@ runs `SELECT pg_try_advisory_lock(K1, K_WRITER)` (5 s timeout).
   preflight; a grant that fails for any reason but a missing role is
   `Unavailable`. The self-checks are:
   - `SELECT NOT pg_is_in_recovery()`. A replica, such as the Kubernetes
-    `-ro` Service or a read-replica address, is treated as `Unavailable`.
-    If it is still in recovery after the 120 s window, the process exits
-    with a message naming that likely misconfiguration;
+    `-ro` Service or a read-replica address, is a misconfiguration that
+    waiting cannot fix: the process exits with code 1 at once, with a
+    message naming it;
   - `pg_locks` holds exactly one granted advisory row with
     `pid = pg_backend_pid()` and `objsubid = 2`.
 
@@ -995,7 +966,10 @@ runs `SELECT pg_try_advisory_lock(K1, K_WRITER)` (5 s timeout).
 pub async fn write<T: Send + 'static>(&self, budget: Budget, f: impl TxFn<T>) -> Result<T, DbError> {
     let this = self.clone();
     // A dropped caller only drops the JoinHandle: the transaction runs to completion.
-    tokio::spawn(async move { this.write_retrying(budget, f).await }).await.map_err(DbError::from)?
+    match tokio::spawn(async move { this.write_retrying(budget, f).await }).await {
+        Ok(r) => r,
+        Err(e) => std::panic::resume_unwind(e.into_panic()), // never cancelled: nothing aborts it
+    }
 }
 
 // inside write_retrying, per attempt:
@@ -1039,7 +1013,7 @@ match &r {
 | Budget  | Used for                                                                             | Limits                                                                                                                                                                                                              |
 |---------|--------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `Batch` | Normal writes                                                                        | Each statement gets a client timeout of `statement_timeout + 10 s` = 70 s, so the server cancels first and the error is clean                                                                                       |
-| `Long`  | Migrations (including no-transaction files), repairs, rebuilds, `sync_holder_counts` | `statement_timeout = 0` and no client timeout. A watchdog checks every 15 s, from the read pool and with a 5 s deadline, that `pg_locks` still shows the writer pid holding `K_WRITER`. Four misses cancel the work |
+| `Long`  | Migrations, repairs, rebuilds, `sync_holder_counts`                                  | `statement_timeout = 0` and no client timeout. A watchdog checks every 15 s, from the read pool and with a 5 s deadline, that `pg_locks` still shows the writer pid holding `K_WRITER`. Four misses cancel the work |
 
 **Error classes.** `Unavailable` is the default; only `Data` reaches the
 caller.
@@ -1047,8 +1021,7 @@ caller.
 | Condition                                                                                                                                                                                                                                        | Class         | What happens                                                                                                                                                                                                                                   |
 |--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | SQLSTATE classes `22` and `23`, `21000` (cardinality violation), sqlx `Error::Encode`                                                                                                                                                            | `Data`        | Returned to the caller. These depend on a bundle's content, so `indexer.rs:1024-1036`'s per-bundle fallback isolates the bad bundle                                                                                                            |
-| `40001`, `40P01`                                                                                                                                                                                                                                 | Retry         | Retried immediately                                                                                                                                                                                                                            |
-| **Everything else:** `08*`, `57P0x`, `55P03`, `57014` (escalates once to `Long`), `25006`, classes `42`, `53`, `54`, `58`, `XX`, I/O errors, pool and client timeouts, and every other sqlx error (`Protocol`, `Tls`, `Decode`, `PoolClosed`, …) | `Unavailable` | `Writer::write` drops the session and retries the same idempotent batch, with backoff from 1 s to 30 s. It logs a warning with the SQLSTATE on each retry, and an error after 10 identical failures. It never returns this class to the caller |
+| **Everything else:** `08*`, `57P0x`, `55P03`, `57014` (escalates once to `Long`), `25006`, classes `42`, `53`, `54`, `58`, `XX`, I/O errors, pool and client timeouts, and every other sqlx error (`Protocol`, `Tls`, `Decode`, `PoolClosed`, …) | `Unavailable` | `Writer::write` drops the session and retries the same idempotent batch, with backoff from 1 s to 30 s. It logs a warning with the SQLSTATE on each retry. It never returns this class to the caller                                           |
 
 A database problem, such as a timeout, a full disk, a missing privilege or
 a restart, therefore never drops blocks. Dropped blocks would be a
@@ -1223,8 +1196,10 @@ alone still opens the file.
   with a credential-free `PG_TEST_URL` and the variables set.
 
 **Telling a Postgres URL from a SQLite path.** One function,
-`DbTarget::parse`, classifies the argument of `open` and the value of
-`DATABASE_URL`. `DB_PATH` is always a file path and is never classified.
+`DbTarget::parse`, classifies the value of `DATABASE_URL`. `DB_PATH` is
+always a file path and is never classified, and so is the argument of
+`db::open`, which opens SQLite only; tests open Postgres through `open_with`
+and a `DbConfig`.
 
 - **`postgres://…` or `postgresql://…`** is Postgres, as given.
 - **No scheme, in the form `[user[:password]@]host:port[/dbname][?params]`,**
@@ -1372,8 +1347,8 @@ flowchart LR
   credentials never leave it Ready. A preflight refusal (section 5) exits
   non-zero, so a broken image never replaces a working leader.
 - **Web startup.** `open_with` builds its pools lazily and never fails
-  because Postgres is unreachable. A background task evaluates the schema
-  gate.
+  because Postgres is unreachable. The follower evaluates the schema gate
+  from its first successful tick.
 - **`/readyz`.** It reports
   `{role, schema: {db, binary}, writer, preflight}`, plus `sync`
   on the indexer (section 10), from a status `watch` created before
@@ -1381,8 +1356,7 @@ flowchart LR
   when:
   - **indexer:** the preflight passed, whether the writer is a candidate,
     leader or reacquiring. Sync progress never affects readiness;
-  - **web:** the schema gate (D ≥ B) passed, and no shutdown signal has
-    arrived.
+  - **web:** the schema gate (D ≥ B) passed.
 
   Database health shows in the JSON body and in metrics. Pool exhaustion
   and outages are handled by the 503 middleware, not by readiness.
@@ -1552,10 +1526,10 @@ Under `ROLE=web`, `src/follow.rs` runs one task on the read pool:
 - **Rollout.** The three `temp_db` helpers (`decoder.rs:13`, `pages.rs:27`,
   `live_rpc.rs:19`) switch to the shared one in stage 1, SQLite only, and
   gain Postgres in stage 4c.
-- **SQLite-only tests.** The 7 `db::lock` tests stay SQLite-only: the
-  `TEST_DB=postgres` job skips them by name, from a `--skip` list in
-  `postgres.yml`, so the test files need no edit. Tests that call `db::open`
-  with a file path, or `init_db` directly, stay on SQLite by construction.
+- **SQLite-only tests.** The `db::lock` tests in decoder open SQLite with
+  `db::open` and a file path, and the tests that call `init_db` directly
+  stay on SQLite too, so the `TEST_DB=postgres` job runs every test in its
+  suites.
 - **Backend-neutral rebuild.** The rebuild step of
   `pages.rs::a_genesis_balance_counts_once` gets a backend-neutral copy.
 
@@ -1606,12 +1580,7 @@ which serves as the reference, and through `BatchPlan`. Balances and
 - both canaries adopted with their rows intact;
 - checksum refusal, and D > B refusal by the preflight before `try_lock`;
 - per-version shape parity, and a per-version data upgrade;
-- a no-transaction file killed during the CREATE, and again between the
-  CREATE and the row insert, then re-run successfully with
-  `indisvalid = true`. The kill takes down the whole process, so each
-  re-run goes through a fresh start and its preflight;
-- the invalid-index refusal, the header rules including the expand-body
-  check, and the web gate (D ≥ B);
+- the list test, and the web gate (D ≥ B);
 - an unversioned Postgres schema refused;
 - the web role's grants.
 
@@ -1759,7 +1728,8 @@ phase 3 makes stale:
 
 Before it merges, the reviewer checks that every variable in the
 configuration table is read by the code and every route in the routes table
-exists.
+exists. Since then, the README leaves the Postgres test commands and the
+migration details to `docs/database.md`.
 
 **Cutover: side by side** (decision 9)
 
@@ -1911,10 +1881,10 @@ backends always compile, so clippy always checks both.
 | Blocks lost on a database restart or error, or after a restore | `Unavailable` is the default class and is retried; `writer_seq` with run id and exit 4; fallible frontier reads; the container-restart and injected-error tests                                                                                                                                                                                                                                                 |
 | The database is a single point of failure (no HA)              | Pages return 503 with `Retry-After` while it is down, and no block is lost (section 6). If the data itself is lost, a re-index rebuilds it at the rate item 7 measures: at ~200 blocks/s, about 3 h for the ~2.3M blocks of 2026-10-05, plus about 15 min for each day the chain grows. Pages show partial history until backfill completes (section 10). HA can be added later with no code change (section 7) |
 | Orphan sessions holding the lock                               | The lease, `tcp_user_timeout`, `client_connection_check_interval`, terminating the recorded pid, and the watchdog                                                                                                                                                                                                                                                                                               |
-| A deploy deadlock, a broken image, or version skew             | Probes never wait on the lock; the indexer preflight gates readiness; the expand-body check and the one-release contract rule; indexer-first deploys                                                                                                                                                                                                                                                            |
+| A deploy deadlock, a broken image, or version skew             | Probes never wait on the lock; the indexer preflight gates readiness; the one-release contract rule, checked in review; indexer-first deploys                                                                                                                                                                                                                                                                   |
 | A divergence that only production data shows                   | Section 9's tests (replay, differential, the live canary re-index, the grid); the cutover's hole check and spot check; the current deployment kept for 7 days as the fallback                                                                                                                                                                                                                                   |
 | Teammates edit `init_db` or a merged migration                 | Pins A and B; the CI immutability step; runtime checksums                                                                                                                                                                                                                                                                                                                                                       |
-| Two repos assign the same migration number                     | Numbers are assigned on NVNM-Chain's `main` only, and other repos sync migrations from it (section 5); the header test as a required, up-to-date check; runtime checksums refuse a mismatch                                                                                                                                                                                                                     |
+| Two repos assign the same migration number                     | Numbers are assigned on NVNM-Chain's `main` only, and other repos sync migrations from it (section 5); the list test as a required, up-to-date check; runtime checksums refuse a mismatch                                                                                                                                                                                                                       |
 | The commute rule proves too restrictive                        | Stub patterns, two-release index changes, and the section 5 escape hatch                                                                                                                                                                                                                                                                                                                                        |
 | sqlx 0.9.0 is new                                              | Pinned to `=0.9.0`; MSRV 1.94                                                                                                                                                                                                                                                                                                                                                                                   |
 

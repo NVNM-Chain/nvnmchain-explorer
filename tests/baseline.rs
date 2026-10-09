@@ -32,11 +32,13 @@ use nvnmchain_explorer::indexer::fetch_block_bundle;
 use nvnmchain_explorer::models::BlockBundle;
 use nvnmchain_explorer::rpc::ChainRpc;
 use nvnmchain_explorer::tokens::balances_at_genesis;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 
 #[allow(dead_code)]
 mod common;
-use common::baseline::{columns, diff_rows, pg_rows, rows, tables, Rows, Spec, SPECS};
+use common::baseline::{
+    columns, diff_rows, fixture_paths, open_fixture, pg_rows, rows, tables, Rows, Spec, SPECS,
+};
 
 #[path = "common/backend.rs"]
 mod backend;
@@ -79,15 +81,6 @@ fn rpc() -> ChainRpc {
 /// The one line that differs between builds: how a database is opened.
 async fn open_db(path: &str) -> Db {
     db::open(path).await.expect("open database")
-}
-
-fn open_baseline(path: &str) -> Connection {
-    let abs = std::fs::canonicalize(path).unwrap_or_else(|e| panic!("baseline {path}: {e}"));
-    Connection::open_with_flags(
-        format!("file:{}?immutable=1", abs.display()),
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-    )
-    .unwrap_or_else(|e| panic!("open baseline {path}: {e}"))
 }
 
 /// The contiguous runs of block numbers a database holds.
@@ -293,16 +286,10 @@ fn baselines() -> Vec<String> {
             .map(String::from)
             .collect();
     }
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/baseline");
-    let mut found: Vec<String> = std::fs::read_dir(&dir)
-        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
-        .map(|entry| entry.unwrap().path())
-        .filter(|p| p.extension().is_some_and(|e| e == "db"))
+    fixture_paths()
+        .iter()
         .map(|p| p.display().to_string())
-        .collect();
-    found.sort();
-    assert!(!found.is_empty(), "no baselines under {}", dir.display());
-    found
+        .collect()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -310,19 +297,14 @@ async fn reindexing_reproduces_each_baseline() {
     let rpc = rpc();
     let mut failed = Vec::new();
     for path in &baselines() {
-        let baseline = open_baseline(path);
+        let baseline = open_fixture(path);
         let runs = block_runs(&baseline);
         assert!(!runs.is_empty(), "{path}: no blocks to re-index");
         eprintln!("{path}: re-indexing {runs:?}");
 
         let (mut fresh, _guard) = if backend::on_postgres() {
             let (scratch, url) = backend::scratch_schema().await;
-            let db = db::open_with(
-                &backend::pg_config(&url, db::Role::All),
-                tokio::sync::watch::channel(db::Status::starting(db::Role::All)).0,
-            )
-            .await
-            .expect("open Postgres");
+            let db = backend::open(&backend::pg_config(&url, db::Role::All)).await;
             let worst = reindex(&rpc, &db, &runs).await;
             eprintln!("  at most {worst} round trip(s) per batch");
             assert!(

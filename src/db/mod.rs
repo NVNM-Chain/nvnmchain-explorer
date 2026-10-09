@@ -28,14 +28,12 @@ pub(crate) mod pg;
 mod sqlite;
 mod status;
 
-pub use config::{DbConfig, DbTarget, DbUrl, PasswordSource, Role, Tuning};
+pub use config::{DbConfig, DbTarget, DbUrl, Role, Tuning};
 pub use pg::DbError;
 pub use status::{Preflight, SchemaVersions, Status, Sync, WriterState};
 
 #[doc(hidden)]
-pub use sqlite::{
-    counter, get_block_timestamp, init_db, rebuild_token_balances, sync_holder_counts,
-};
+pub use sqlite::{counter, get_block_timestamp, init_db, sync_holder_counts};
 pub use sqlite::{now_ts, page_offset, Holder, TxColumns};
 
 /// The explorer's database. Cheap to clone; every clone shares one backend.
@@ -55,14 +53,10 @@ enum Backend {
     Postgres(Box<pg::PgDb>),
 }
 
-/// Open a database as `ROLE=all` and bring its schema up to date. A Postgres
-/// URL, with or without its scheme (`localhost:5432` counts), picks Postgres;
-/// anything else is a SQLite path, created if needed.
-pub async fn open(path_or_url: &str) -> Result<Db> {
-    let cfg = match DbTarget::parse(path_or_url)? {
-        DbTarget::Sqlite(path) => DbConfig::sqlite(&path),
-        DbTarget::Postgres(url) => DbConfig::postgres(url, Role::All),
-    };
+/// Open a SQLite file as `ROLE=all`, created if needed, and bring its schema
+/// up to date.
+pub async fn open(path: &str) -> Result<Db> {
+    let cfg = DbConfig::sqlite(path);
     open_with(&cfg, watch::channel(Status::starting(Role::All)).0).await
 }
 
@@ -77,12 +71,6 @@ pub async fn open(path_or_url: &str) -> Result<Db> {
 pub async fn open_with(cfg: &DbConfig, status: watch::Sender<Status>) -> Result<Db> {
     let backend = match &cfg.target {
         DbTarget::Sqlite(path) => {
-            if cfg.role != Role::All {
-                bail!(
-                    "ROLE={} needs Postgres; a SQLite file runs as ROLE=all",
-                    cfg.role
-                );
-            }
             let s = sqlite::open(path)?;
             // A file opens only once it is at this binary's version.
             status.send_modify(|s| s.schema.db = Some(migrations::binary_version()));
@@ -96,7 +84,7 @@ pub async fn open_with(cfg: &DbConfig, status: watch::Sender<Status>) -> Result<
         status,
         role: cfg.role,
     }));
-    if !seed_labels(&db).await {
+    if !reload_labels(&db).await {
         // Every later label change goes through this process's own writes, so
         // the seed is retried only until it lands.
         tokio::spawn(reseed_until_ok(Arc::downgrade(&db.0), true));
@@ -114,9 +102,10 @@ pub async fn open_with(cfg: &DbConfig, status: watch::Sender<Status>) -> Result<
     Ok(db)
 }
 
-/// Merge every stored token's label into the cache. On an error the cache is
-/// left as it was, and this says so.
-async fn seed_labels(db: &Db) -> bool {
+/// Merge every stored token's label into the cache: the seed at open, and
+/// what a web replica's follower calls to see the indexer's inserts and
+/// repairs. On an error the cache is left as it was, and this says so.
+pub async fn reload_labels(db: &Db) -> bool {
     match try_all_token_metas(db).await {
         Ok(rows) => {
             db.0.labels.merge(&rows);
@@ -129,12 +118,6 @@ async fn seed_labels(db: &Db) -> bool {
     }
 }
 
-/// Re-read every label, merging; what a web replica's follower calls to see
-/// the indexer's inserts and repairs.
-pub async fn reload_labels(db: &Db) -> bool {
-    seed_labels(db).await
-}
-
 const LABEL_RETRY: Duration = Duration::from_secs(30);
 
 async fn reseed_until_ok(weak: Weak<Inner>, wait_first: bool) {
@@ -145,7 +128,7 @@ async fn reseed_until_ok(weak: Weak<Inner>, wait_first: bool) {
         }
         wait = true;
         let Some(inner) = weak.upgrade() else { return };
-        if seed_labels(&Db(inner)).await {
+        if reload_labels(&Db(inner)).await {
             return;
         }
     }
@@ -406,7 +389,24 @@ pub async fn save_block_bundles(db: &Db, bundles: &[BlockBundle]) -> Result<()> 
             db.0.labels.committed(bundles);
             Ok(())
         }
-        Backend::Postgres(_) => save_and_label(db, bundles.to_vec()).await,
+        // A batch commits on in the writer's spawned task when its caller is
+        // dropped, so the label update runs in a task of its own that waits
+        // for the commit, as `save_token_metadata`'s does.
+        Backend::Postgres(_) => {
+            let (db, bundles) = (db.clone(), bundles.to_vec());
+            let task = tokio::spawn(async move {
+                let Backend::Postgres(p) = &db.0.backend else {
+                    unreachable!()
+                };
+                pg::save_block_bundles(p, &bundles).await?;
+                db.0.labels.committed(&bundles);
+                anyhow::Ok(())
+            });
+            match task.await {
+                Ok(r) => r,
+                Err(e) => std::panic::resume_unwind(e.into_panic()),
+            }
+        }
     }
 }
 
@@ -414,33 +414,15 @@ pub async fn save_block_bundles(db: &Db, bundles: &[BlockBundle]) -> Result<()> 
 pub async fn save_block_bundle(db: &Db, bundle: &BlockBundle) -> Result<()> {
     #[cfg(feature = "db-coverage")]
     coverage::hit("save_block_bundle");
+    let one = std::slice::from_ref(bundle);
     match &db.0.backend {
         Backend::Sqlite(s) => {
             sqlite::save_block_bundle(s, bundle)?;
-            db.0.labels.committed(std::slice::from_ref(bundle));
+            db.0.labels.committed(one);
             Ok(())
         }
         // No singular twin: one bundle is a batch of one.
-        Backend::Postgres(_) => save_and_label(db, vec![bundle.clone()]).await,
-    }
-}
-
-/// The bundle saves on Postgres. A batch commits on in the writer's spawned
-/// task when its caller is dropped, so the label update runs in a task of its
-/// own that waits for the commit, as `save_token_metadata`'s does.
-async fn save_and_label(db: &Db, bundles: Vec<BlockBundle>) -> Result<()> {
-    let db = db.clone();
-    let task = tokio::spawn(async move {
-        let Backend::Postgres(p) = &db.0.backend else {
-            unreachable!()
-        };
-        pg::save_block_bundles(p, &bundles).await?;
-        db.0.labels.committed(&bundles);
-        anyhow::Ok(())
-    });
-    match task.await {
-        Ok(r) => r,
-        Err(e) => std::panic::resume_unwind(e.into_panic()),
+        Backend::Postgres(_) => save_block_bundles(db, one).await,
     }
 }
 

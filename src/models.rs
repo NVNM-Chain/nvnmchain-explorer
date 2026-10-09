@@ -43,6 +43,20 @@ pub fn block_event_json(block: &Block, txs: &[Transaction], tx_cap: usize) -> Js
     })
 }
 
+/// Live-feed events for a range read, oldest first: `blocks` as
+/// `get_blocks_in_range` returns them (newest first), and `txs` as
+/// `get_transactions_in_range` does (by block, then position).
+pub fn block_events<'a>(
+    blocks: &'a [Block],
+    txs: &'a [Transaction],
+) -> impl Iterator<Item = Json> + 'a {
+    blocks.iter().rev().map(move |block| {
+        let first = txs.partition_point(|t| t.block_number < block.number);
+        let past = txs.partition_point(|t| t.block_number <= block.number);
+        block_event_json(block, &txs[first..past], STREAM_TX_CAP)
+    })
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Block {
     pub number: i64,

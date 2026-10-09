@@ -65,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("bind {addr}"))?;
     info!("listening on http://{addr}");
     let pages: Arc<OnceLock<Router>> = Arc::new(OnceLock::new());
-    let mut app = web::health(status_rx, shutdown_rx.clone());
+    let mut app = web::health(status_rx);
     if role != Role::All {
         // In-cluster scraping only: `ROLE=all` runs where there is no Ingress
         // to keep /metrics private.

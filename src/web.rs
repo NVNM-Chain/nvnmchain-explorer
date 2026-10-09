@@ -866,15 +866,9 @@ async fn sse_step(
                 let txs =
                     db::get_transactions_in_range(&state.db, start, end, TxColumns::List).await;
                 // Oldest first, since the writer emits in number order.
-                for block in blocks.into_iter().rev() {
-                    let first = txs.partition_point(|t| t.block_number < block.number);
-                    let past = txs.partition_point(|t| t.block_number <= block.number);
-                    state.pending.push_back(crate::models::block_event_json(
-                        &block,
-                        &txs[first..past],
-                        crate::models::STREAM_TX_CAP,
-                    ));
-                }
+                state
+                    .pending
+                    .extend(crate::models::block_events(&blocks, &txs));
                 state.last_num = state.last_num.max(end);
                 if let Some(v) = state.pending.pop_front() {
                     return Some((sse_event(&v), state));
@@ -940,10 +934,7 @@ pub async fn block_page(
     let burnt = burnt_fees_wei(&block.base_fee, block.gas_used);
     // Looked up rather than inferred from the tip: the index has gaps while it
     // backfills, so a number below the tip is not necessarily there to link to.
-    let neighbour = |n: i64| {
-        let db = state.db.clone();
-        async move { db::get_block_by_number(&db, n).await }
-    };
+    let neighbour = |n: i64| db::get_block_by_number(&state.db, n);
     let below = if block.number > 0 {
         neighbour(block.number - 1).await
     } else {
@@ -2406,24 +2397,16 @@ pub fn format_time_ago(ts: i64) -> String {
 /// `/healthz` and `/readyz`, for an orchestrator's probes. Liveness never
 /// touches the database; readiness reads the status the database layer
 /// publishes and never takes a connection.
-pub fn health(status: watch::Receiver<db::Status>, shutdown: watch::Receiver<bool>) -> Router {
+pub fn health(status: watch::Receiver<db::Status>) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/readyz", get(readyz))
-        .with_state(HealthState { status, shutdown })
+        .with_state(status)
 }
 
-#[derive(Clone)]
-struct HealthState {
-    status: watch::Receiver<db::Status>,
-    shutdown: watch::Receiver<bool>,
-}
-
-async fn readyz(State(h): State<HealthState>) -> Response {
-    let status = h.status.borrow().clone();
-    // A replica on its way out stops taking new traffic.
-    let ready = status.ready() && !*h.shutdown.borrow();
-    let code = if ready {
+async fn readyz(State(status): State<watch::Receiver<db::Status>>) -> Response {
+    let status = status.borrow().clone();
+    let code = if status.ready() {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
@@ -2434,15 +2417,13 @@ async fn readyz(State(h): State<HealthState>) -> Response {
 /// Turn a response whose reads failed into a 503 with `Retry-After`, never a
 /// false 404 or an empty page, and time every page by its route.
 async fn database_guard(
-    matched: Option<axum::extract::MatchedPath>,
+    matched: axum::extract::MatchedPath,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
     let started = std::time::Instant::now();
     let (resp, failed) = db::track_failures(next.run(req)).await;
-    if let Some(route) = matched {
-        crate::metrics::request_duration(route.as_str(), started.elapsed().as_secs_f64());
-    }
+    crate::metrics::request_duration(matched.as_str(), started.elapsed().as_secs_f64());
     if !failed {
         return resp;
     }

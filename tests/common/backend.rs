@@ -17,7 +17,6 @@ use nvnmchain_explorer::db::{self, Db, DbConfig, DbUrl, Role, Status};
 use sqlx::{AssertSqlSafe, Connection, PgConnection};
 
 /// Keep this alive as long as the database is used.
-#[allow(dead_code)]
 pub enum TempDb {
     Sqlite(tempfile::TempDir),
     Postgres(Scratch),
@@ -135,19 +134,36 @@ pub fn pg_config(url: &str, role: Role) -> DbConfig {
     cfg
 }
 
+/// `cfg` opened, its status published to nobody.
+pub async fn open(cfg: &DbConfig) -> Db {
+    db::open_with(
+        cfg,
+        tokio::sync::watch::channel(Status::starting(cfg.role)).0,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("open: {e:#}"))
+}
+
+/// Run `sql`, one statement or several, on a connection of its own.
+pub async fn exec(url: &str, sql: &str) {
+    let mut conn = PgConnection::connect(url)
+        .await
+        .unwrap_or_else(|e| panic!("connect: {e}"));
+    sqlx::raw_sql(AssertSqlSafe(sql.to_string()))
+        .execute(&mut conn)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+}
+
 /// A fresh database for one test. Keep the guard alive for as long as the
 /// database is used; dropping it removes the database.
 pub async fn temp_db(name: &str) -> (TempDb, Db) {
     if on_postgres() {
         let (scratch, url) = scratch_schema().await;
-        let cfg = pg_config(&url, Role::All);
-        let db = db::open_with(
-            &cfg,
-            tokio::sync::watch::channel(Status::starting(Role::All)).0,
-        )
-        .await
-        .unwrap_or_else(|e| panic!("open {url}: {e:#}"));
-        return (TempDb::Postgres(scratch), db);
+        return (
+            TempDb::Postgres(scratch),
+            open(&pg_config(&url, Role::All)).await,
+        );
     }
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join(name);

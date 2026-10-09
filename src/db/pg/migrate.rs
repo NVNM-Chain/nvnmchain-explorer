@@ -7,12 +7,9 @@ use super::q;
 use super::DbError;
 use crate::db::config::is_identifier;
 use crate::db::migrations::{
-    binary_version, checksum, concurrent_indexes, first_gap, headers, postgres_checksums,
-    split_at_line_end, Migration, MIGRATIONS,
+    binary_version, check_applied, checksum, Migration, APPLIED_BY, MIGRATIONS,
 };
 use crate::db::now_ts;
-
-const APPLIED_BY: &str = concat!("nvnmchain-explorer ", env!("CARGO_PKG_VERSION"));
 
 pub(crate) enum PreflightError {
     /// The database is not one this binary may write: the process exits.
@@ -33,9 +30,7 @@ impl From<sqlx::Error> for PreflightError {
 /// - a schema with tables but no `schema_migrations`, i.e. applied by hand;
 /// - a version missing below the highest, i.e. rows edited by hand;
 /// - a migration whose file changed after it was applied;
-/// - a database newer than this binary (D > B);
-/// - an INVALID index, unless `REINDEX CONCURRENTLY` is building it or a
-///   pending no-transaction file will drop and rebuild it.
+/// - a database newer than this binary (D > B).
 pub(crate) async fn preflight(conn: &mut PgConnection) -> Result<(), PreflightError> {
     let row = sqlx::query(
         "SELECT to_regclass('schema_migrations') IS NOT NULL, \
@@ -60,56 +55,7 @@ pub(crate) async fn preflight(conn: &mut PgConnection) -> Result<(), PreflightEr
             .iter()
             .map(|r| Ok((r.try_get(0)?, r.try_get(1)?)))
             .collect::<Result<_, sqlx::Error>>()?;
-    if let Some((missing, found)) = first_gap(applied.iter().map(|(v, _)| *v)) {
-        return Err(PreflightError::Refused(anyhow!(
-            "schema_migrations has version {found} but not {missing}: its rows were edited by \
-             hand, so which files ran is unknown. Drop the schema and re-index from the chain"
-        )));
-    }
-    let binary = binary_version();
-    let db = applied.last().map_or(0, |(v, _)| *v);
-    if db > binary {
-        return Err(PreflightError::Refused(anyhow!(
-            "the database is at schema version {db}, newer than this binary's {binary}; \
-             deploy a release at version {db} or later (the only way back is forward)"
-        )));
-    }
-    let sums = postgres_checksums();
-    for (version, stored) in &applied {
-        let expected = usize::try_from(*version - 1).ok().and_then(|i| sums.get(i));
-        if expected != Some(stored) {
-            return Err(PreflightError::Refused(anyhow!(
-                "migration {version} was edited after it was applied"
-            )));
-        }
-    }
-    let rebuilding: Vec<String> = MIGRATIONS[db as usize..]
-        .iter()
-        .filter(|m| headers(m.postgres).0.no_transaction)
-        .flat_map(|m| concurrent_indexes(m.postgres))
-        .collect();
-    let invalid: Vec<String> = sqlx::query(
-        "SELECT c.relname FROM pg_index i \
-         JOIN pg_class c ON c.oid = i.indexrelid \
-         JOIN pg_namespace n ON n.oid = c.relnamespace \
-         WHERE n.nspname = current_schema() AND NOT i.indisvalid",
-    )
-    .fetch_all(&mut *conn)
-    .await?
-    .iter()
-    .map(|r| r.try_get::<String, _>(0))
-    .collect::<Result<_, _>>()?;
-    let blocking: Vec<&String> = invalid
-        .iter()
-        .filter(|name| !name.contains("_ccnew") && !name.contains("_ccold"))
-        .filter(|name| !rebuilding.contains(name))
-        .collect();
-    if !blocking.is_empty() {
-        return Err(PreflightError::Refused(anyhow!(
-            "INVALID index(es) {blocking:?}: drop and rebuild them (DROP INDEX CONCURRENTLY, \
-             then the CREATE from their migration) before starting"
-        )));
-    }
+    check_applied(&applied, |m| checksum(m.postgres)).map_err(PreflightError::Refused)?;
     Ok(())
 }
 
@@ -130,14 +76,12 @@ pub(crate) async fn run(conn: &mut PgConnection, web_role: &str) -> Result<(), D
     )
     .await
     .map_err(|e| unavailable("create schema_migrations", e))?;
-    let db: i64 = q::fetch_one(
-        conn,
+    let db: i64 = q::run(
         "schema version",
-        sqlx::query("SELECT COALESCE(MAX(version), 0) FROM schema_migrations"),
+        sqlx::query_scalar("SELECT COALESCE(MAX(version), 0) FROM schema_migrations")
+            .fetch_one(&mut *conn),
     )
     .await
-    .map_err(|e| unavailable("read the schema version", e))?
-    .try_get(0)
     .map_err(|e| unavailable("read the schema version", e))?;
     // The writer re-runs the preflight under the lock, so D <= B here.
     let pending = usize::try_from(db)
@@ -150,42 +94,17 @@ pub(crate) async fn run(conn: &mut PgConnection, web_role: &str) -> Result<(), D
             )
         })?;
     for m in pending {
-        apply(conn, m).await?;
+        apply(conn, m).await.map_err(|e| {
+            unavailable(
+                &format!("migration {:04}_{}", m.version, m.name),
+                describe(&e),
+            )
+        })?;
         tracing::info!("applied migration {:04}_{}", m.version, m.name);
     }
     grant(conn, web_role)
         .await
         .map_err(|e| unavailable(&format!("grant the web role {web_role:?}"), e))
-}
-
-async fn apply(conn: &mut PgConnection, m: &'static Migration) -> Result<(), DbError> {
-    let no_transaction = headers(m.postgres).0.no_transaction;
-    let mut tries = 0;
-    loop {
-        tries += 1;
-        let r = if no_transaction {
-            apply_concurrently(conn, m).await
-        } else {
-            apply_in_transaction(conn, m).await
-        };
-        match r {
-            Ok(()) => return Ok(()),
-            // A lock timeout, or a cancelled concurrent build: the file is
-            // safe to re-run from the top.
-            Err(e)
-                if tries < 5
-                    && (e.contains("55P03") || (no_transaction && e.contains("57014"))) =>
-            {
-                tracing::warn!("migration {:04}: {e}; retrying", m.version);
-            }
-            Err(e) => {
-                return Err(unavailable(
-                    &format!("migration {:04}_{}", m.version, m.name),
-                    e,
-                ))
-            }
-        }
-    }
 }
 
 fn describe(e: &sqlx::Error) -> String {
@@ -208,48 +127,16 @@ async fn record(conn: &mut PgConnection, m: &Migration) -> Result<(), sqlx::Erro
     .map(|_| ())
 }
 
-async fn apply_in_transaction(
-    conn: &mut PgConnection,
-    m: &'static Migration,
-) -> Result<(), String> {
-    let mut tx = conn.begin().await.map_err(|e| describe(&e))?;
+/// One version in one transaction, its row included.
+async fn apply(conn: &mut PgConnection, m: &Migration) -> Result<(), sqlx::Error> {
+    let mut tx = conn.begin().await?;
     sqlx::raw_sql("SET LOCAL statement_timeout = 0; SET LOCAL lock_timeout = '5s'")
         .execute(&mut *tx)
-        .await
-        .map_err(|e| describe(&e))?;
+        .await?;
     q::count_statement();
-    sqlx::raw_sql(m.postgres)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| describe(&e))?;
-    record(&mut tx, m).await.map_err(|e| describe(&e))?;
-    tx.commit().await.map_err(|e| describe(&e))
-}
-
-/// Each statement on its own, autocommitted: one multi-statement query is an
-/// implicit transaction, which `CONCURRENTLY` refuses. The version row goes in
-/// only after the last statement; a re-run starts again from the file's DROP.
-async fn apply_concurrently(conn: &mut PgConnection, m: &'static Migration) -> Result<(), String> {
-    sqlx::raw_sql("SET statement_timeout = 0; SET lock_timeout = '5s'")
-        .execute(&mut *conn)
-        .await
-        .map_err(|e| describe(&e))?;
-    let r = async {
-        for stmt in split_at_line_end(m.postgres) {
-            q::count_statement();
-            sqlx::raw_sql(AssertSqlSafe(stmt))
-                .execute(&mut *conn)
-                .await
-                .map_err(|e| describe(&e))?;
-        }
-        record(conn, m).await.map_err(|e| describe(&e))
-    }
-    .await;
-    sqlx::raw_sql("RESET statement_timeout; RESET lock_timeout")
-        .execute(&mut *conn)
-        .await
-        .map_err(|e| describe(&e))?;
-    r
+    sqlx::raw_sql(m.postgres).execute(&mut *tx).await?;
+    record(&mut tx, m).await?;
+    tx.commit().await
 }
 
 /// What web replicas may do: read everything, and write the two caches. Run
@@ -292,69 +179,6 @@ async fn grant(conn: &mut PgConnection, web_role: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A no-transaction file builds its index concurrently and records its
-    /// version, and a re-run after an interrupted build (an INVALID index left
-    /// behind) drops and rebuilds it. Needs `PG_TEST_URL`.
-    #[tokio::test]
-    #[ignore = "needs PG_TEST_URL; see AGENTS.md"]
-    async fn a_no_transaction_file_rebuilds_an_interrupted_index() {
-        let url = std::env::var("PG_TEST_URL").expect("PG_TEST_URL");
-        // The pattern the test helpers' sweep removes once this process is gone.
-        let schema = format!("t_{}_900000", std::process::id());
-        let mut admin = PgConnection::connect(&url).await.unwrap();
-        sqlx::raw_sql(AssertSqlSafe(format!(
-            "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}"
-        )))
-        .execute(&mut admin)
-        .await
-        .unwrap();
-        // The writer's own statement_timeout, which the runner must restore.
-        let mut conn = PgConnection::connect(&format!(
-            "{url}?options[search_path]={schema}&options[statement_timeout]=60s"
-        ))
-        .await
-        .unwrap();
-        sqlx::raw_sql(
-            "CREATE TABLE schema_migrations (version BIGINT PRIMARY KEY, name TEXT NOT NULL,
-                 checksum TEXT NOT NULL, applied_at BIGINT NOT NULL, applied_by TEXT NOT NULL);
-             CREATE TABLE blocks (number BIGINT PRIMARY KEY, miner BYTEA);
-             INSERT INTO blocks VALUES (1, '\\x01'), (2, '\\x01');
-             CREATE INDEX idx_miner ON blocks (miner);
-             UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'idx_miner'::regclass;",
-        )
-        .execute(&mut conn)
-        .await
-        .unwrap();
-        let file: &'static Migration = Box::leak(Box::new(Migration {
-            version: 2,
-            name: "miner_index",
-            sqlite: Some("-- kind: expand\n"),
-            postgres: "-- kind: expand\n-- no-transaction\n\
-                       DROP INDEX CONCURRENTLY IF EXISTS idx_miner;\n\
-                       CREATE INDEX CONCURRENTLY idx_miner\n    ON blocks (miner);\n",
-        }));
-        apply(&mut conn, file).await.unwrap();
-        let (valid, versions): (bool, i64) = sqlx::query_as(
-            "SELECT (SELECT indisvalid FROM pg_index WHERE indexrelid = 'idx_miner'::regclass),
-                    (SELECT COUNT(*) FROM schema_migrations WHERE version = 2)",
-        )
-        .fetch_one(&mut conn)
-        .await
-        .unwrap();
-        assert!(valid, "rebuilt valid");
-        assert_eq!(versions, 1);
-        let timeout: String = sqlx::query_scalar("SHOW statement_timeout")
-            .fetch_one(&mut conn)
-            .await
-            .unwrap();
-        assert_eq!(timeout, "1min", "the session's own settings are restored");
-        drop(conn);
-        sqlx::raw_sql(AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
-            .execute(&mut admin)
-            .await
-            .unwrap();
-    }
 
     /// A grant that fails for any reason but a missing role fails the run, so
     /// the writer never leads without its web role's grants, and the next run

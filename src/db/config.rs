@@ -150,16 +150,6 @@ impl fmt::Debug for Secret {
     }
 }
 
-/// Where the password the connection uses came from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PasswordSource {
-    None,
-    Env,
-    Url,
-    /// The URL's, with `PGPASSWORD` also set and ignored.
-    UrlOverEnv,
-}
-
 /// Timings and sizes with production defaults, which tests shorten.
 #[derive(Clone, Debug)]
 pub struct Tuning {
@@ -270,29 +260,14 @@ impl DbConfig {
         }
     }
 
-    /// A Postgres configuration with credentials from the process
-    /// environment, as `db::open(url)` uses.
+    /// A Postgres configuration for `url` as `role`, the rest at its defaults.
+    /// Where the URL has no user or password, sqlx takes `PGUSER` and
+    /// `PGPASSWORD` from the process environment.
     pub fn postgres(url: DbUrl, role: Role) -> Self {
-        let env = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
         DbConfig {
             role,
             target: DbTarget::Postgres(url),
-            user: env("PGUSER"),
-            password: env("PGPASSWORD").map(Secret),
-            ssl_mode: env("PGSSLMODE"),
-            web_role: env("DB_WEB_ROLE").unwrap_or_else(|| "explorer_web".into()),
-            follow_poll: std::time::Duration::from_millis(500),
-            tuning: Tuning::default(),
-        }
-    }
-
-    pub fn password_source(&self) -> PasswordSource {
-        let in_url = matches!(&self.target, DbTarget::Postgres(u) if u.has_password());
-        match (in_url, self.password.is_some()) {
-            (true, true) => PasswordSource::UrlOverEnv,
-            (true, false) => PasswordSource::Url,
-            (false, true) => PasswordSource::Env,
-            (false, false) => PasswordSource::None,
+            ..DbConfig::sqlite("")
         }
     }
 
@@ -317,6 +292,10 @@ impl DbConfig {
             if let Some(Secret(password)) = &self.password {
                 opts = opts.password(password);
             }
+        } else if self.password.is_some() {
+            tracing::warn!(
+                "DATABASE_URL carries a password and PGPASSWORD is set; using the URL's"
+            );
         }
         let asked = match url.ssl_mode() {
             Some(mode) => Some(("sslmode", mode)),
@@ -487,7 +466,6 @@ mod tests {
         .unwrap();
         let opts = cfg.pg_options().unwrap();
         assert_eq!(opts.get_username(), "explorer_indexer");
-        assert_eq!(cfg.password_source(), PasswordSource::Env);
     }
 
     /// Local runs may write them into the URL, which then wins.
@@ -503,14 +481,6 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(cfg.pg_options().unwrap().get_username(), "explorer");
-        assert_eq!(cfg.password_source(), PasswordSource::UrlOverEnv);
-    }
-
-    #[test]
-    fn no_credentials_anywhere_is_left_to_the_server() {
-        let cfg = DbConfig::from_env(env(&[("DATABASE_URL", "localhost:5432")])).unwrap();
-        assert_eq!(cfg.password_source(), PasswordSource::None);
-        assert!(!format!("{cfg:?}").contains("PGPASSWORD="));
     }
 
     #[test]

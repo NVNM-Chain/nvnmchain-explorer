@@ -13,19 +13,21 @@ use crate::models::{AnchoringEvent, Block, BlockBundle, Transaction, TransferEve
 use crate::tokens::TokenMeta;
 
 /// One batch, as the per-row writer would leave it: blocks, transactions and
-/// token metadata keep the last copy of a repeated key, as an upsert does;
-/// transfers and anchoring events keep the first, as `INSERT OR IGNORE` does.
-/// A set-based upsert must not touch a row twice, so repeats go here.
+/// token metadata keep the last copy of a repeated key, as an upsert does, and
+/// a set-based upsert must not touch a row twice. Transfers keep the first, as
+/// `INSERT OR IGNORE` does, so the balances count each once. Anchoring events
+/// keep every copy: their insert's `DO NOTHING` keeps the first.
 pub(crate) struct BatchPlan {
-    blocks: Vec<Block>,
-    txs: Vec<Transaction>,
-    transfers: Vec<TransferEvent>,
-    anchoring: Vec<AnchoringEvent>,
-    tokens: Vec<TokenMeta>,
+    pub(super) blocks: Vec<Block>,
+    pub(super) txs: Vec<Transaction>,
+    pub(super) transfers: Vec<TransferEvent>,
+    pub(super) anchoring: Vec<AnchoringEvent>,
+    pub(super) tokens: Vec<TokenMeta>,
 }
 
 /// The balance rows a batch's new transfers leave, and the holders each token
 /// gains or loses.
+#[derive(Default)]
 pub(crate) struct BalanceChanges {
     pub(crate) upserts: Vec<(String, String, String)>,
     pub(crate) deletes: Vec<(String, String)>,
@@ -67,37 +69,16 @@ impl BatchPlan {
                 |t| (t.block_number, t.log_index),
                 false,
             ),
-            anchoring: dedup(
-                bundles.iter().flat_map(|b| b.anchoring.iter().cloned()),
-                |a| (a.block_number, a.log_index),
-                false,
-            ),
+            anchoring: bundles
+                .iter()
+                .flat_map(|b| b.anchoring.iter().cloned())
+                .collect(),
             tokens: dedup(
                 bundles.iter().flat_map(|b| b.tokens.iter().cloned()),
                 |m| m.address.to_lowercase(),
                 true,
             ),
         }
-    }
-
-    pub(crate) fn blocks(&self) -> &[Block] {
-        &self.blocks
-    }
-
-    pub(crate) fn txs(&self) -> &[Transaction] {
-        &self.txs
-    }
-
-    pub(crate) fn transfers(&self) -> &[TransferEvent] {
-        &self.transfers
-    }
-
-    pub(crate) fn anchoring(&self) -> &[AnchoringEvent] {
-        &self.anchoring
-    }
-
-    pub(crate) fn tokens(&self) -> &[TokenMeta] {
-        &self.tokens
     }
 
     /// Each block with its transaction count in this batch, for the counter
@@ -112,63 +93,34 @@ impl BatchPlan {
         pairs.into_iter().unzip()
     }
 
-    fn fresh<'a>(
-        &'a self,
-        fresh: &'a HashSet<(i64, i64)>,
-    ) -> impl Iterator<Item = &'a TransferEvent> {
-        self.transfers
-            .iter()
-            .filter(move |t| fresh.contains(&(t.block_number, t.log_index)))
-    }
-
-    /// The `(token, holder)` balance rows the new transfers touch, keyed by the
-    /// addresses as written, as `adjust_balance` keys them.
-    pub(crate) fn balance_keys(&self, fresh: &HashSet<(i64, i64)>) -> Vec<(String, String)> {
-        let mut keys: Vec<(String, String)> = self
-            .fresh(fresh)
-            .flat_map(|t| {
-                [
-                    (t.token_addr.clone(), t.from_addr.clone()),
-                    (t.token_addr.clone(), t.to_addr.clone()),
-                ]
-            })
-            .collect();
-        keys.sort();
-        keys.dedup();
-        keys
-    }
-
-    /// Net each (token, holder)'s deltas over the new transfers and apply them
-    /// to `old`, with `adjust_balance`'s rules: a zero balance has no row,
-    /// a negative one is kept but is not a holding. The holder deltas
-    /// telescope to what the per-row writer's steps add up to.
-    pub(crate) fn apply(
-        &self,
-        fresh: &HashSet<(i64, i64)>,
-        old: HashMap<(String, String), String>,
-    ) -> BalanceChanges {
+    /// Each (token, holder)'s net delta over the new transfers, the ones
+    /// `fresh` names, keyed by the addresses as written, as `adjust_balance`
+    /// keys them.
+    pub(crate) fn net(&self, fresh: &HashSet<(i64, i64)>) -> HashMap<(String, String), BigInt> {
         let mut net: HashMap<(String, String), BigInt> = HashMap::new();
-        for t in self.fresh(fresh) {
+        for t in &self.transfers {
+            if !fresh.contains(&(t.block_number, t.log_index)) {
+                continue;
+            }
             let amount = bigint(&t.amount);
             *net.entry((t.token_addr.clone(), t.from_addr.clone()))
                 .or_default() -= &amount;
             *net.entry((t.token_addr.clone(), t.to_addr.clone()))
                 .or_default() += &amount;
         }
-        apply_deltas(net, &old)
+        net
     }
 }
 
-/// Apply net balance deltas to the stored balances `old`.
+/// Apply net balance deltas to the stored balances `old`, with
+/// `adjust_balance`'s rules: a zero balance has no row, a negative one is kept
+/// but is not a holding. The holder deltas telescope to what the per-row
+/// writer's steps add up to.
 pub(crate) fn apply_deltas(
     net: HashMap<(String, String), BigInt>,
     old: &HashMap<(String, String), String>,
 ) -> BalanceChanges {
-    let mut changes = BalanceChanges {
-        upserts: Vec::new(),
-        deletes: Vec::new(),
-        holders: Vec::new(),
-    };
+    let mut changes = BalanceChanges::default();
     let mut holders: HashMap<String, i64> = HashMap::new();
     let mut keys: Vec<_> = net.into_iter().collect();
     keys.sort_by(|a, b| a.0.cmp(&b.0));
@@ -315,12 +267,12 @@ mod tests {
         fn write(&mut self, bundles: &[BlockBundle]) {
             let plan = BatchPlan::new(bundles);
             let fresh: HashSet<(i64, i64)> = plan
-                .transfers()
+                .transfers
                 .iter()
                 .map(|t| (t.block_number, t.log_index))
                 .filter(|k| self.transfers.insert(*k))
                 .collect();
-            for meta in plan.tokens() {
+            for meta in &plan.tokens {
                 if !self.holders.contains_key(&meta.address) {
                     let n = self
                         .balances
@@ -330,12 +282,12 @@ mod tests {
                     self.holders.insert(meta.address.clone(), n as i64);
                 }
             }
-            let old: HashMap<(String, String), String> = plan
-                .balance_keys(&fresh)
-                .into_iter()
-                .filter_map(|k| self.balances.get(&k).map(|b| (k, b.clone())))
+            let net = plan.net(&fresh);
+            let old: HashMap<(String, String), String> = net
+                .keys()
+                .filter_map(|k| self.balances.get(k).map(|b| (k.clone(), b.clone())))
                 .collect();
-            let changes = plan.apply(&fresh, old);
+            let changes = apply_deltas(net, &old);
             for (token, holder, balance) in changes.upserts {
                 self.balances.insert((token, holder), balance);
             }
@@ -419,15 +371,11 @@ mod tests {
             t.amount = "999".into();
         }
         let plan = BatchPlan::new(&[first.clone(), second]);
-        assert_eq!(plan.blocks().len(), 1);
-        assert_eq!(plan.blocks()[0].extra_data, "second", "blocks: last wins");
-        assert_eq!(plan.tokens()[0].symbol, "NEW", "tokens: last wins");
+        assert_eq!(plan.blocks.len(), 1);
+        assert_eq!(plan.blocks[0].extra_data, "second", "blocks: last wins");
+        assert_eq!(plan.tokens[0].symbol, "NEW", "tokens: last wins");
         if let Some(t) = first.transfers.first() {
-            assert_eq!(
-                plan.transfers()[0].amount,
-                t.amount,
-                "transfers: first wins"
-            );
+            assert_eq!(plan.transfers[0].amount, t.amount, "transfers: first wins");
         }
     }
 }

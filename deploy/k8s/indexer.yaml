@@ -1,10 +1,6 @@
 # The one writer: indexes the chain into Postgres and runs its migrations.
-#
-# replicas: 1, and a rollout that starts the new pod before stopping the old:
-# the new pod turns Ready once its preflight passes and waits as a candidate
-# for the writer's lock; only then is the old pod terminated, which frees it.
-# Readiness never waits on the lock, or every release carrying a migration
-# would deadlock. Roll this deployment first on every release (README.md).
+# Roll it first on every release. README.md (Deploy order) says why maxSurge 1
+# and why no probe waits on the lock.
 apiVersion: apps/v1
 kind: Deployment
 metadata:

@@ -1,30 +1,9 @@
-//! What the Postgres backend shares with `sqlite.rs`: copies of its small
-//! helpers, so their visibility there does not change, and the column lists as
-//! macros, because sqlx takes only a `&'static str` and `concat!` needs
-//! literals. `sqlite/migrate.rs` tests each list against its SQLite constant.
+//! What the Postgres backend shares with `sqlite.rs`: its small helpers, and
+//! the column lists as macros, because sqlx takes only a `&'static str` and
+//! `concat!` needs literals. `sqlite/migrate.rs` tests each list against its
+//! SQLite constant.
 
-/// Decode a `0x`-prefixed hex string into raw bytes, as `sqlite.rs` stores
-/// hashes and addresses; a non-hex value is stored as its own bytes.
-pub(crate) fn hex_blob(s: &str) -> Vec<u8> {
-    let hexed = s.strip_prefix("0x").unwrap_or(s);
-    match hex::decode(hexed) {
-        Ok(b) => b,
-        Err(_) => s.as_bytes().to_vec(),
-    }
-}
-
-pub(crate) fn blob_hex(bytes: &[u8]) -> String {
-    format!("0x{}", hex::encode(bytes))
-}
-
-/// One stored address, in the checksummed form the rest of the explorer keys on.
-pub(crate) fn blob_addr(bytes: &[u8]) -> String {
-    crate::decoder::checksum_address(&blob_hex(bytes))
-}
-
-pub(crate) fn bigint(s: &str) -> num_bigint::BigInt {
-    num_bigint::BigInt::parse_bytes(s.as_bytes(), 10).unwrap_or_else(|| num_bigint::BigInt::from(0))
-}
+pub(crate) use crate::db::sqlite::{bigint, blob_addr, blob_hex, hex_blob};
 
 /// Postgres `TEXT` refuses a NUL byte, which SQLite stores. Caches drop it.
 pub(crate) fn without_nul(s: &str) -> String {

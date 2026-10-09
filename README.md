@@ -78,8 +78,6 @@ Railway: create a service from this repo (Dockerfile), add a volume mounted at
 `/data`, set `DB_PATH=/data/explorer.db`. Render: import `render.yaml`, pick
 Starter, deploy.
 
-All of these run the single process (`ROLE=all`, the default) on SQLite.
-
 ### Kubernetes with Postgres
 
 For availability and data that outgrows one machine, the same image runs as
@@ -96,14 +94,11 @@ and the operations guide.
   database; the container entrypoint (`deploy/entrypoint.sh`) fixes volume
   ownership on boot so the app user can write to it regardless of how the
   provider mounts empty volumes.
-- **Versioned migrations run automatically** — both backends share one list
-  of schema versions. On SQLite, version 1 is the frozen `init_db`; a file
-  written before versions existed is adopted and stamped version 1, rows
-  untouched, and later versions apply on boot. A database newer than the
-  binary is refused, and the only way back is forward. A drifted table makes
-  the explorer refuse to start and name it. Legacy databases also get a
-  one-time rebuild of the incremental token-balance table, and their anchoring
-  events read back from the node's logs. See `docs/database.md`.
+- **Versioned migrations run automatically** — on boot, on both backends.
+  The explorer refuses to start on a database newer than the binary, or on a
+  drifted table, which it names. Legacy databases also get a one-time rebuild
+  of the incremental token-balance table, and their anchoring events read
+  back from the node's logs. See `docs/database.md`.
 - **Volume sizing** — a full backfill of this chain is ~1.2 GB of raw block
   JSON before indexes and transactions. Use at least 2 GB; the examples use
   5 GB (~$0.75/mo on Fly), which leaves comfortable headroom.
@@ -288,24 +283,12 @@ cargo test --lib --test decoder --test anchoring --test pages \
 
 # Integration tests against the live chain RPC
 cargo test --test live_rpc --test baseline
-
-# The same suites, and the Postgres ones, against Postgres
-docker compose up -d --wait
-export PG_TEST_URL=postgres://explorer:explorer@localhost:5432/explorer
-TEST_DB=postgres cargo test --test decoder --test anchoring --test pages -- \
-    --skip duplicate_bundle_is_idempotent --skip anchoring_events_read_back_by_registry
-cargo test --lib -- --include-ignored
-cargo test --features db-coverage --test postgres --test migrations --test replay \
-    --test differential --test grid --test locks --test indexer_pg --test outage_drills \
-    -- --include-ignored
-
-# The live re-index into Postgres (needs the chain's RPC)
-TEST_DB=postgres cargo test --test baseline
 ```
 
-`docs/database.md` lists every Postgres suite: fixture replay into both
-backends, a differential between them, a parity grid over every database
-function, migrations, locks, and outage drills.
+On Postgres, `docs/database.md` ("Running the Postgres tests") has the
+commands for every suite: fixture replay into both backends, a differential
+between them, a parity grid over every database function, migrations, locks,
+and outage drills.
 
 `tests/pages.rs` boots the HTTP API over a temp SQLite database and renders the
 real templates, so a context key a handler stops sending fails a test rather

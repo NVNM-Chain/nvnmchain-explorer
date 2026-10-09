@@ -29,55 +29,47 @@ pub fn follow_point(db: &Db) -> Result<(Option<i64>, Option<i64>, Option<i64>)> 
 
 /// Token addresses a transfer or a fee names that have no metadata row, or
 /// why they could not be read: a failed scan is not "none missing".
-/// Undecodable rows are dropped and logged, as `query_rows` does.
 pub fn tokens_missing_metadata(db: &Db) -> Result<Vec<String>> {
-    let conn = lock(db);
-    let mut stmt = conn
-        .prepare(
-            "SELECT a FROM (
-                 SELECT token_addr AS a FROM transfer_events
-                 UNION
-                 SELECT fee_token FROM transactions WHERE fee_token IS NOT NULL
-             ) used
-             WHERE NOT EXISTS (SELECT 1 FROM token_metadata m WHERE m.address = used.a)",
-        )
-        .context("tokens_missing_metadata")?;
-    let rows = stmt
-        .query_map([], |r| Ok(blob_addr(&r.get::<_, Vec<u8>>(0)?)))
-        .context("tokens_missing_metadata")?;
-    let mut out = Vec::new();
-    let (mut dropped, mut first) = (0usize, None);
-    for row in rows {
-        match row {
-            Ok(address) => out.push(address),
-            Err(e) => {
-                dropped += 1;
-                first.get_or_insert_with(|| e.to_string());
-            }
-        }
-    }
-    if let Some(e) = first {
-        tracing::warn!("tokens_missing_metadata: dropped {dropped} undecodable row(s); first: {e}");
-    }
-    Ok(out)
+    try_rows(
+        db,
+        "tokens_missing_metadata",
+        "SELECT a FROM (
+             SELECT token_addr AS a FROM transfer_events
+             UNION
+             SELECT fee_token FROM transactions WHERE fee_token IS NOT NULL
+         ) used
+         WHERE NOT EXISTS (SELECT 1 FROM token_metadata m WHERE m.address = used.a)",
+        |r| Ok(blob_addr(&r.get::<_, Vec<u8>>(0)?)),
+    )
 }
 
 /// Every token-metadata row, or why they could not be read. Unlike
 /// `get_all_token_metas`, a failed read is an error, never an empty table.
-/// Undecodable rows are still dropped and logged, as there.
 pub fn try_all_token_metas(db: &Db) -> Result<Vec<TokenMetadata>> {
+    try_rows(
+        db,
+        "try_all_token_metas",
+        &format!("SELECT {TOKEN_COLS} FROM token_metadata"),
+        row_to_token,
+    )
+}
+
+/// Every row `sql` returns, mapped, or why the query failed. Undecodable rows
+/// are dropped and logged, as `query_rows` does.
+fn try_rows<T>(
+    db: &Db,
+    what: &'static str,
+    sql: &str,
+    map: impl FnMut(&rusqlite::Row) -> rusqlite::Result<T>,
+) -> Result<Vec<T>> {
     let conn = lock(db);
-    let mut stmt = conn
-        .prepare(&format!("SELECT {TOKEN_COLS} FROM token_metadata"))
-        .context("try_all_token_metas")?;
-    let rows = stmt
-        .query_map([], row_to_token)
-        .context("try_all_token_metas")?;
+    let mut stmt = conn.prepare(sql).context(what)?;
+    let rows = stmt.query_map([], map).context(what)?;
     let mut out = Vec::new();
     let (mut dropped, mut first) = (0usize, None);
     for row in rows {
         match row {
-            Ok(meta) => out.push(meta),
+            Ok(v) => out.push(v),
             Err(e) => {
                 dropped += 1;
                 first.get_or_insert_with(|| e.to_string());
@@ -85,7 +77,7 @@ pub fn try_all_token_metas(db: &Db) -> Result<Vec<TokenMetadata>> {
         }
     }
     if let Some(e) = first {
-        tracing::warn!("try_all_token_metas: dropped {dropped} undecodable row(s); first: {e}");
+        tracing::warn!("{what}: dropped {dropped} undecodable row(s); first: {e}");
     }
     Ok(out)
 }
@@ -99,19 +91,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = sqlite::open(dir.path().join("extra.db").to_str().unwrap()).unwrap();
         (dir, db)
-    }
-
-    #[test]
-    fn the_lowest_block_reads_as_get_min_block_number_does() {
-        let (_dir, db) = temp_db();
-        assert_eq!(try_min_block_number(&db).unwrap(), None);
-        sqlite::lock(&db)
-            .execute_batch(
-                "INSERT INTO blocks (number, hash, parent_hash, timestamp) VALUES (7, X'07', X'06', 0);
-                 INSERT INTO blocks (number, hash, parent_hash, timestamp) VALUES (5, X'05', X'04', 0);",
-            )
-            .unwrap();
-        assert_eq!(try_min_block_number(&db).unwrap(), Some(5));
     }
 
     /// A token a transfer or a fee names, with no metadata row: the

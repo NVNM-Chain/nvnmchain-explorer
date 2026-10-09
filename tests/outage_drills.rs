@@ -9,8 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use nvnmchain_explorer::db::{self, DbConfig, Role, Status};
-use sqlx::Connection as _;
+use nvnmchain_explorer::db::{self, Role, Status};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -185,24 +184,13 @@ fn upstream(url: &str) -> String {
 #[ignore = "needs PG_TEST_URL; see AGENTS.md"]
 async fn a_half_open_read_fails_within_the_deadline_and_the_pool_recovers() {
     let (_scratch, url) = backend::scratch_schema().await;
-    drop(
-        db::open_with(
-            &backend::pg_config(&url, Role::Indexer),
-            tokio::sync::watch::channel(Status::starting(Role::Indexer)).0,
-        )
-        .await
-        .unwrap(),
-    );
+    drop(backend::open(&backend::pg_config(&url, Role::Indexer)).await);
     let dark = Arc::new(AtomicBool::new(false));
     let port = blackhole_proxy(upstream(&url), dark.clone()).await;
-    let cfg: DbConfig = backend::pg_config(&via(&url, port), Role::Web);
-    let (status, mut seen) = tokio::sync::watch::channel(Status::starting(Role::Web));
-    let web = db::open_with(&cfg, status).await.unwrap();
-    // The path goes dark under an idle pool. A web replica reads the schema
-    // version in the background as it opens, so wait for that; and sqlx pings
-    // each connection as it goes back to the pool, with no deadline, so let
-    // the last one land. Either, caught by the dark, holds its slot.
-    seen.wait_for(|s| s.schema.db.is_some()).await.unwrap();
+    let web = backend::open(&backend::pg_config(&via(&url, port), Role::Web)).await;
+    // The path goes dark under an idle pool. sqlx pings each connection as it
+    // goes back to the pool, with no deadline, so let the last one land: caught
+    // by the dark, it holds its slot.
     let (_, failed) = db::track_failures(db::get_latest_block(&web)).await;
     assert!(!failed);
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -234,12 +222,7 @@ async fn the_watchdog_cancels_long_work_it_cannot_see() {
     let mut cfg = backend::pg_config(&via(&url, port), Role::Indexer);
     cfg.tuning.watchdog = Duration::from_secs(1);
     cfg.tuning.candidate_retry = Duration::from_millis(100);
-    let indexer = db::open_with(
-        &cfg,
-        tokio::sync::watch::channel(Status::starting(Role::Indexer)).0,
-    )
-    .await
-    .unwrap();
+    let indexer = backend::open(&cfg).await;
     let before = db::testing::writer_pid(&indexer).unwrap();
     let long = tokio::spawn({
         let indexer = indexer.clone();
@@ -281,12 +264,7 @@ async fn an_unreachable_database_is_waited_out_not_taken_for_a_lost_lock() {
     let pid = db::testing::writer_pid(&indexer).unwrap();
 
     refuse.store(true, Ordering::Relaxed);
-    let mut admin = sqlx::PgConnection::connect(&url).await.unwrap();
-    sqlx::query("SELECT pg_terminate_backend($1)")
-        .bind(pid)
-        .execute(&mut admin)
-        .await
-        .unwrap();
+    backend::exec(&url, &format!("SELECT pg_terminate_backend({pid})")).await;
     let write = tokio::spawn({
         let indexer = indexer.clone();
         async move {

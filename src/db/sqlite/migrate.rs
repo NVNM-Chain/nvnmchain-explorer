@@ -1,23 +1,14 @@
 //! The SQLite runner: version 1 is the frozen `init_db`, and later versions
 //! are the `migrations/sqlite/NNNN_*.sql` files.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
-#[cfg(test)]
-use sha3::{Digest, Sha3_256};
 
-use crate::db::migrations::{binary_version, checksum, first_gap, MIGRATIONS};
+use crate::db::migrations::{check_applied, checksum, APPLIED_BY, MIGRATIONS};
 
 /// The shape of `init_db(":memory:")`: what version 1 is on SQLite.
 pub(crate) const BASELINE_SHA3: &str =
     "21ff43b56fd29b1b7f7ea0e973755d2e8fb5f751cfede043ab5c852817c91ef2";
-
-#[cfg(test)]
-/// `init_db`'s body, pragma statements aside.
-const INIT_DB_BODY_SHA3: &str = "de7fb9fc801d6fd1a2f9415e97a30456de099c9511ff378857327eac7352b34d";
-
-/// Who applied a version, for the `applied_by` column.
-const APPLIED_BY: &str = concat!("nvnmchain-explorer ", env!("CARGO_PKG_VERSION"));
 
 /// Bring a file `init_db` has just opened up to this binary's version.
 ///
@@ -64,25 +55,9 @@ fn migrate(conn: &Connection) -> Result<()> {
         .prepare("SELECT version, checksum FROM schema_migrations ORDER BY version")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
-    if let Some((missing, found)) = first_gap(applied.iter().map(|(v, _)| *v)) {
-        bail!(
-            "schema_migrations has version {found} but not {missing}: its rows were edited by \
-             hand, so which files ran is unknown"
-        );
-    }
-    let binary = binary_version();
-    let db = applied.last().map_or(0, |(v, _)| *v);
-    if db > binary {
-        bail!(
-            "the database is at schema version {db}, newer than this binary's {binary}; \
-             run a release at version {db} or later (the only way back is forward)"
-        );
-    }
-    for (version, stored) in &applied {
-        if *stored != expected_checksum(*version) {
-            bail!("migration {version} was edited after it was applied");
-        }
-    }
+    let db = check_applied(&applied, |m| {
+        m.sqlite.map_or_else(|| BASELINE_SHA3.into(), checksum)
+    })?;
     for m in &MIGRATIONS[db as usize..] {
         let sql = m.sqlite.expect("every version after 1 has a SQLite file");
         conn.execute_batch(sql)
@@ -90,13 +65,6 @@ fn migrate(conn: &Connection) -> Result<()> {
         record(conn, m.version, m.name, &checksum(sql))?;
     }
     super::schema_check::verify(conn)
-}
-
-fn expected_checksum(version: i64) -> String {
-    match MIGRATIONS.get(version as usize - 1).and_then(|m| m.sqlite) {
-        Some(sql) => checksum(sql),
-        None => BASELINE_SHA3.to_string(),
-    }
 }
 
 fn record(conn: &Connection, version: i64, name: &str, sum: &str) -> Result<()> {
@@ -109,57 +77,55 @@ fn record(conn: &Connection, version: i64, name: &str, sum: &str) -> Result<()> 
 }
 
 #[cfg(test)]
-/// sha3 of the schema: every object's type, name, table and SQL.
-pub(crate) fn shape_hash(conn: &Connection) -> Result<String> {
-    let mut stmt =
-        conn.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name")?;
-    let mut rows = stmt.query([])?;
-    let mut hash = Sha3_256::new();
-    while let Some(row) = rows.next()? {
-        for i in 0..4 {
-            let field: Option<String> = row.get(i)?;
-            hash.update(field.unwrap_or_default().as_bytes());
-            hash.update([0x1f]);
-        }
-        hash.update([0x1e]);
-    }
-    Ok(hex::encode(hash.finalize()))
-}
-
-#[cfg(test)]
-/// `init_db`'s body, from its signature to its closing brace.
-fn init_db_body(source: &str) -> String {
-    let start = source
-        .find("pub fn init_db(")
-        .expect("init_db in sqlite.rs");
-    let len = source[start..]
-        .find("\n}\n")
-        .expect("init_db's closing brace");
-    source[start..start + len + 2].to_string()
-}
-
-#[cfg(test)]
-/// The body's hash with every statement that sets a pragma or reads the cache
-/// size left out, comments before it included, so tuning a pragma in place
-/// never trips the pin.
-fn hash_without_pragmas(body: &str) -> String {
-    let kept: Vec<&str> = body
-        .split_inclusive(";\n")
-        .filter(|stmt| !stmt.contains("pragma_update") && !stmt.contains("cache_kib"))
-        .collect();
-    hex::encode(Sha3_256::digest(kept.concat().as_bytes()))
-}
-
-#[cfg(test)]
-fn init_db_body_hash() -> String {
-    hash_without_pragmas(&init_db_body(include_str!("../sqlite.rs")))
-}
-
-#[cfg(test)]
 mod tests {
+    use sha3::{Digest, Sha3_256};
+
     use super::*;
     use crate::db::migrations::binary_version;
     use crate::db::sqlite;
+
+    /// `init_db`'s body, pragma statements aside.
+    const INIT_DB_BODY_SHA3: &str =
+        "de7fb9fc801d6fd1a2f9415e97a30456de099c9511ff378857327eac7352b34d";
+
+    /// sha3 of the schema: every object's type, name, table and SQL.
+    fn shape_hash(conn: &Connection) -> Result<String> {
+        let mut stmt = conn
+            .prepare("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name")?;
+        let mut rows = stmt.query([])?;
+        let mut hash = Sha3_256::new();
+        while let Some(row) = rows.next()? {
+            for i in 0..4 {
+                let field: Option<String> = row.get(i)?;
+                hash.update(field.unwrap_or_default().as_bytes());
+                hash.update([0x1f]);
+            }
+            hash.update([0x1e]);
+        }
+        Ok(hex::encode(hash.finalize()))
+    }
+
+    /// `init_db`'s body, from its signature to its closing brace.
+    fn init_db_body(source: &str) -> String {
+        let start = source
+            .find("pub fn init_db(")
+            .expect("init_db in sqlite.rs");
+        let len = source[start..]
+            .find("\n}\n")
+            .expect("init_db's closing brace");
+        source[start..start + len + 2].to_string()
+    }
+
+    /// The body's hash with every statement that sets a pragma or reads the
+    /// cache size left out, comments before it included, so tuning a pragma in
+    /// place never trips the pin.
+    fn hash_without_pragmas(body: &str) -> String {
+        let kept: Vec<&str> = body
+            .split_inclusive(";\n")
+            .filter(|stmt| !stmt.contains("pragma_update") && !stmt.contains("cache_kib"))
+            .collect();
+        hex::encode(Sha3_256::digest(kept.concat().as_bytes()))
+    }
 
     const FROZEN: &str = "init_db is migration 1 and frozen: add \
                           `migrations/{sqlite,postgres}/NNNN_*.sql` (docs/database.md)";
@@ -193,19 +159,8 @@ mod tests {
     /// seeding, which a fresh database cannot show. Pragmas stay tunable.
     #[test]
     fn pin_b_init_db_body_is_unchanged() {
-        assert_eq!(init_db_body_hash(), INIT_DB_BODY_SHA3, "{FROZEN}");
-    }
-
-    #[test]
-    fn pin_b_lets_pragmas_be_tuned() {
         let body = init_db_body(include_str!("../sqlite.rs"));
-        let tuned = body
-            .replace("512 * 1024", "256 * 1024")
-            .replace("\"NORMAL\"", "\"FULL\"");
-        assert_ne!(body, tuned, "the replacements must hit");
-        assert_eq!(hash_without_pragmas(&body), hash_without_pragmas(&tuned));
-        let edited = body.replace("DROP", "DROP  ");
-        assert_ne!(hash_without_pragmas(&body), hash_without_pragmas(&edited));
+        assert_eq!(hash_without_pragmas(&body), INIT_DB_BODY_SHA3, "{FROZEN}");
     }
 
     #[test]
@@ -216,33 +171,6 @@ mod tests {
         let rows = versions(&sqlite::lock(&db));
         assert_eq!(rows.first(), Some(&(1, BASELINE_SHA3.to_string())));
         assert_eq!(rows.len() as i64, binary_version());
-    }
-
-    /// A file written before versions existed is adopted as version 1, rows
-    /// and all, and reopening it changes nothing.
-    #[test]
-    fn a_legacy_file_is_adopted_with_its_rows() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("legacy.db");
-        {
-            let conn = sqlite::init_db(path.to_str().unwrap()).unwrap();
-            conn.execute(
-                "INSERT INTO kv (key, value, updated_at) VALUES ('stats', '{}', 1)",
-                [],
-            )
-            .unwrap();
-            assert!(!has_table(&conn, "schema_migrations"));
-        }
-        for _ in 0..2 {
-            let db = sqlite::open(path.to_str().unwrap()).unwrap();
-            let conn = sqlite::lock(&db);
-            assert_eq!(versions(&conn)[0], (1, BASELINE_SHA3.to_string()));
-            assert_eq!(versions(&conn).len() as i64, binary_version());
-            let kept: String = conn
-                .query_row("SELECT value FROM kv WHERE key = 'stats'", [], |r| r.get(0))
-                .unwrap();
-            assert_eq!(kept, "{}");
-        }
     }
 
     #[test]

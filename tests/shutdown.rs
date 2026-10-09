@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -105,6 +105,37 @@ impl Sigterm {
     }
 }
 
+/// The explorer on `port`, against a node on `node`, on SQLite unless the
+/// test says otherwise, its output dropped.
+fn explorer(port: u16, node: u16) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nvnmchain-explorer"));
+    cmd.env("ENV_FILE", "")
+        .env("HOST", "127.0.0.1")
+        .env("PORT", port.to_string())
+        .env("NVNM_RPC", format!("http://127.0.0.1:{node}"))
+        .env("WS_URL", format!("ws://127.0.0.1:{node}"))
+        .env("SIGNATURE_LOOKUP_URL", "")
+        .env_remove("DATABASE_URL")
+        .env_remove("ROLE")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    cmd
+}
+
+/// The child's exit status, if it exits within `limit`.
+fn exit_within(child: &mut Child, limit: Duration) -> Option<ExitStatus> {
+    let deadline = Instant::now() + limit;
+    loop {
+        if let Some(status) = child.try_wait().expect("wait") {
+            return Some(status);
+        }
+        if Instant::now() > deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn wait_until_listening(port: u16) {
     let deadline = Instant::now() + Duration::from_secs(30);
     while TcpStream::connect(("127.0.0.1", port)).is_err() {
@@ -119,18 +150,8 @@ fn sigterm_exits_within_three_seconds_with_a_request_in_flight() {
     let node = silent_node();
     let port = free_port();
     let mut child = Explorer(
-        Command::new(env!("CARGO_BIN_EXE_nvnmchain-explorer"))
-            .env("ENV_FILE", "")
+        explorer(port, node)
             .env("DB_PATH", dir.path().join("shutdown.db"))
-            .env("HOST", "127.0.0.1")
-            .env("PORT", port.to_string())
-            .env("NVNM_RPC", format!("http://127.0.0.1:{node}"))
-            .env("WS_URL", format!("ws://127.0.0.1:{node}"))
-            .env("SIGNATURE_LOOKUP_URL", "")
-            .env_remove("DATABASE_URL")
-            .env_remove("ROLE")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
             .spawn()
             .expect("spawn the explorer"),
     );
@@ -148,17 +169,8 @@ fn sigterm_exits_within_three_seconds_with_a_request_in_flight() {
 
     let started = Instant::now();
     assert!(sigterm.send(child.id()), "kill failed");
-    let deadline = started + Duration::from_secs(10);
-    let status = loop {
-        if let Some(status) = child.try_wait().expect("wait") {
-            break status;
-        }
-        if Instant::now() > deadline {
-            let _ = child.kill();
-            panic!("still running 10 s after SIGTERM");
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let status =
+        exit_within(&mut child, Duration::from_secs(10)).expect("still running 10 s after SIGTERM");
     let took = started.elapsed();
     assert!(status.success(), "a graceful stop, not a crash: {status}");
     assert!(
@@ -207,16 +219,8 @@ fn a_sigterm_during_startup_stops_it_cleanly() {
         // whole window.
         let sigterm = Sigterm::ready();
         let mut child = Explorer(
-            Command::new(env!("CARGO_BIN_EXE_nvnmchain-explorer"))
-                .env("ENV_FILE", "")
+            explorer(port, node)
                 .env("DB_PATH", dir.path().join("startup.db"))
-                .env("HOST", "127.0.0.1")
-                .env("PORT", port.to_string())
-                .env("NVNM_RPC", format!("http://127.0.0.1:{node}"))
-                .env("WS_URL", format!("ws://127.0.0.1:{node}"))
-                .env("SIGNATURE_LOOKUP_URL", "")
-                .env_remove("DATABASE_URL")
-                .env_remove("ROLE")
                 .stdout(out.try_clone().expect("log"))
                 .stderr(out)
                 .spawn()
@@ -241,16 +245,7 @@ fn a_sigterm_during_startup_stops_it_cleanly() {
         }
         std::thread::sleep(Duration::from_millis(15 * attempt));
         let sent = sigterm.send(child.id());
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let status = loop {
-            if let Some(status) = child.try_wait().expect("wait") {
-                break Some(status);
-            }
-            if Instant::now() > deadline {
-                break None;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        };
+        let status = exit_within(&mut child, Duration::from_secs(10));
         assert!(sent, "attempt {attempt}: kill failed");
         match status {
             Some(status) => assert!(
@@ -279,19 +274,12 @@ fn the_port_answers_before_the_database_opens() {
     let port = free_port();
     let node = silent_node();
     let _child = Explorer(
-        Command::new(env!("CARGO_BIN_EXE_nvnmchain-explorer"))
-            .env("ENV_FILE", "")
+        explorer(port, node)
             .env("ROLE", "indexer")
             .env(
                 "DATABASE_URL",
                 "postgres://explorer:explorer@127.0.0.1:1/explorer",
             )
-            .env("HOST", "127.0.0.1")
-            .env("PORT", port.to_string())
-            .env("NVNM_RPC", format!("http://127.0.0.1:{node}"))
-            .env("WS_URL", format!("ws://127.0.0.1:{node}"))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
             .spawn()
             .expect("spawn the explorer"),
     );
@@ -314,20 +302,10 @@ fn sigterm_exits_within_three_seconds_with_the_runtime_stuck_in_sqlite() {
     let node = silent_node();
     let port = free_port();
     let mut child = Explorer(
-        Command::new(env!("CARGO_BIN_EXE_nvnmchain-explorer"))
-            .env("ENV_FILE", "")
+        explorer(port, node)
             .env("DB_PATH", &path)
             .env("TOKIO_WORKER_THREADS", "1")
             .env("STATS_INTERVAL_SECONDS", "1")
-            .env("HOST", "127.0.0.1")
-            .env("PORT", port.to_string())
-            .env("NVNM_RPC", format!("http://127.0.0.1:{node}"))
-            .env("WS_URL", format!("ws://127.0.0.1:{node}"))
-            .env("SIGNATURE_LOOKUP_URL", "")
-            .env_remove("DATABASE_URL")
-            .env_remove("ROLE")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
             .spawn()
             .expect("spawn the explorer"),
     );
@@ -342,18 +320,7 @@ fn sigterm_exits_within_three_seconds_with_the_runtime_stuck_in_sqlite() {
 
     let started = Instant::now();
     let sent = sigterm.send(child.id());
-    let deadline = started + Duration::from_secs(15);
-    let status = loop {
-        if let Some(status) = child.try_wait().expect("wait") {
-            break Some(status);
-        }
-        if Instant::now() > deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            break None;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let status = exit_within(&mut child, Duration::from_secs(15));
     let took = started.elapsed();
     drop(lock);
     assert!(sent, "kill failed");

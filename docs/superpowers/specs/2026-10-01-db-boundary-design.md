@@ -1,6 +1,6 @@
 # Phase 1: seal the database boundary (SQLite only)
 
-Status: draft, awaiting review
+Status: implemented (merged as bb83764)
 Date: 2026-10-01
 
 ## Why

@@ -757,7 +757,9 @@ async fn holder_count_follows_the_balances() {
 
 #[tokio::test]
 async fn duplicate_bundle_is_idempotent() {
-    let (_dir, db) = temp_db("dedup.db").await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("dedup.db");
+    let db: Db = db::open(path.to_str().unwrap()).await.expect("init_db");
     let raw_block = sample_raw_block();
     let block = parse_block(&raw_block);
     let tx = parse_transaction(&raw_block["transactions"][0], &block);
@@ -827,7 +829,9 @@ async fn duplicate_bundle_is_idempotent() {
 /// checksummed; re-writing the block adds no second row.
 #[tokio::test]
 async fn anchoring_events_read_back_by_registry() {
-    let (_dir, db) = temp_db("anchoring.db").await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("anchoring.db");
+    let db: Db = db::open(path.to_str().unwrap()).await.expect("init_db");
     let raw_block = sample_raw_block();
     let block = parse_block(&raw_block);
     let tx = parse_transaction(&raw_block["transactions"][0], &block);
