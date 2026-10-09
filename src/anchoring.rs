@@ -27,7 +27,7 @@ sol! {
         uint64 registryId;
     }
 
-    #[derive(Debug, serde::Serialize)]
+    #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
     struct Registry {
         uint64 id;
         string name;
@@ -133,6 +133,19 @@ pub async fn registries(rpc: &ChainRpc, page: u64, per_page: u64) -> Result<(Vec
     Ok((view(rpc, call).await?.registriesOut, total))
 }
 
+/// A registry by id; `None` if there is no such registry.
+pub async fn find_registry(rpc: &ChainRpc, registry_id: u64) -> Result<Option<Registry>> {
+    if !(1..=registry_count(rpc).await?).contains(&registry_id) {
+        return Ok(None);
+    }
+    let call = registriesCall {
+        registryId: registry_id,
+        pagination: PageRequest::default(),
+    };
+    let registry = view(rpc, call).await?.registriesOut.pop();
+    Ok(Some(registry.context("no registry")?))
+}
+
 /// A registry, the latest version of each of its records newest first, and how many records
 /// it has; `None` if there is no such registry.
 pub async fn registry(
@@ -141,18 +154,9 @@ pub async fn registry(
     page: u64,
     per_page: u64,
 ) -> Result<Option<(Registry, Vec<Record>, u64)>> {
-    if !(1..=registry_count(rpc).await?).contains(&registry_id) {
+    let Some(registry) = find_registry(rpc, registry_id).await? else {
         return Ok(None);
-    }
-    let call = registriesCall {
-        registryId: registry_id,
-        pagination: PageRequest::default(),
     };
-    let registry = view(rpc, call)
-        .await?
-        .registriesOut
-        .pop()
-        .context("no registry")?;
     let total = record_count(rpc, registry_id).await?;
     let Some(ids) = newest_first(total, page, per_page) else {
         return Ok(Some((registry, Vec::new(), total)));
@@ -209,17 +213,24 @@ pub async fn record(
 }
 
 /// Registries named exactly `q`, and the latest version of the record with checksum `q` in
-/// each registry that has one. The contract matches names exactly and nothing else.
+/// each registry that has one. The contract matches names exactly and nothing else. Both in
+/// one round trip, as a search box asks at every keystroke.
 pub async fn lookup(rpc: &ChainRpc, q: &str) -> Result<(Vec<Registry>, Vec<Record>)> {
-    let call = registriesByNameCall {
+    let named = registriesByNameCall {
         name: q.into(),
         matchMode: 1,
         pagination: PageRequest::default(),
     };
-    let named = view(rpc, call).await?.registriesOut;
-    let call = recordsCall {
+    let anchored = recordsCall {
         checksum: q.into(),
         ..version(0, 0, 0)
     };
-    Ok((named, view(rpc, call).await?.recordsOut))
+    let calls = [eth_call(&named), eth_call(&anchored)].map(|params| ("eth_call".into(), params));
+    let mut answers = rpc.batch_call(calls.into()).await?;
+    let anchored = answers.pop().context("no answer")??;
+    let named = answers.pop().context("no answer")??;
+    Ok((
+        returns::<registriesByNameCall>(named)?.registriesOut,
+        returns::<recordsCall>(anchored)?.recordsOut,
+    ))
 }

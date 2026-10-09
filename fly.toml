@@ -6,8 +6,7 @@
 app = 'nvnmchain-explorer'
 primary_region = 'sin'
 
-# Built from the repo Dockerfile; CI deploys it automatically on main push
-# (.github/workflows/docker.yml -> fly deploy --remote-only).
+# Built from the repo Dockerfile by `fly deploy`.
 [build]
   dockerfile = 'Dockerfile'
 

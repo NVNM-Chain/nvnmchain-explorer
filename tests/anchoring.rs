@@ -344,7 +344,7 @@ async fn every_page_renders() {
     for (path, expect) in [
         ("/anchoring", "reg-30"),
         ("/anchoring?page=2", "Page 2 of 2"),
-        ("/anchoring?q=twin", "Registries named"),
+        ("/anchoring?q=twin", "Registries matching"),
         ("/anchoring?q=sum-1", "2 / 1"),
         ("/anchoring/1", "27 records"),
         ("/anchoring/1/1", "30 versions"),
@@ -411,6 +411,30 @@ async fn the_search_box_finds_a_registry_by_name_and_a_record_by_checksum() {
     assert!(kinds.contains(&"registry"), "{suggestions}");
 }
 
+/// The anchoring page's field suggests as the reader types, a number being a registry id.
+#[tokio::test]
+async fn the_anchoring_field_suggests_an_id_a_name_or_a_checksum() {
+    let (_dir, base) = serve(stub_node(30).await).await;
+    let urls = |body: &Value| -> Vec<String> {
+        let rows = body["results"].as_array().unwrap().iter();
+        rows.map(|row| row["url"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    let (_, by_id) = get(&base, "/api/anchoring/search?q=7").await;
+    assert_eq!(
+        by_id["results"],
+        json!([{"type": "registry", "url": "/anchoring/7", "label": "reg-7", "sublabel": "Registry #7"}])
+    );
+    let (_, past_the_last) = get(&base, "/api/anchoring/search?q=31").await;
+    assert_eq!(past_the_last["results"], json!([]));
+
+    let (_, named) = get(&base, "/api/anchoring/search?q=twin").await;
+    assert_eq!(urls(&named), ["/anchoring/2", "/anchoring/3"]);
+    let (_, anchored) = get(&base, "/api/anchoring/search?q=sum-1").await;
+    assert_eq!(urls(&anchored), ["/anchoring/1/1", "/anchoring/2/1"]);
+}
+
 /// Half a name matches only in the node's name index: the contract answers a whole one
 /// and nothing less.
 #[tokio::test]
@@ -444,11 +468,22 @@ async fn the_search_box_takes_half_a_name_from_the_index() {
     let (_, found) = get(&base, "/search?q=reg-2").await;
     assert_eq!(found["match"]["url"], "/anchoring/20");
 
+    // The anchoring page lists them too, after the contract's whole-name matches.
+    let (_, listed) = get(&base, "/anchoring?q=reg-2").await;
+    assert_eq!(
+        ids(&listed["registries"], "id"),
+        (20..=29).collect::<Vec<_>>()
+    );
+    let (_, twins) = get(&base, "/anchoring?q=twin").await;
+    assert_eq!(ids(&twins["registries"], "id"), [2, 3], "none twice");
+
     // On a node that does not serve the search, the same half name finds nothing — and
     // the method being absent is not an error the box shows.
     let (_dir, bare) = serve(stub_node(30).await).await;
     let (_, none) = get(&bare, "/search?q=reg-2").await;
     assert_eq!(none["match"], Value::Null);
+    let (_, unlisted) = get(&bare, "/anchoring?q=reg-2").await;
+    assert_eq!(unlisted["registries"], json!([]));
 }
 
 /// An `AddRegistry` log for registry `id` at `block`, as `eth_getLogs` returns it.

@@ -352,6 +352,7 @@
                 <form action="/search" method="GET" class="max-w-2xl mx-auto search-box" role="search">
                     <input type="text" name="q" id="search-input" placeholder="Search block, transaction, address or token…"
                            class="search-input" value="{{ query | default(value='') }}"
+                           data-suggest="/api/search"
                            autocomplete="off" role="combobox" aria-expanded="false"
                            aria-controls="search-suggestions" aria-autocomplete="list">
                     <div id="search-suggestions" class="suggestions" role="listbox" hidden></div>
@@ -414,10 +415,9 @@
         // Search suggestions. Every answer comes from the index, so a keystroke
         // costs one cheap request; a request still in flight when the next
         // keystroke lands is abandoned rather than raced.
-        (() => {
-            const input = document.getElementById('search-input');
-            const panel = document.getElementById('search-suggestions');
-            if (!input || !panel) return;
+        document.querySelectorAll('input[data-suggest]').forEach((input) => {
+            const panel = document.getElementById(input.getAttribute('aria-controls'));
+            if (!panel) return;
 
             let items = [];
             let active = -1;
@@ -478,7 +478,7 @@
                 inFlight = new AbortController();
                 try {
                     const response = await fetch(
-                        `/api/search?q=${encodeURIComponent(query)}`,
+                        `${input.dataset.suggest}?q=${encodeURIComponent(query)}`,
                         { signal: inFlight.signal },
                     );
                     if (!response.ok) return close();
@@ -509,7 +509,7 @@
                     select((active - 1 + items.length) % items.length);
                 } else if (event.key === 'Enter' && active >= 0) {
                     // Only when something is highlighted; otherwise the form
-                    // submits and /search decides, as it always has.
+                    // submits and the page decides, as it always has.
                     event.preventDefault();
                     window.location.href = items[active].href;
                 } else if (event.key === 'Escape') {
@@ -522,7 +522,7 @@
                 const query = input.value.trim();
                 if (query) suggest(query);
             });
-        })();
+        });
     </script>
 </body>
 </html>

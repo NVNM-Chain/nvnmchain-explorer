@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::anchoring::Registry;
 use crate::rpc::ChainRpc;
 
 /// A keystroke must not wait on a busy node. The contract half of a suggestion shares it.
@@ -22,25 +23,18 @@ const CONTAINS: &str = "contains";
 /// Rows asked for per row shown.
 const OVERFETCH: usize = 8;
 
-/// A registry the index matched, read down to what a suggestion shows.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct Named {
-    pub id: u64,
-    pub name: String,
-}
-
 /// The node's answer.
 #[derive(Deserialize)]
 struct Answer {
     #[serde(default)]
-    registries: Vec<Named>,
+    registries: Vec<Registry>,
 }
 
 /// Registries whose name contains `q`, best first, at most `limit`.
 ///
 /// Empty for anything that goes wrong: the box is better without a row than broken by a
 /// node that is down, slow, or not running the index.
-pub async fn matching(rpc: &ChainRpc, q: &str, limit: usize) -> Vec<Named> {
+pub async fn matching(rpc: &ChainRpc, q: &str, limit: usize) -> Vec<Registry> {
     match ask(rpc, q, limit).await {
         Ok(named) => named,
         Err(e) => {
@@ -52,7 +46,7 @@ pub async fn matching(rpc: &ChainRpc, q: &str, limit: usize) -> Vec<Named> {
 
 /// The whole name first, then the names beginning with it, then the rest, each by id.
 /// Cached: the key is otherwise lowercased at every comparison.
-fn rank(named: &mut [Named], lower: &str) {
+fn rank(named: &mut [Registry], lower: &str) {
     named.sort_by_cached_key(|n| {
         let name = n.name.to_lowercase();
         let tier = if name == lower {
@@ -68,7 +62,7 @@ fn rank(named: &mut [Named], lower: &str) {
 
 /// The index answers by id, so the name meant can sit behind longer ones that merely
 /// contain it: ask for more than will be shown, then rank.
-async fn ask(rpc: &ChainRpc, q: &str, limit: usize) -> Result<Vec<Named>> {
+async fn ask(rpc: &ChainRpc, q: &str, limit: usize) -> Result<Vec<Registry>> {
     let call = rpc.call(
         "anchoring_searchRegistriesByName",
         json!([{"name": q, "mode": CONTAINS, "limit": limit.saturating_mul(OVERFETCH)}]),
@@ -86,13 +80,14 @@ async fn ask(rpc: &ChainRpc, q: &str, limit: usize) -> Result<Vec<Named>> {
 mod tests {
     use super::*;
 
-    fn named(names: &[&str]) -> Vec<Named> {
+    fn named(names: &[&str]) -> Vec<Registry> {
         names
             .iter()
             .enumerate()
-            .map(|(i, name)| Named {
+            .map(|(i, name)| Registry {
                 id: i as u64 + 1,
                 name: (*name).to_string(),
+                ..Default::default()
             })
             .collect()
     }
@@ -119,8 +114,7 @@ mod tests {
         assert_eq!(order, [1, 2]);
     }
 
-    /// The node returns an id as a number and the fields the page never shows; taking the
-    /// two that matter is what keeps a later field from breaking the box.
+    /// The node writes a registry as the contract holds it, with an id as a number.
     #[test]
     fn a_row_is_read_from_the_nodes_answer() {
         let answer = json!({"registries": [
@@ -128,12 +122,8 @@ mod tests {
              "createdAt": "2026-09-21 00:00:00 +0000 UTC", "metadata": "{}"}
         ]});
         let parsed: Answer = serde_json::from_value(answer).unwrap();
-        assert_eq!(
-            parsed.registries,
-            [Named {
-                id: 7,
-                name: "Fund Alpha".into()
-            }]
-        );
+        let row = &parsed.registries[0];
+        assert_eq!((row.id, row.name.as_str()), (7, "Fund Alpha"));
+        assert_eq!(row.createdAt, "2026-09-21 00:00:00 +0000 UTC");
     }
 }

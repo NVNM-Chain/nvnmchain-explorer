@@ -679,8 +679,8 @@ numbers:
   ruleset requires a review and squash merges but no status checks, so an
   org admin adds this in stage 2.
 - **A migration merged into another repo first** is the mistake this
-  prevents. The Fly app tracks yihuang's `main` (section 10, cutover step
-  1), so it would apply that migration to its SQLite file at once. If
+  prevents. Any deploy from yihuang's `main`, such as a `fly deploy` of
+  the Fly app, would apply that migration to its SQLite file at once. If
   NVNM-Chain has used the number, the fix is renaming a merged file and
   rebuilding every database that ran it.
 
@@ -1159,7 +1159,7 @@ password are the separate variables `PGUSER` and `PGPASSWORD`, so the
 password can be injected into the pod from Secret Manager without any URL
 holding it. `ROLE` picks the role. `DB_PATH` stays the SQLite setting, and
 `DATABASE_URL` wins when it is set. The Fly app, Render
-and the systemd unit set only `DB_PATH` (`fly.toml:15`, `render.yaml:16`,
+and the systemd unit set only `DB_PATH` (`fly.toml:14`, `render.yaml:16`,
 `deploy/nvnmchain-explorer.service:12`), and a test checks that `DB_PATH`
 alone still opens the file.
 
@@ -1758,10 +1758,9 @@ flowchart LR
    deployment of today's image on its SQLite file. It keeps its image,
    its SQLite file and all traffic. The new code reaches production only
    through the two new deployments, so it never opens the production
-   SQLite file. The Fly app (`nvnmchain-explorer`, deployed by
-   `docker.yml`'s `deploy-to-fly` job on every upstream `main` push) is not
-   production. It tracks `main`, so it runs stages 0–6 on SQLite as they
-   merge, and stage 2 stamps its file v1.
+   SQLite file. The Fly app (`nvnmchain-explorer`, deployed by hand with
+   `fly deploy`) is not production. It runs on SQLite, and the first deploy
+   of stage 2 or later stamps its file v1.
 2. **Deploy `explorer-indexer`** against an empty database. It passes the
    preflight, takes the lock, applies the migrations from v1, and
    re-indexes: forward from the head, backfill down to block 1, and the
