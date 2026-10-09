@@ -39,13 +39,13 @@ All of the options below give you a platform subdomain with TLS — no domain
 registration needed. If you already own a domain you can point a subdomain at
 any of them instead.
 
-| Provider                     | Cost (approx.)                    | Subdomain              | Notes                                                        |
-|------------------------------|-----------------------------------|------------------------|--------------------------------------------------------------|
-| **Fly.io** (recommended)     | ~$2/mo, free tier often covers it | `<app>.fly.dev`        | Managed PaaS, 1 GB persistent volume, `fly.toml` included    |
-| **Railway**                  | $5/mo base (includes $5 usage)    | `<app>.up.railway.app` | Same Dockerfile, volumes supported                           |
-| **Render**                   | $7/mo Starter + ~$0.25/GB disk    | `<app>.onrender.com`   | `render.yaml` included; must be paid (always-on)             |
-| **Hetzner Cloud**            | ~€4–5/mo VPS                      | your own or IP only    | Full VM, real disk, `deploy/install.sh` + systemd included   |
-| **Oracle Cloud Always Free** | $0                                | public IP only         | 4-OCPU ARM VM; free forever but more setup + capacity limits |
+| Provider | Cost (approx.) | Subdomain | Notes |
+|----------|----------------|-----------|-------|
+| **Fly.io** (recommended) | ~$2/mo, free tier often covers it | `<app>.fly.dev` | Managed PaaS, 1 GB persistent volume, `fly.toml` included |
+| **Railway** | $5/mo base (includes $5 usage) | `<app>.up.railway.app` | Same Dockerfile, volumes supported |
+| **Render** | $7/mo Starter + ~$0.25/GB disk | `<app>.onrender.com` | `render.yaml` included; must be paid (always-on) |
+| **Hetzner Cloud** | ~€4–5/mo VPS | your own or IP only | Full VM, real disk, `deploy/install.sh` + systemd included |
+| **Oracle Cloud Always Free** | $0 | public IP only | 4-OCPU ARM VM; free forever but more setup + capacity limits |
 
 ### Managed PaaS (Fly.io)
 
@@ -56,16 +56,13 @@ fly volumes create nvnm_data --size 5            # persistent disk for SQLite
 fly deploy
 ```
 
-The app listens on port 8080 and is served at `https://nvnmchain-explorer.fly.dev`
+The app listens on port 8080 and is served at `https://<app>.fly.dev`
 (TLS automatic). Keep the machine always-on — `auto_stop_machines = false` is
 already set in `fly.toml` because the indexer runs inside the web process.
-Merging to `main` deploys automatically — CI builds the image on Fly's remote
-builder and rolls it out (see `.github/workflows/docker.yml`). For a manual
-redeploy run `fly deploy` (the token for CI lives in the repo secret
-`FLY_API_TOKEN`, created with `fly tokens create deploy -x 2160h`). SQLite
-data lives on the volume and survives redeploys.
+To redeploy run `fly deploy`. SQLite data lives on the volume and survives
+redeploys.
 
-CI also publishes the image to
+CI publishes the image to
 `ghcr.io/yihuang/nvnmchain-explorer` (`latest` + `sha-<commit>` tags, and a
 `<tag>` tag for `v*` releases). Managed platforms can run that image directly
 instead of building from source.
@@ -128,39 +125,40 @@ The indexer is built for a sub-second chain:
 
 ## Configuration (env vars)
 
-| Var                      | Default                                   | Meaning                                                                                                  |
-|--------------------------|-------------------------------------------|----------------------------------------------------------------------------------------------------------|
-| `NVNM_RPC`               | `https://rpc.nvnm.canary.mantrachain.dev` | JSON-RPC endpoint (legacy `TEMPO_RPC` also accepted)                                                     |
-| `WS_URL`                 | `wss://ws.nvnm.canary.mantrachain.dev`    | WebSocket endpoint for `newHeads`                                                                        |
-| `INDEX_WS`               | `1`                                       | Set `0` to disable the WebSocket feed (pure polling)                                                     |
-| `CHAIN_ID`               | `787222`                                  | Chain id shown in the UI                                                                                 |
-| `DB_PATH`                | `explorer.db`                             | SQLite database path                                                                                     |
-| `HOST` / `PORT`          | `0.0.0.0` / `8080`                        | Bind address                                                                                             |
-| `INDEX_POLL_SECONDS`     | `1`                                       | Poll interval when the WebSocket feed is unavailable                                                     |
-| `INDEX_BATCH`            | `5`                                       | Blocks indexed per cycle (forward + backfill)                                                            |
-| `INDEX_CONCURRENCY`      | `32`                                      | Blocks fetched in parallel                                                                               |
-| `NATIVE_SYMBOL`          | `OM`                                      | Symbol shown for native (burnt/gas) amounts                                                              |
-| `STATS_INTERVAL_SECONDS` | `5`                                       | How often the dashboard stats are recomputed                                                             |
-| `SIGNATURE_LOOKUP_URL`   | OpenChain                                 | Signature directory for selectors no built-in ABI declares; set empty to disable ([Decoding](#decoding)) |
-| `RUST_LOG`               | `nvnmchain_explorer=info`                 | Log verbosity                                                                                            |
+| Var | Default | Meaning |
+|-----|---------|---------|
+| `NVNM_RPC` | `https://rpc.nvnm.canary.mantrachain.dev` | JSON-RPC endpoint (legacy `TEMPO_RPC` also accepted) |
+| `WS_URL` | `wss://ws.nvnm.canary.mantrachain.dev` | WebSocket endpoint for `newHeads` |
+| `INDEX_WS` | `1` | Set `0` to disable the WebSocket feed (pure polling) |
+| `CHAIN_ID` | `787222` | Chain id shown in the UI |
+| `DB_PATH` | `explorer.db` | SQLite database path |
+| `HOST` / `PORT` | `0.0.0.0` / `8080` | Bind address |
+| `INDEX_POLL_SECONDS` | `1` | Poll interval when the WebSocket feed is unavailable |
+| `INDEX_BATCH` | `5` | Blocks indexed per cycle (forward + backfill) |
+| `INDEX_CONCURRENCY` | `32` | Blocks fetched in parallel |
+| `NATIVE_SYMBOL` | `OM` | Symbol shown for native (burnt/gas) amounts |
+| `STATS_INTERVAL_SECONDS` | `5` | How often the dashboard stats are recomputed |
+| `SIGNATURE_LOOKUP_URL` | OpenChain | Signature directory for selectors no built-in ABI declares; set empty to disable ([Decoding](#decoding)) |
+| `RUST_LOG` | `nvnmchain_explorer=info` | Log verbosity |
 
 ## Routes
 
-| Path                             | Description                                                                                                  |
-|----------------------------------|--------------------------------------------------------------------------------------------------------------|
-| `/`                              | Dashboard (stats, recent blocks/txs)                                                                         |
-| `/block/{num\|hash}`             | Block detail                                                                                                 |
-| `/blocks`                        | Block list                                                                                                   |
-| `/tx/{hash}`                     | Transaction detail (tabs: Overview/Balances/Calls/Events/Raw)                                                |
-| `/address/{addr}`                | Address info (transactions, transfers, holdings, contract)                                                   |
-| `/token/{addr}`                  | Token metadata, transfers, and holders                                                                       |
-| `/tokens`                        | Token list                                                                                                   |
-| `/anchoring`                     | Anchoring registries; `?q=` finds an id, an exact name or a checksum                                         |
-| `/anchoring/{registry}`          | A registry and the latest version of each record                                                             |
-| `/anchoring/{registry}/{record}` | A record's versions                                                                                          |
-| `/search?q=...`                  | Smart redirect (block#/tx/address/token auto-detection)                                                      |
-| `/api/search?q=...`              | Suggestions for the search box, answered from the index                                                      |
-| `/api/events`                    | SSE live feed — pushes each newly indexed tip block (drives the home page's streaming "Latest Blocks" panel) |
+| Path | Description |
+|------|-------------|
+| `/` | Dashboard (stats, recent blocks/txs) |
+| `/block/{num\|hash}` | Block detail |
+| `/blocks` | Block list |
+| `/tx/{hash}` | Transaction detail (tabs: Overview/Balances/Calls/Events/Raw) |
+| `/address/{addr}` | Address info (transactions, transfers, holdings, contract) |
+| `/token/{addr}` | Token metadata, transfers, and holders |
+| `/tokens` | Token list |
+| `/anchoring` | Anchoring registries; `?q=` finds an id, a name or a checksum |
+| `/anchoring/{registry}` | A registry and the latest version of each record |
+| `/anchoring/{registry}/{record}` | A record's versions |
+| `/search?q=...` | Smart redirect (block#/tx/address/token auto-detection) |
+| `/api/search?q=...` | Suggestions for the search box, answered from the index |
+| `/api/anchoring/search?q=...` | Suggestions for the anchoring page's field |
+| `/api/events` | SSE live feed — pushes each newly indexed tip block (drives the home page's streaming "Latest Blocks" panel) |
 
 All data endpoints accept `?format=json` or `Accept: application/json`.
 
@@ -190,7 +188,7 @@ The anchoring pages read that contract over RPC, not the index: the corpus it
 was seeded with at genesis emitted no events. So does the search box, for a whole
 registry name or a record's checksum — all the contract matches. Any part of a name
 matches only in the node's registry name index: start the node with
-`--anchoring.name-index` and the box asks it, at a request per keystroke. A node without
+`--anchoring.name-index` and the box and the anchoring page ask it. A node without
 it answers "method not found", which costs the box those rows and nothing else.
 
 Each decoded log is also said in words, from the phrasing table in
@@ -258,7 +256,7 @@ src/
   summary.rs    what a transaction did, in a sentence
   memo.rs       TIP-20 transfer memos
   signatures.rs names for selectors no built-in ABI declares
-  name_search.rs  registry names from nvnmchain-anchoring, when one is configured
+  name_search.rs  registry names from the node's name index, when it runs one
   tempo_address.rs  TIP-1022 virtual addresses
   contracts.rs  precompile / token labels
   anchoring.rs  the anchoring contract's views
