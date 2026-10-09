@@ -68,29 +68,3 @@ jobs:
           # no quota and is rewritten in place.
           cache-from: type=registry,ref=${{ steps.meta.outputs.cache }}
           cache-to: type=registry,ref=${{ steps.meta.outputs.cache }},mode=max
-
-  # Deploys the app to Fly.io on every main push / release tag. The image is
-  # built from the repo Dockerfile on Fly's remote builder (fly.toml has no
-  # image pin), so deploys don't depend on GHCR. Runs independently of
-  # build-and-push so a GHCR hiccup never blocks the app going live.
-  #
-  # Set the repo secret FLY_API_TOKEN first:
-  #   fly tokens create deploy -x 2160h
-  deploy-to-fly:
-    name: Deploy to Fly.io
-    runs-on: ubuntu-latest
-    if: github.repository_owner == 'yihuang'
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          submodules: true
-
-      - name: Install flyctl
-        run: |
-          curl -fsSL https://fly.io/install.sh | sh
-          echo "$HOME/.fly/bin" >> "$GITHUB_PATH"
-
-      - name: Deploy
-        run: fly deploy --remote-only
-        env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

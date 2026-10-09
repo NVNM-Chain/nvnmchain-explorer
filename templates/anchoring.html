@@ -8,12 +8,16 @@
         <h1 class="text-2xl font-extrabold tracking-tight">Anchoring</h1>
         <p class="text-xs text-dim mt-1">{% if not q %}{{ total }} registries · {% endif %}read from the contract at {{ ui::copy_address(address=address) }}</p>
     </div>
-    <form action="/anchoring" method="get" class="w-full md:w-96">
-        <input type="text" name="q" value="{{ q }}" class="search-input" placeholder="Registry id, exact name or checksum">
+    <form action="/anchoring" method="get" class="w-full md:w-96 search-box" role="search">
+        <input type="text" name="q" value="{{ q }}" class="search-input" placeholder="Registry id, name or checksum"
+               data-suggest="/api/anchoring/search"
+               autocomplete="off" role="combobox" aria-expanded="false"
+               aria-controls="anchoring-suggestions" aria-autocomplete="list">
+        <div id="anchoring-suggestions" class="suggestions" role="listbox" hidden></div>
     </form>
 </div>
 
-{% if q %}<h2 class="section-title mb-2">Registries named “{{ q }}”</h2>{% endif %}
+{% if q %}<h2 class="section-title mb-2">Registries matching “{{ q }}”</h2>{% endif %}
 <div class="card overflow-x-auto mb-6">
     <div class="min-w-[720px]">
         <div class="flex table-header">
@@ -33,7 +37,7 @@
             <div class="w-56 px-3 py-3 text-right text-faint">{{ registry.createdAt }}</div>
         </div>
         {% else %}
-        <div class="card-body text-center text-dim text-sm py-10">{% if q %}No registry has this name{% else %}No registries yet{% endif %}</div>
+        <div class="card-body text-center text-dim text-sm py-10">{% if q %}No registry matches this name{% else %}No registries yet{% endif %}</div>
         {% endfor %}
     </div>
 </div>

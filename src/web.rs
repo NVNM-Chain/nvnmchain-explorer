@@ -1659,7 +1659,7 @@ pub async fn tokens_page(
 // ---------------------------------------------------------------------------
 
 /// The anchoring contract's registries, newest first; or, given `q`, the registries with that
-/// exact name and the records with that checksum. A browser asking for an id is sent to it.
+/// name and the records with that checksum. A browser asking for an id is sent to it.
 pub async fn anchoring_page(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1682,9 +1682,9 @@ pub async fn anchoring_page(
                 })
             })
     } else {
-        anchoring::lookup(&state.rpc, q)
+        anchoring_search(&state.rpc, q, PER_PAGE as usize)
             .await
-            .map(|(named, records)| json!({"registries": named, "records": records}))
+            .map(|(registries, records)| json!({"registries": registries, "records": records}))
     };
     match found {
         Ok(mut extra) => {
@@ -1899,13 +1899,13 @@ struct Hit {
 }
 
 impl Hit {
-    fn registry(id: u64, name: String) -> Self {
+    fn registry(registry: &anchoring::Registry) -> Self {
         Self {
             kind: "registry",
-            id: id.to_string(),
-            url: format!("/anchoring/{id}"),
-            label: name,
-            sublabel: format!("Registry #{id}"),
+            id: registry.id.to_string(),
+            url: format!("/anchoring/{}", registry.id),
+            label: registry.name.clone(),
+            sublabel: format!("Registry #{}", registry.id),
         }
     }
 
@@ -1920,30 +1920,32 @@ impl Hit {
     }
 }
 
-/// What the chain knows about `q`, best first: a registry by its whole name, a record by
-/// its checksum, then registries whose name contains it, which only a node running the
-/// name index matches. Empty when neither knows it, or cannot be reached.
+/// What the chain knows of `q`: the registries with that whole name and the records with that
+/// checksum, from the contract, then at most `limit` registries whose name contains it, from
+/// the name index, none twice. Both asked at once: a keystroke waits on the slower one only.
+async fn anchoring_search(
+    rpc: &ChainRpc,
+    q: &str,
+    limit: usize,
+) -> anyhow::Result<(Vec<anchoring::Registry>, Vec<anchoring::Record>)> {
+    let (found, mut partial) = tokio::join!(
+        anchoring::lookup(rpc, q),
+        name_search::matching(rpc, q, limit)
+    );
+    let (mut registries, records) = found?;
+    partial.retain(|r| !registries.iter().any(|seen| seen.id == r.id));
+    registries.extend(partial);
+    Ok((registries, records))
+}
+
+/// `anchoring_search` as suggestions, registries first. Empty when the node is slow or down:
+/// the reader loses these rows, not the box.
 async fn anchoring_hits(state: &AppState, q: &str, limit: usize) -> Vec<Hit> {
-    let mut hits = Vec::new();
-    // Two calls to the node per keystroke: a slow node costs the reader these
-    // rows, not the whole suggestion.
-    let asked = tokio::time::timeout(name_search::TIMEOUT, anchoring::lookup(&state.rpc, q)).await;
-    if let Ok(Ok((registries, records))) = asked {
-        hits.extend(
-            registries
-                .iter()
-                .map(|r| Hit::registry(r.id, r.name.clone())),
-        );
-        hits.extend(records.iter().map(Hit::record));
-    }
-    if hits.len() < limit {
-        for named in name_search::matching(&state.rpc, q, limit).await {
-            let hit = Hit::registry(named.id, named.name);
-            if !hits.iter().any(|seen| seen.url == hit.url) {
-                hits.push(hit);
-            }
-        }
-    }
+    let asked =
+        tokio::time::timeout(name_search::TIMEOUT, anchoring_search(&state.rpc, q, limit)).await;
+    let (registries, records) = asked.ok().and_then(Result::ok).unwrap_or_default();
+    let mut hits: Vec<Hit> = registries.iter().map(Hit::registry).collect();
+    hits.extend(records.iter().map(Hit::record));
     hits.truncate(limit);
     hits
 }
@@ -1968,9 +1970,6 @@ pub async fn search_suggest(
     }
 
     let mut results: Vec<Value> = Vec::new();
-    // `type` is both the routing hint and the label on the row, so a
-    // precompile says so rather than calling itself an address.
-    let suggestion = |kind: &str, url: String, label: String, sublabel: String| json!({"type": kind, "url": url, "label": label, "sublabel": sublabel});
 
     // A block number, if the chain has reached it. The digit check keeps
     // `parse` from accepting a sign the reader did not mean as a number.
@@ -2061,6 +2060,39 @@ pub async fn search_suggest(
 
     results.truncate(SUGGESTION_LIMIT);
     suggest_response(&raw, results)
+}
+
+/// Suggestions for the anchoring page's field: a number is a registry id, as on the page;
+/// anything else is a name or a checksum.
+pub async fn anchoring_suggest(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let raw = query.get("q").cloned().unwrap_or_default();
+    let q = raw.trim();
+    let hits = if q.is_empty() {
+        Vec::new()
+    } else if q.chars().all(|c| c.is_ascii_digit()) {
+        let id = q.parse().unwrap_or(0);
+        let asked = anchoring::find_registry(&state.rpc, id);
+        match tokio::time::timeout(name_search::TIMEOUT, asked).await {
+            Ok(Ok(Some(registry))) => vec![Hit::registry(&registry)],
+            _ => Vec::new(),
+        }
+    } else {
+        anchoring_hits(&state, q, SUGGESTION_LIMIT).await
+    };
+    let results = hits
+        .into_iter()
+        .map(|hit| suggestion(hit.kind, hit.url, hit.label, hit.sublabel))
+        .collect();
+    suggest_response(&raw, results)
+}
+
+/// A suggestion row. `type` is both the routing hint and the label on the row, so a
+/// precompile says so rather than calling itself an address.
+fn suggestion(kind: &str, url: String, label: String, sublabel: String) -> Value {
+    json!({"type": kind, "url": url, "label": label, "sublabel": sublabel})
 }
 
 /// The suggestions as JSON, cacheable for a moment: backspacing re-asks the
@@ -2357,6 +2389,7 @@ pub fn app(state: AppState) -> Router {
         )
         .route("/search", get(search_page))
         .route("/api/search", get(search_suggest))
+        .route("/api/anchoring/search", get(anchoring_suggest))
         // Public explorer: allow cross-origin reads from any site (the wallet
         // is hosted on a different origin and needs `?format=json`).
         .layer(CorsLayer::permissive())
