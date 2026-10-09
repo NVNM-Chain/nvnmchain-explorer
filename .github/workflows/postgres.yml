@@ -1,5 +1,4 @@
-# Fork-owned: ci.yml is upstream's, and a job appended there would conflict
-# with upstream's next change to it. See docs/database.md.
+# The Postgres backend's suites. ci.yml runs everything that needs no server.
 name: Postgres
 
 on:
@@ -7,28 +6,43 @@ on:
     branches: ["main"]
   pull_request:
     branches: ["main"]
+  schedule:
+    # Nightly on the oldest supported major.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
 
 env:
   RUSTFLAGS: "-D warnings"
+  PG_TEST_URL: postgres://explorer:explorer@localhost:5432/explorer
 
 jobs:
   postgres:
-    name: Test (Postgres)
+    name: ${{ matrix.suite }} (PG ${{ matrix.pg }})
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:18.6 # same tag as docker-compose.yml
+        # 18.6 is docker-compose.yml's tag: change both together.
+        image: postgres:${{ matrix.pg }}
+        command: postgres -c max_connections=300
         env:
           POSTGRES_USER: explorer
           POSTGRES_PASSWORD: explorer
           POSTGRES_DB: explorer
           POSTGRES_INITDB_ARGS: --locale=C --encoding=UTF8
+        # A fixed host port: the restart drill restarts this container, and
+        # PG_TEST_URL must still reach it afterwards.
         ports: ["5432:5432"]
         options: >-
           --health-cmd "pg_isready -U explorer -d explorer"
           --health-interval 2s --health-timeout 3s --health-retries 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # PG 18 on every push and PR; PG 15 nightly.
+        pg: ${{ github.event_name == 'schedule' && fromJSON('["15.15"]') || fromJSON('["18.6"]') }}
+        suite: [backend-matrix, postgres-suites, live-baseline]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           submodules: true
 
@@ -41,9 +55,27 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Network-free suites on Postgres
+        if: matrix.suite == 'backend-matrix'
+        env:
+          TEST_DB: postgres
+        run: cargo test --test decoder --test anchoring --test pages
+
       # The tests are #[ignore]d so plain `cargo test` needs no server; here
       # they must run, and fail rather than skip if PG_TEST_URL is missing.
-      - name: Schema parity and baseline round-trip
-        run: cargo test --test postgres -- --include-ignored
+      - name: Replay, differential, grid, migrations, locks and outages
+        if: matrix.suite == 'postgres-suites'
+        run: |
+          cargo test --lib -- --include-ignored
+          cargo test --features db-coverage \
+            --test postgres --test migrations --test replay --test differential \
+            --test grid --test locks --test indexer_pg --test outage_drills \
+            -- --include-ignored
+          PG_CONTAINER=${{ job.services.postgres.id }} cargo test --features db-coverage --test restart_drill -- --include-ignored
+
+      - name: Live baseline re-index into Postgres
+        if: matrix.suite == 'live-baseline'
         env:
-          PG_TEST_URL: postgres://explorer:explorer@localhost:5432/explorer
+          TEST_DB: postgres
+          TEMPO_RPC: https://rpc.nvnm.canary.mantrachain.dev
+        run: cargo test --test baseline

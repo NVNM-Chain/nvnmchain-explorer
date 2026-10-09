@@ -1,4 +1,5 @@
 # Environment / tooling
+.env
 .envrc
 .direnv
 .aider*

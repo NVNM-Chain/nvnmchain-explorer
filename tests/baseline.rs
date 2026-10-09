@@ -32,11 +32,16 @@ use nvnmchain_explorer::indexer::fetch_block_bundle;
 use nvnmchain_explorer::models::BlockBundle;
 use nvnmchain_explorer::rpc::ChainRpc;
 use nvnmchain_explorer::tokens::balances_at_genesis;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 
 #[allow(dead_code)]
 mod common;
-use common::baseline::{columns, diff_rows, rows, tables, SPECS};
+use common::baseline::{
+    columns, diff_rows, fixture_paths, open_fixture, pg_rows, rows, tables, Rows, Spec, SPECS,
+};
+
+#[path = "common/backend.rs"]
+mod backend;
 
 /// The ranges `build_baseline` indexes by default, chosen so that one small
 /// database exercises every write path: canary's first Transfer (102504); all
@@ -56,7 +61,12 @@ const COMMIT: usize = 64;
 
 /// Written by the live loops and page views rather than by indexing a block:
 /// watermarks, the stats blob and the selector cache.
-const NOT_INDEXED: &[&str] = &["kv", "selector_names", "sqlite_sequence"];
+const NOT_INDEXED: &[&str] = &[
+    "kv",
+    "schema_migrations",
+    "selector_names",
+    "sqlite_sequence",
+];
 
 /// The most differences printed; the counts per table are always complete.
 const SHOWN: usize = 25;
@@ -69,17 +79,8 @@ fn rpc() -> ChainRpc {
 }
 
 /// The one line that differs between builds: how a database is opened.
-fn open_db(path: &str) -> Db {
-    db::open(path).expect("open database")
-}
-
-fn open_baseline(path: &str) -> Connection {
-    let abs = std::fs::canonicalize(path).unwrap_or_else(|e| panic!("baseline {path}: {e}"));
-    Connection::open_with_flags(
-        format!("file:{}?immutable=1", abs.display()),
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-    )
-    .unwrap_or_else(|e| panic!("open baseline {path}: {e}"))
+async fn open_db(path: &str) -> Db {
+    db::open(path).await.expect("open database")
 }
 
 /// The contiguous runs of block numbers a database holds.
@@ -135,26 +136,74 @@ async fn fetch(rpc: &ChainRpc, number: u64) -> anyhow::Result<BlockBundle> {
 /// Index `runs` into `db` the way a baseline is built: fetched concurrently,
 /// written in ascending block order, then the genesis pass the explorer runs
 /// alongside indexing, which fills `genesis_balances` and adds each holder's
-/// block-0 balance to `token_balances`.
-async fn reindex(rpc: &ChainRpc, db: &Db, runs: &[RangeInclusive<u64>]) {
+/// block-0 balance to `token_balances`. Returns the most statements one batch
+/// sent, for Postgres's round-trip budget.
+async fn reindex(rpc: &ChainRpc, db: &Db, runs: &[RangeInclusive<u64>]) -> u64 {
     let numbers: Vec<u64> = runs.iter().cloned().flatten().collect();
     let mut bundles = stream::iter(numbers)
         .map(|n| fetch(rpc, n))
         .buffered(CONCURRENCY)
         .try_chunks(COMMIT);
+    let mut worst = 0;
     while let Some(chunk) = bundles.next().await {
         let chunk = chunk.map_err(|e| e.1).expect("fetch");
-        db::save_block_bundles(db, &chunk).expect("save");
+        let before = db::statements();
+        db::save_block_bundles(db, &chunk).await.expect("save");
+        worst = worst.max(db::statements() - before);
     }
     add_genesis_balances(rpc, db).await;
+    worst
+}
+
+/// The re-indexed database, on either backend.
+enum Fresh {
+    Sqlite(Connection),
+    Postgres(sqlx::PgConnection),
+}
+
+impl Fresh {
+    async fn tables(&mut self) -> Vec<String> {
+        match self {
+            Fresh::Sqlite(conn) => tables(conn),
+            Fresh::Postgres(conn) => sqlx::query_scalar(
+                "SELECT table_name::text FROM information_schema.tables
+                 WHERE table_schema = current_schema() ORDER BY 1",
+            )
+            .fetch_all(conn)
+            .await
+            .unwrap(),
+        }
+    }
+
+    async fn columns(&mut self, table: &str) -> Vec<String> {
+        match self {
+            Fresh::Sqlite(conn) => columns(conn, table),
+            Fresh::Postgres(conn) => sqlx::query_scalar(
+                "SELECT column_name::text FROM information_schema.columns
+                 WHERE table_schema = current_schema() AND table_name = $1 ORDER BY ordinal_position",
+            )
+            .bind(table)
+            .fetch_all(conn)
+            .await
+            .unwrap(),
+        }
+    }
+
+    async fn rows(&mut self, spec: &Spec, cols: &[String]) -> Rows {
+        match self {
+            Fresh::Sqlite(conn) => rows(conn, spec, cols),
+            Fresh::Postgres(conn) => pg_rows(conn, spec, cols).await,
+        }
+    }
 }
 
 /// `indexer::add_genesis_balances`, which is private: page through the
 /// transfers' holders and store each one's balance at block 0. A page's
 /// lookup is retried; the cursor only moves once its balances are stored.
 async fn add_genesis_balances(rpc: &ChainRpc, db: &Db) {
-    while let Some((cursor, holders)) =
-        db::holders_without_genesis_balance(db, 1000).expect("genesis holders")
+    while let Some((cursor, holders)) = db::holders_without_genesis_balance(db, 1000)
+        .await
+        .expect("genesis holders")
     {
         let mut wait = Duration::from_millis(250);
         let balances = loop {
@@ -166,17 +215,19 @@ async fn add_genesis_balances(rpc: &ChainRpc, db: &Db) {
             wait *= 2;
         };
         let rows: Vec<_> = holders.into_iter().zip(balances).collect();
-        db::save_genesis_balances(db, &rows, cursor).expect("save genesis balances");
+        db::save_genesis_balances(db, &rows, cursor)
+            .await
+            .expect("save genesis balances");
     }
 }
 
 /// Every difference between the baseline and the re-indexed database, and
 /// the rows compared per table.
-fn compare(baseline: &Connection, fresh: &Connection) -> (Vec<String>, Vec<(String, usize)>) {
+async fn compare(baseline: &Connection, fresh: &mut Fresh) -> (Vec<String>, Vec<(String, usize)>) {
     let mut diffs = Vec::new();
     let mut compared = Vec::new();
     let mut all_tables = tables(baseline);
-    all_tables.extend(tables(fresh));
+    all_tables.extend(fresh.tables().await);
     all_tables.sort();
     all_tables.dedup();
     for table in all_tables {
@@ -189,13 +240,15 @@ fn compare(baseline: &Connection, fresh: &Connection) -> (Vec<String>, Vec<(Stri
     for spec in SPECS {
         // Both directions: a column the re-index no longer writes is lost
         // data, not a column to stop comparing.
-        let compared_cols = |conn| -> Vec<String> {
-            columns(conn, spec.table)
-                .into_iter()
+        let compared_cols = |all: Vec<String>| -> Vec<String> {
+            all.into_iter()
                 .filter(|c| !spec.skip.contains(&c.as_str()))
                 .collect()
         };
-        let (base_cols, cols) = (compared_cols(baseline), compared_cols(fresh));
+        let (base_cols, cols) = (
+            compared_cols(columns(baseline, spec.table)),
+            compared_cols(fresh.columns(spec.table).await),
+        );
         let mut schema_diffs = Vec::new();
         for (side, present, other) in [
             ("baseline", &base_cols, &cols),
@@ -216,7 +269,7 @@ fn compare(baseline: &Connection, fresh: &Connection) -> (Vec<String>, Vec<(Stri
             diffs.extend(schema_diffs);
             continue;
         }
-        let (base, new) = (rows(baseline, spec, &cols), rows(fresh, spec, &cols));
+        let (base, new) = (rows(baseline, spec, &cols), fresh.rows(spec, &cols).await);
         compared.push((spec.table.to_string(), base.len()));
         diffs.extend(diff_rows(spec.table, &base, &new, ("baseline", "re-index")));
     }
@@ -233,16 +286,10 @@ fn baselines() -> Vec<String> {
             .map(String::from)
             .collect();
     }
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/baseline");
-    let mut found: Vec<String> = std::fs::read_dir(&dir)
-        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
-        .map(|entry| entry.unwrap().path())
-        .filter(|p| p.extension().is_some_and(|e| e == "db"))
+    fixture_paths()
+        .iter()
         .map(|p| p.display().to_string())
-        .collect();
-    found.sort();
-    assert!(!found.is_empty(), "no baselines under {}", dir.display());
-    found
+        .collect()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -250,18 +297,31 @@ async fn reindexing_reproduces_each_baseline() {
     let rpc = rpc();
     let mut failed = Vec::new();
     for path in &baselines() {
-        let baseline = open_baseline(path);
+        let baseline = open_fixture(path);
         let runs = block_runs(&baseline);
         assert!(!runs.is_empty(), "{path}: no blocks to re-index");
         eprintln!("{path}: re-indexing {runs:?}");
 
-        let dir = tempfile::tempdir().expect("tempdir");
-        let fresh_path = dir.path().join("reindex.db");
-        let fresh_path = fresh_path.to_str().unwrap();
-        reindex(&rpc, &open_db(fresh_path), &runs).await;
-
-        let fresh = Connection::open(fresh_path).expect("open re-index");
-        let (diffs, compared) = compare(&baseline, &fresh);
+        let (mut fresh, _guard) = if backend::on_postgres() {
+            let (scratch, url) = backend::scratch_schema().await;
+            let db = backend::open(&backend::pg_config(&url, db::Role::All)).await;
+            let worst = reindex(&rpc, &db, &runs).await;
+            eprintln!("  at most {worst} round trip(s) per batch");
+            assert!(
+                worst <= 14,
+                "{path}: a batch took {worst} round trips; the budget is 14"
+            );
+            use sqlx::Connection as _;
+            let conn = sqlx::PgConnection::connect(&url).await.unwrap();
+            (Fresh::Postgres(conn), backend::TempDb::Postgres(scratch))
+        } else {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let fresh_path = dir.path().join("reindex.db");
+            reindex(&rpc, &open_db(fresh_path.to_str().unwrap()).await, &runs).await;
+            let conn = Connection::open(&fresh_path).expect("open re-index");
+            (Fresh::Sqlite(conn), backend::TempDb::Sqlite(dir))
+        };
+        let (diffs, compared) = compare(&baseline, &mut fresh).await;
         for (table, n) in &compared {
             eprintln!("  {table}: {n} row(s)");
         }
@@ -299,7 +359,7 @@ async fn build_baseline() {
         Err(_) => RICH_RANGES.to_vec(),
     };
     eprintln!("{path}: indexing {runs:?}");
-    reindex(&rpc(), &open_db(&path), &runs).await;
+    reindex(&rpc(), &open_db(&path).await, &runs).await;
     let conn = Connection::open(&path).unwrap();
     for table in [
         "blocks",

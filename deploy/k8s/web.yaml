@@ -1,0 +1,81 @@
+# The web replicas: pages, the live feed (a polling follower), and the two
+# cache writes. They never take the writer's lock.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: explorer-web
+  labels: {app: explorer, role: web}
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 1, maxUnavailable: 0}
+  selector:
+    matchLabels: {app: explorer, role: web}
+  template:
+    metadata:
+      labels: {app: explorer, role: web}
+    spec:
+      # The explorer never calls the Kubernetes API, so it gets no token.
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: explorer
+          image: ghcr.io/nvnm-chain/nvnmchain-explorer:latest # pin a sha-<commit> tag
+          env:
+            - {name: ROLE, value: web}
+            - name: DATABASE_URL
+              value: postgres://explorer-db.internal:5432/explorer
+            - {name: PGUSER, value: explorer_web}
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef: {name: explorer-web-db, key: password}
+            - {name: FOLLOW_POLL_MS, value: "500"}
+            - {name: NVNM_RPC, value: "https://rpc.example.internal"}
+            - {name: PORT, value: "8080"}
+          ports:
+            - {name: http, containerPort: 8080}
+          startupProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+          # Ready once the database is at this image's schema (the indexer
+          # migrates first).
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 5
+            failureThreshold: 3
+          lifecycle:
+            # axum stops accepting the moment SIGTERM arrives; give the
+            # endpoints time to drop the pod first.
+            preStop:
+              sleep: {seconds: 10}
+          resources:
+            requests: {cpu: 250m, memory: 256Mi}
+            limits: {memory: 1Gi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: explorer-web
+spec:
+  selector: {app: explorer, role: web}
+  ports:
+    - {name: http, port: 80, targetPort: http}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: explorer-web
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: explorer-web}
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: {type: Utilization, averageUtilization: 70}

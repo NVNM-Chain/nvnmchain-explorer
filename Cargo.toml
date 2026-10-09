@@ -2,6 +2,8 @@
 name = "nvnmchain-explorer"
 version = "0.1.0"
 edition = "2021"
+# sqlx 0.9 requires it.
+rust-version = "1.94"
 description = "nvnmchain blockchain explorer (Rust)"
 license = "MIT"
 
@@ -9,8 +11,12 @@ license = "MIT"
 anyhow = "1"
 axum = "0.8"
 chrono = { version = "0.4", features = ["clock"] }
+# `.env`, read at startup. Already built for sqlx.
+dotenvy = "0.15"
 futures-util = "0.3"
 hex = "0.4"
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.17", default-features = false }
 num-bigint = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-webpki-roots"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -23,7 +29,13 @@ tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors"] }
+url = "2"
+# The Postgres backend, without TLS: the database is reached over a private
+# network. Pinned: the writer leans on its connection behaviour
+# (docs/superpowers/specs/2026-10-03-postgres-backend-design.md).
+sqlx = { version = "=0.9.0", default-features = false, features = ["runtime-tokio", "postgres"] }
 
 # Tempo tx types: RLP-decode the typed 0x76 transaction
 # (https://tempo.xyz/developers/docs/sdk/rust)
@@ -37,8 +49,17 @@ alloy-primitives = "1"
 alloy-sol-types = "1"
 alloy-consensus = "2"
 
+# SIGINT and SIGTERM on a thread of their own, so shutdown keeps its deadline
+# while inline SQLite calls hold the runtime's workers.
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.4"
+
+[features]
+# Records which `db` functions ran, for the gate that every one runs on both
+# backends (src/db/mod.rs, `coverage`).
+db-coverage = []
+
 [dev-dependencies]
-sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres"] }
 tempfile = "3"
 
 [profile.release]

@@ -13,6 +13,8 @@ RUN mkdir src \
 
 COPY src ./src
 COPY templates ./templates
+# Compiled in via include_str! by src/db/migrations.rs.
+COPY migrations ./migrations
 # Compiled in via include_str!; the runtime image does not need a copy.
 COPY abi ./abi
 COPY contracts/layout ./contracts/layout

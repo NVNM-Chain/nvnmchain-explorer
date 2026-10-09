@@ -7,8 +7,8 @@
 //! left idle; backfill yields the RPC when the tip falls behind.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::ops::RangeInclusive;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -26,7 +26,7 @@ use crate::models::{AnchoringEvent, BlockBundle, Transaction, TransferEvent};
 use crate::parse::{parse_block, parse_transaction};
 use crate::rpc::ChainRpc;
 use crate::summary::ZERO_ADDRESS;
-use crate::tokens::{fetch_token_metadata, has_control_chars};
+use crate::tokens::{fetch_token_metadata, has_control_chars, TokenMeta};
 
 /// How many blocks share one JSON-RPC HTTP request. Sixteen empty blocks
 /// (32 methods when receipts are included) measured at ~265ms against the
@@ -517,7 +517,7 @@ pub async fn index_block(rpc: &ChainRpc, db: &Db, block_num: u64) -> Result<()> 
     let Some(bundle) = fetch_block_bundle(rpc, block_num).await? else {
         return Ok(());
     };
-    db::save_block_bundle(db, &bundle)?;
+    db::save_block_bundle(db, &bundle).await?;
     Ok(())
 }
 
@@ -533,6 +533,7 @@ const WINDOW: u64 = 50_000;
 /// stopped run resume at its last window.
 pub async fn backfill_anchoring(rpc: &ChainRpc, db: &Db) -> Result<()> {
     let done: u64 = db::get_kv(db, BACKFILL_KEY)
+        .await
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     let head = rpc.eth_block_number().await.context("head for backfill")?;
@@ -573,11 +574,12 @@ pub async fn backfill_anchoring(rpc: &ChainRpc, db: &Db) -> Result<()> {
         backoff = Duration::from_secs(1);
         // One transaction per window, watermark included, holding the shared
         // connection only to write.
-        wrote += db::save_anchoring_window(db, BACKFILL_KEY, &to.to_string(), |stamp| {
+        wrote += db::save_anchoring_window(db, BACKFILL_KEY, &to.to_string(), move |stamp| {
             logs.iter()
                 .filter_map(|log| anchoring_event_from_log(stamp, log))
                 .collect()
-        })?;
+        })
+        .await?;
         from = to + 1;
         // Leave the node to the indexer between windows.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -610,6 +612,7 @@ fn anchoring_event_from_log(
 /// so a deployed database self-heals without manual intervention.
 async fn repair_token_metadata(rpc: &ChainRpc, db: &Db) -> Result<()> {
     let stale: Vec<String> = db::get_all_token_metas(db)
+        .await
         .into_iter()
         .filter(|m| {
             RESERVED_TOKENS.contains(&m.address.as_str())
@@ -638,7 +641,7 @@ async fn repair_token_metadata(rpc: &ChainRpc, db: &Db) -> Result<()> {
             }
             // Written as they arrive: the writes take the lock, so they queue anyway.
             Ok(Ok(meta)) => {
-                if let Err(e) = db::save_token_metadata(db, &meta) {
+                if let Err(e) = db::save_token_metadata(db, &meta).await {
                     warn!(
                         "failed to repair token metadata for {}: {e:#}",
                         meta.address
@@ -670,16 +673,12 @@ struct Indexer {
     known_tokens: Arc<Mutex<HashSet<String>>>,
     bundle_tx: mpsc::Sender<BlockBundle>,
     shutdown: watch::Receiver<bool>,
-    tip_lag: Arc<AtomicU64>,
+    sync: SyncTracker,
 }
 
 impl Indexer {
     fn shutting_down(&self) -> bool {
         *self.shutdown.borrow()
-    }
-
-    fn set_tip_lag(&self, lag: u64) {
-        self.tip_lag.store(lag, Ordering::Relaxed);
     }
 
     /// Fetch `from..=to` as multi-block RPC batches, returning bundles in
@@ -786,7 +785,7 @@ fn drain_heads(rx: &mut mpsc::Receiver<u64>, mut head: u64) -> u64 {
 async fn wait_for_seed(db: &Db) -> u64 {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        if let Some(b) = db::get_latest_block(db) {
+        if let Some(b) = db::get_latest_block(db).await {
             return b.number as u64;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -808,6 +807,7 @@ async fn forward_loop(mut ix: Indexer, block_events: broadcast::Sender<Value>) {
     ));
 
     let mut sent = db::get_latest_block(&ix.db)
+        .await
         .map(|b| b.number as u64)
         .unwrap_or(0);
     info!("forward loop started from block {sent}");
@@ -819,7 +819,7 @@ async fn forward_loop(mut ix: Indexer, block_events: broadcast::Sender<Value>) {
         // A fast head feed delivers every block; fold queued heads into one
         // range so we fetch a batch instead of one HTTP request per block.
         let mut head = drain_heads(&mut head_rx, head);
-        db::set_chain_head(&ix.db, head as i64);
+        db::set_chain_head(&ix.db, head as i64).await;
 
         if sent == 0 && head > 0 {
             sent = wait_for_seed(&ix.db).await;
@@ -837,9 +837,10 @@ async fn forward_loop(mut ix: Indexer, block_events: broadcast::Sender<Value>) {
                 return;
             }
             head = drain_heads(&mut head_rx, head);
-            db::set_chain_head(&ix.db, head as i64);
+            db::set_chain_head(&ix.db, head as i64).await;
             let end = sent.saturating_add(ix.cfg.batch).min(head);
-            ix.set_tip_lag(head.saturating_sub(sent));
+            ix.sync
+                .update(|s| s.tip_lag = Some(head.saturating_sub(sent) as i64));
             let bundles = ix.fetch_from(sent + 1, end).await;
             // Nothing past `sent` came back: the fetch failed, or the node has
             // not caught up with the head it announced. Ask again after a
@@ -865,7 +866,7 @@ async fn forward_loop(mut ix: Indexer, block_events: broadcast::Sender<Value>) {
             }
             sent = reached;
         }
-        ix.set_tip_lag(0);
+        ix.sync.update(|s| s.tip_lag = Some(0));
     }
     warn!("forward loop stopped (head feed closed)");
 }
@@ -879,13 +880,17 @@ async fn backfill_loop(mut ix: Indexer) {
     // In-memory descending frontier: advancing this without waiting for the
     // writer lets the next fetch overlap the previous commit. Writes are
     // idempotent, so a crash just re-fetches the last in-flight batch.
-    let mut frontier: Option<u64> = db::get_min_block_number(&ix.db).map(|n| n as u64);
+    // Read through `try_min_block_number`: an outage must never read as an
+    // empty table, or backfill would start over from the head.
+    let Some(mut frontier) = lowest_block(&mut ix).await else {
+        return;
+    };
     let mut consecutive_failures = 0u32;
     loop {
         if ix.shutting_down() {
             break;
         }
-        if ix.tip_lag.load(Ordering::Relaxed) > TIP_YIELD_LAG {
+        if ix.sync.get().tip_lag.unwrap_or(0) > TIP_YIELD_LAG as i64 {
             if sleep_or_shutdown(&mut ix.shutdown, Duration::from_millis(50)).await {
                 break;
             }
@@ -897,7 +902,10 @@ async fn backfill_loop(mut ix: Indexer) {
                 if sleep_or_shutdown(&mut ix.shutdown, ix.cfg.poll).await {
                     break;
                 }
-                frontier = db::get_min_block_number(&ix.db).map(|n| n as u64);
+                let Some(min) = lowest_block(&mut ix).await else {
+                    break;
+                };
+                frontier = min;
                 continue;
             }
             None => match ix.rpc.eth_block_number().await {
@@ -935,6 +943,199 @@ async fn backfill_loop(mut ix: Indexer) {
     }
 }
 
+/// The lowest stored block, retried until it reads: on an error there is no
+/// frontier to fall back to, and `None` would mean "start from the head".
+/// `None` only on shutdown.
+async fn lowest_block(ix: &mut Indexer) -> Option<Option<u64>> {
+    loop {
+        match db::try_min_block_number(&ix.db).await {
+            Ok(min) => {
+                ix.sync.update(|s| s.lowest_block = min);
+                return Some(min.map(|n| n as u64));
+            }
+            Err(e) => {
+                warn!("backfill frontier read failed; retrying: {e:#}");
+                if sleep_or_shutdown(&mut ix.shutdown, ix.cfg.poll).await {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+/// What the indexer reports in `/readyz` for the cutover: read from what its
+/// loops last saw, never from the database.
+#[derive(Clone)]
+struct SyncTracker {
+    db: Db,
+    report: bool,
+    sync: Arc<Mutex<db::Sync>>,
+}
+
+impl SyncTracker {
+    fn new(db: Db) -> Self {
+        SyncTracker {
+            report: db::role(&db) == db::Role::Indexer,
+            db,
+            sync: Arc::default(),
+        }
+    }
+
+    fn get(&self) -> db::Sync {
+        *self.sync.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Apply `f`, work out `complete` again, and publish the result.
+    fn update(&self, f: impl FnOnce(&mut db::Sync)) {
+        let mut s = self.sync.lock().unwrap_or_else(|e| e.into_inner());
+        f(&mut s);
+        s.complete = s.lowest_block == Some(1)
+            && s.tip_lag.is_some_and(|l| l <= TIP_YIELD_LAG as i64)
+            && s.genesis
+            && s.anchoring;
+        if self.report {
+            let s = *s;
+            db::update_status(&self.db, |st| st.sync = Some(s));
+        }
+    }
+}
+
+/// One pass of the missing-metadata job: fetch each candidate, and each
+/// address an earlier pass could not, and save the ones that are tokens. An
+/// address that answers to neither name nor symbol is not a token, and is
+/// dropped; one whose fetch failed is kept for the next pass.
+async fn missing_metadata_pass<F, Fut>(
+    db: &Db,
+    candidates: Vec<String>,
+    retry: &mut HashSet<String>,
+    fetch: &F,
+) where
+    F: Fn(String) -> Fut,
+    Fut: Future<Output = Result<TokenMeta>>,
+{
+    let wanted: HashSet<String> = retry.drain().chain(candidates).collect();
+    for addr in wanted {
+        match fetch(addr.clone()).await {
+            Ok(meta) if meta.name.is_empty() && meta.symbol.is_empty() => {}
+            Ok(meta) => {
+                if let Err(e) = db::save_token_metadata(db, &meta).await {
+                    warn!("token metadata for {addr} not saved: {e:#}");
+                    retry.insert(addr);
+                }
+            }
+            Err(e) => {
+                warn!("token metadata for {addr} unavailable: {e:#}");
+                retry.insert(addr);
+            }
+        }
+    }
+}
+
+/// The missing-metadata job's full scan, until one reads. A failed read is
+/// not "nothing is missing": tokens an earlier run left unfetched would wait
+/// for a restart, or for a bundle that names them again. Retries back off
+/// from one pass to five minutes, since a scan that fails may have run to its
+/// statement timeout; the passes go on meanwhile.
+struct FullScan {
+    done: bool,
+    backoff: Duration,
+    next: tokio::time::Instant,
+}
+
+impl FullScan {
+    fn new() -> Self {
+        FullScan {
+            done: false,
+            backoff: Duration::ZERO,
+            next: tokio::time::Instant::now(),
+        }
+    }
+
+    /// The scan's addresses the first time `read` succeeds; empty before
+    /// that, while it backs off, and after.
+    async fn take<F, Fut>(&mut self, read: F, pass: Duration) -> Vec<String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Vec<String>>>,
+    {
+        if self.done || tokio::time::Instant::now() < self.next {
+            return Vec::new();
+        }
+        match read().await {
+            Ok(missing) => {
+                self.done = true;
+                missing
+            }
+            Err(e) => {
+                let cap = Duration::from_secs(300).max(pass);
+                self.backoff = (self.backoff * 2).max(pass).min(cap);
+                self.next = tokio::time::Instant::now() + self.backoff;
+                warn!(
+                    "missing-metadata scan failed; retrying in {:?}: {e:#}",
+                    self.backoff
+                );
+                Vec::new()
+            }
+        }
+    }
+}
+
+/// Under `ROLE=indexer`, web replicas write no chain data, so a token whose
+/// metadata fetch failed while indexing has no page view to repair it. This
+/// job does: a full scan at start, retried until it reads, then, on each
+/// stats interval, the addresses committed bundles named that have no
+/// metadata.
+async fn missing_metadata_loop(
+    rpc: ChainRpc,
+    db: Db,
+    interval: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let fetch = |addr: String| {
+        let rpc = rpc.clone();
+        async move { fetch_token_metadata(&rpc, &addr).await }
+    };
+    let mut retry = HashSet::new();
+    let mut scan = FullScan::new();
+    loop {
+        let mut candidates = scan
+            .take(|| db::tokens_missing_metadata(&db), interval)
+            .await;
+        candidates.extend(db::take_tokens_without_metadata(&db));
+        missing_metadata_pass(&db, candidates, &mut retry, &fetch).await;
+        if sleep_or_shutdown(&mut shutdown, interval).await {
+            break;
+        }
+    }
+}
+
+/// Wait for the first of the core tasks to end. Outside a shutdown that is a
+/// failure, and the process should exit (code 5) so it restarts; during one,
+/// wait for the rest.
+async fn supervise(
+    tasks: Vec<(&'static str, tokio::task::JoinHandle<()>)>,
+    shutdown: &watch::Receiver<bool>,
+) -> Result<()> {
+    let (names, handles): (Vec<_>, Vec<_>) = tasks.into_iter().unzip();
+    let (result, i, rest) = futures_util::future::select_all(handles).await;
+    if let Err(e) = result {
+        warn!("indexer {} task failed: {e:#}", names[i]);
+    }
+    if *shutdown.borrow() {
+        for task in rest {
+            if let Err(e) = task.await {
+                warn!("indexer task failed while shutting down: {e:#}");
+            }
+        }
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("the indexer's {} task ended", names[i]))
+    }
+}
+
+/// How long the writer may sit idle before it renews its lease.
+const KEEPALIVE: Duration = Duration::from_secs(10);
+
 /// Run the indexer: one serialized DB writer plus forward and backfill loops.
 /// Newly written blocks are broadcast on `block_events` for live viewers.
 pub async fn run_forever(
@@ -944,8 +1145,9 @@ pub async fn run_forever(
     block_events: broadcast::Sender<Value>,
     stats: Arc<RwLock<Value>>,
     shutdown: watch::Receiver<bool>,
-) {
+) -> Result<()> {
     let stats_interval = cfg.stats_interval;
+    let sync = SyncTracker::new(db.clone());
     let stats_db = db.clone();
     let stats_events = block_events.clone();
     let stats_shutdown = shutdown.clone();
@@ -965,11 +1167,20 @@ pub async fn run_forever(
         db.clone(),
         stats_interval,
         shutdown.clone(),
+        sync.clone(),
     ));
+    if db::role(&db) == db::Role::Indexer {
+        tokio::spawn(missing_metadata_loop(
+            rpc.clone(),
+            db.clone(),
+            stats_interval,
+            shutdown.clone(),
+        ));
+    }
 
     // Seed the token-metadata cache and repair balances on legacy databases.
     let known_tokens = Arc::new(Mutex::new(
-        db::get_all_token_addresses(&db).into_iter().collect(),
+        db::get_all_token_addresses(&db).await.into_iter().collect(),
     ));
     // Re-fetch token metadata that was stored by the pre-fix ABI string
     // decoder (its name/symbol are NUL-padded control-char garbage). Cheap
@@ -982,13 +1193,16 @@ pub async fn run_forever(
         }
     });
     let rebuild_db = db.clone();
-    tokio::spawn(async move { db::repair_derived_tables(&rebuild_db) });
+    tokio::spawn(async move { db::repair_derived_tables(&rebuild_db).await });
     // Anchoring rows for blocks indexed before the table existed.
     let anchoring_rpc = rpc.clone();
     let anchoring_db = db.clone();
+    let anchoring_sync = sync.clone();
     tokio::spawn(async move {
-        if let Err(e) = backfill_anchoring(&anchoring_rpc, &anchoring_db).await {
-            warn!("anchoring backfill failed: {e:#}");
+        match backfill_anchoring(&anchoring_rpc, &anchoring_db).await {
+            Ok(()) => anchoring_sync.update(|s| s.anchoring = true),
+            // Runs once per start: `sync.anchoring` stays false until a restart.
+            Err(e) => warn!("anchoring backfill failed: {e:#}"),
         }
     });
 
@@ -1006,7 +1220,19 @@ pub async fn run_forever(
     const MAX_BATCH: usize = 64;
 
     let writer = tokio::spawn(async move {
-        while let Some(bundle) = bundle_rx.recv().await {
+        loop {
+            // An idle writer renews its lease, so its session (and the lock)
+            // outlives a quiet chain.
+            let bundle = tokio::select! {
+                bundle = bundle_rx.recv() => match bundle {
+                    Some(bundle) => bundle,
+                    None => break,
+                },
+                _ = tokio::time::sleep(KEEPALIVE) => {
+                    db::keepalive(&writer_db).await;
+                    continue;
+                }
+            };
             // On shutdown, stop draining the queue: in-flight bundles are
             // dropped and re-fetched on the next start.
             if *writer_shutdown.borrow() {
@@ -1021,7 +1247,7 @@ pub async fn run_forever(
                 };
                 batch.push(next);
             }
-            if let Err(e) = db::save_block_bundles(&writer_db, &batch) {
+            if let Err(e) = db::save_block_bundles(&writer_db, &batch).await {
                 // One bad bundle failed the whole batch; write the rest on
                 // their own so one block is lost rather than sixty-four.
                 let (first, last) = (batch[0].block.number, batch[batch.len() - 1].block.number);
@@ -1029,7 +1255,7 @@ pub async fn run_forever(
                     "db write failed for blocks {first}..={last}: {e:#}; writing them one by one"
                 );
                 for bundle in &batch {
-                    if let Err(e) = db::save_block_bundle(&writer_db, bundle) {
+                    if let Err(e) = db::save_block_bundle(&writer_db, bundle).await {
                         tracing::error!("block {} not written: {e:#}", bundle.block.number);
                     }
                 }
@@ -1043,18 +1269,22 @@ pub async fn run_forever(
         cfg,
         known_tokens,
         bundle_tx: bundle_tx.clone(),
-        shutdown,
-        tip_lag: Arc::new(AtomicU64::new(0)),
+        shutdown: shutdown.clone(),
+        sync,
     };
     let forward = tokio::spawn(forward_loop(ix.clone(), block_events));
     let backfill = tokio::spawn(backfill_loop(ix));
     drop(bundle_tx);
 
-    tokio::select! {
-        r = forward => { if let Err(e) = r { warn!("forward loop ended: {e:#}"); } }
-        r = backfill => { if let Err(e) = r { warn!("backfill loop ended: {e:#}"); } }
-    }
-    let _ = writer.await;
+    supervise(
+        vec![
+            ("writer", writer),
+            ("forward", forward),
+            ("backfill", backfill),
+        ],
+        &shutdown,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -1068,10 +1298,16 @@ async fn genesis_loop(
     db: Db,
     interval: Duration,
     mut shutdown: watch::Receiver<bool>,
+    sync: SyncTracker,
 ) {
     loop {
-        if let Err(e) = add_genesis_balances(&rpc, &db).await {
-            warn!("genesis balances: {e:#}");
+        // Done once a pass that began after backfill reached block 1 finds no
+        // holder left.
+        let after_backfill = sync.get().lowest_block == Some(1);
+        match add_genesis_balances(&rpc, &db).await {
+            Ok(0) if after_backfill => sync.update(|s| s.genesis = true),
+            Ok(_) => {}
+            Err(e) => warn!("genesis balances: {e:#}"),
         }
         if sleep_or_shutdown(&mut shutdown, interval).await {
             break;
@@ -1079,14 +1315,17 @@ async fn genesis_loop(
     }
 }
 
-/// The transfers indexed since the last pass, a page at a time.
-async fn add_genesis_balances(rpc: &ChainRpc, db: &Db) -> Result<()> {
-    while let Some((cursor, holders)) = db::holders_without_genesis_balance(db, 1000)? {
+/// The transfers indexed since the last pass, a page at a time. Returns how
+/// many holders it found.
+async fn add_genesis_balances(rpc: &ChainRpc, db: &Db) -> Result<usize> {
+    let mut found = 0;
+    while let Some((cursor, holders)) = db::holders_without_genesis_balance(db, 1000).await? {
+        found += holders.len();
         let balances = crate::tokens::balances_at_genesis(rpc, &holders).await?;
         let rows: Vec<_> = holders.into_iter().zip(balances).collect();
-        db::save_genesis_balances(db, &rows, cursor)?;
+        db::save_genesis_balances(db, &rows, cursor).await?;
     }
-    Ok(())
+    Ok(found)
 }
 
 /// Recompute the home-page stats blob into the `kv` table every interval so
@@ -1102,7 +1341,7 @@ async fn stats_loop(
         if *shutdown.borrow() {
             break;
         }
-        match db::compute_and_store_stats(&db) {
+        match db::compute_and_store_stats(&db).await {
             Ok(stats) => {
                 *cell.write().unwrap_or_else(|e| e.into_inner()) = stats.clone();
                 // Live viewers get the refresh too, tagged the way block
@@ -1158,6 +1397,107 @@ mod tests {
 
         let wanted = tokens_to_fetch(&[bundle], &known);
         assert_eq!(wanted, [minted, burned].map(String::from).into());
+    }
+
+    fn token(address: &str, symbol: &str) -> TokenMeta {
+        TokenMeta {
+            address: checksum_address(address),
+            name: String::new(),
+            symbol: symbol.into(),
+            decimals: 0,
+            currency: String::new(),
+            total_supply: "0".into(),
+        }
+    }
+
+    /// A failed scan is not "nothing is missing": it runs again once its
+    /// backoff has passed, and once one reads, no pass rescans.
+    #[tokio::test]
+    async fn a_failed_missing_metadata_scan_is_retried() {
+        let token = checksum_address("0x20c0000000000000000000000000000000000001");
+        // An outage, or a scan past its statement timeout.
+        let fails = || async { Err::<Vec<String>, _>(anyhow::anyhow!("statement timeout")) };
+        let reads = || {
+            let token = token.clone();
+            async move { Ok(vec![token]) }
+        };
+        let pass = Duration::from_secs(5);
+        let mut scan = FullScan::new();
+        assert!(scan.take(fails, pass).await.is_empty());
+        assert!(!scan.done, "a failed scan runs again");
+        assert!(
+            scan.take(reads, pass).await.is_empty(),
+            "not before its backoff has passed"
+        );
+        scan.next = tokio::time::Instant::now();
+        assert_eq!(scan.take(reads, pass).await, vec![token.clone()]);
+        assert!(scan.take(reads, pass).await.is_empty(), "scanned once");
+    }
+
+    /// One pass saves what it can fetch and keeps the rest for the next pass;
+    /// an address that answers as no token is dropped, not retried forever.
+    #[tokio::test]
+    async fn the_missing_metadata_job_retries_what_it_could_not_fetch() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db::open(dir.path().join("m.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let (a, b, c) = (
+            checksum_address("0x20c0000000000000000000000000000000000001"),
+            checksum_address("0x20c0000000000000000000000000000000000002"),
+            checksum_address("0x20c0000000000000000000000000000000000003"),
+        );
+        let reachable = Arc::new(Mutex::new(HashSet::from([a.clone(), c.clone()])));
+        let fetch = |addr: String| {
+            let reachable = reachable.clone();
+            async move {
+                if !reachable.lock().unwrap().contains(&addr) {
+                    anyhow::bail!("node down");
+                }
+                Ok(if addr.ends_with('3') {
+                    token(&addr, "")
+                } else {
+                    token(&addr, "SYM")
+                })
+            }
+        };
+        let mut retry = HashSet::new();
+        missing_metadata_pass(
+            &db,
+            vec![a.clone(), b.clone(), c.clone()],
+            &mut retry,
+            &fetch,
+        )
+        .await;
+        assert!(db::get_token_metadata(&db, &a).await.is_some());
+        assert!(
+            db::get_token_metadata(&db, &c).await.is_none(),
+            "not a token"
+        );
+        assert_eq!(retry, HashSet::from([b.clone()]));
+
+        reachable.lock().unwrap().insert(b.clone());
+        missing_metadata_pass(&db, Vec::new(), &mut retry, &fetch).await;
+        assert!(db::get_token_metadata(&db, &b).await.is_some());
+        assert!(retry.is_empty());
+    }
+
+    /// The writer, forward and backfill tasks run for the life of the process;
+    /// one that ends outside a shutdown ends the process (exit 5).
+    #[tokio::test]
+    async fn a_core_task_that_ends_is_reported_unless_shutting_down() {
+        let (stop, shutdown) = watch::channel(false);
+        let ended = tokio::spawn(async {});
+        let running = tokio::spawn(std::future::pending::<()>());
+        assert!(
+            supervise(vec![("writer", ended), ("forward", running)], &shutdown)
+                .await
+                .is_err()
+        );
+
+        stop.send(true).unwrap();
+        let ended = tokio::spawn(async {});
+        assert!(supervise(vec![("writer", ended)], &shutdown).await.is_ok());
     }
 
     #[test]

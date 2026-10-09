@@ -40,7 +40,7 @@ pub async fn resolve(
     }
 
     let fresh_after = db::now_ts() - SIGNATURE_TTL_SECONDS;
-    let cached = db::get_selector_names(db, &wanted, fresh_after);
+    let cached = db::get_selector_names(db, &wanted, fresh_after).await;
     let missing: Vec<String> = wanted
         .iter()
         .filter(|s| !cached.contains_key(*s))
@@ -73,7 +73,7 @@ pub async fn resolve(
             )
         })
         .collect();
-    if let Err(e) = db::save_selector_names(db, &answers) {
+    if let Err(e) = db::save_selector_names(db, &answers).await {
         tracing::warn!("caching selector names failed: {e:#}");
     }
     resolved.extend(fetched);

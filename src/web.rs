@@ -122,8 +122,8 @@ fn html_or_json(
 /// Common context keys every page needs. Every rendered template extends
 /// `base.html`, so every one of these must be present or the render fails —
 /// build page contexts through here rather than by hand.
-fn page_ctx(state: &AppState, extra: Value) -> Value {
-    page_ctx_for(state, db::get_latest_block(&state.db), extra)
+async fn page_ctx(state: &AppState, extra: Value) -> Value {
+    page_ctx_for(state, db::get_latest_block(&state.db).await, extra)
 }
 
 /// [`page_ctx`] for handlers that have already read the tip, so the page does
@@ -294,7 +294,7 @@ fn tokens_mentioned(event: &DecodedEvent) -> Vec<String> {
 
 /// Symbol and decimals per address, keyed lowercase: a log and the database
 /// need not agree on checksum casing.
-fn token_display_map(state: &AppState, addresses: impl Iterator<Item = String>) -> Tokens {
+async fn token_display_map(state: &AppState, addresses: impl Iterator<Item = String>) -> Tokens {
     let mut wanted: Vec<String> = addresses
         .map(|a| checksum_address(&a))
         .filter(|a| is_valid_address(a))
@@ -302,6 +302,7 @@ fn token_display_map(state: &AppState, addresses: impl Iterator<Item = String>) 
     wanted.sort();
     wanted.dedup();
     db::get_tokens_metadata(&state.db, &wanted)
+        .await
         .into_iter()
         .map(|(address, meta)| {
             (
@@ -576,13 +577,8 @@ pub fn address_label(db: &Db, address: &str) -> Option<String> {
     if let Some(name) = crate::contracts::deployed_contract_name(&checksummed) {
         return Some(name);
     }
-    if let Some(meta) = db::get_token_metadata(db, &checksummed) {
-        if !meta.symbol.is_empty() {
-            return Some(meta.symbol);
-        }
-        if !meta.name.is_empty() {
-            return Some(meta.name);
-        }
+    if let Some(label) = db::token_label(db, &checksummed) {
+        return Some(label);
     }
     if let Some(parts) = parse_virtual(&checksummed) {
         return Some(format!("Virtual {}", parts.master_id));
@@ -596,7 +592,7 @@ pub fn address_label(db: &Db, address: &str) -> Option<String> {
 /// One page of a token's holders, with balances in the token's own units and
 /// each share of supply. The share is percent with four decimals, divided in
 /// big integers so a supply too large for an f64 still comes out exact.
-fn token_holders(
+async fn token_holders(
     state: &AppState,
     token: &str,
     meta: &crate::models::TokenMetadata,
@@ -605,6 +601,7 @@ fn token_holders(
 ) -> Vec<Value> {
     let supply = BigInt::parse_bytes(meta.total_supply.as_bytes(), 10).unwrap_or_default();
     db::get_token_holders(&state.db, token, page, per_page)
+        .await
         .into_iter()
         .enumerate()
         .map(|(i, (address, balance))| {
@@ -667,9 +664,9 @@ pub async fn home(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let latest_block = db::get_latest_block(&state.db);
-    let recent_blocks = db::get_recent_blocks(&state.db, state.cfg.recent_block_count);
-    let recent_txs = db::get_transactions(&state.db, 1, state.cfg.recent_tx_count as u32);
+    let latest_block = db::get_latest_block(&state.db).await;
+    let recent_blocks = db::get_recent_blocks(&state.db, state.cfg.recent_block_count).await;
+    let recent_txs = db::get_transactions(&state.db, 1, state.cfg.recent_tx_count as u32).await;
     let latest_num = latest_block.as_ref().map(|b| b.number).unwrap_or(0);
     let mut stats = state
         .stats
@@ -718,12 +715,17 @@ pub async fn home(
     // A blob written before the head rode along in it (an upgrade, seeded from
     // kv) has no chain_head; the kv row it came from does, so the bar shows
     // real progress rather than 0% until the first recompute.
-    let chain_head = stats
+    let chain_head = match stats
         .get("chain_head")
         .and_then(Value::as_i64)
         .filter(|head| *head > 0)
-        .or_else(|| db::get_kv(&state.db, "chain_head").and_then(|v| v.parse().ok()))
-        .unwrap_or(0);
+    {
+        Some(head) => head,
+        None => db::get_kv(&state.db, "chain_head")
+            .await
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+    };
     let index_pct = if chain_head > 0 {
         (indexed_count as f64 / chain_head as f64 * 100.0).clamp(0.0, 100.0)
     } else {
@@ -814,9 +816,9 @@ async fn sse_step(
     // are populated immediately on connect.
     if !state.sent_initial {
         state.sent_initial = true;
-        if let Some(b) = db::get_latest_block(&state.db) {
+        if let Some(b) = db::get_latest_block(&state.db).await {
             state.last_num = b.number;
-            let txs = db::get_block_transactions(&state.db, b.number, TxColumns::List);
+            let txs = db::get_block_transactions(&state.db, b.number, TxColumns::List).await;
             let payload = crate::models::block_event_json(&b, &txs, crate::models::STREAM_TX_CAP);
             return Some((sse_event(&payload), state));
         }
@@ -853,24 +855,20 @@ async fn sse_step(
                 // no use as a bound -- stats refreshes share this channel and
                 // are counted too -- so the tip bounds the window.
                 let tip = db::get_latest_block(&state.db)
+                    .await
                     .map(|b| b.number)
                     .unwrap_or(state.last_num);
                 let start = state.last_num + 1;
                 let end = tip.min(start + SSE_MAX_REPLAY as i64 - 1);
                 // Two range queries for the whole span, not two per height: a
                 // client that fell far behind replays up to `SSE_MAX_REPLAY`.
-                let blocks = db::get_blocks_in_range(&state.db, start, end);
-                let txs = db::get_transactions_in_range(&state.db, start, end, TxColumns::List);
+                let blocks = db::get_blocks_in_range(&state.db, start, end).await;
+                let txs =
+                    db::get_transactions_in_range(&state.db, start, end, TxColumns::List).await;
                 // Oldest first, since the writer emits in number order.
-                for block in blocks.into_iter().rev() {
-                    let first = txs.partition_point(|t| t.block_number < block.number);
-                    let past = txs.partition_point(|t| t.block_number <= block.number);
-                    state.pending.push_back(crate::models::block_event_json(
-                        &block,
-                        &txs[first..past],
-                        crate::models::STREAM_TX_CAP,
-                    ));
-                }
+                state
+                    .pending
+                    .extend(crate::models::block_events(&blocks, &txs));
                 state.last_num = state.last_num.max(end);
                 if let Some(v) = state.pending.pop_front() {
                     return Some((sse_event(&v), state));
@@ -888,29 +886,33 @@ pub async fn block_page(
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
     let block = if block_id.chars().all(|c| c.is_ascii_digit()) && !block_id.is_empty() {
-        block_id
-            .parse::<i64>()
-            .ok()
-            .and_then(|n| db::get_block_by_number(&state.db, n))
+        match block_id.parse::<i64>() {
+            Ok(n) => db::get_block_by_number(&state.db, n).await,
+            Err(_) => None,
+        }
     } else {
-        db::get_block_by_hash(&state.db, &block_id).or_else(|| {
-            block_id
+        match db::get_block_by_hash(&state.db, &block_id).await {
+            Some(b) => Some(b),
+            None => match block_id
                 .strip_prefix("0x")
                 .and_then(|h| u64::from_str_radix(h, 16).ok())
-                .and_then(|n| db::get_block_by_number(&state.db, n as i64))
-        })
+            {
+                Some(n) => db::get_block_by_number(&state.db, n as i64).await,
+                None => None,
+            },
+        }
     };
     let Some(block) = block else {
-        return not_found(&state, &headers, &query, "Block", &block_id);
+        return not_found(&state, &headers, &query, "Block", &block_id).await;
     };
     let transactions =
-        db::get_block_transactions(&state.db, block.number, columns_for(&headers, &query));
+        db::get_block_transactions(&state.db, block.number, columns_for(&headers, &query)).await;
     let gas_pct = block_pct(block.gas_used, block.gas_limit);
     let token_addrs: Vec<String> = transactions
         .iter()
         .filter_map(|t| t.fee_token.clone())
         .collect();
-    let metas = db::get_tokens_metadata(&state.db, &token_addrs);
+    let metas = db::get_tokens_metadata(&state.db, &token_addrs).await;
     let transactions: Vec<Value> = transactions
         .iter()
         .map(|t| {
@@ -932,10 +934,19 @@ pub async fn block_page(
     let burnt = burnt_fees_wei(&block.base_fee, block.gas_used);
     // Looked up rather than inferred from the tip: the index has gaps while it
     // backfills, so a number below the tip is not necessarily there to link to.
-    let neighbour = |n: i64| db::get_block_by_number(&state.db, n).map(|b| b.number);
-    let previous = (block.number > 0)
-        .then(|| neighbour(block.number - 1))
-        .flatten();
+    let neighbour = |n: i64| db::get_block_by_number(&state.db, n);
+    let below = if block.number > 0 {
+        neighbour(block.number - 1).await
+    } else {
+        None
+    };
+    let previous = below.as_ref().map(|b| b.number);
+    // The parent hash links by height only to the block it names: after a
+    // reorg or a partial refresh, the row below can hold another block.
+    let parent = below
+        .filter(|b| b.hash.eq_ignore_ascii_case(&block.parent_hash))
+        .map(|b| b.number);
+    let next = neighbour(block.number + 1).await.map(|b| b.number);
     let ctx = page_ctx(
         &state,
         json!({
@@ -945,9 +956,11 @@ pub async fn block_page(
             "base_fee_gwei": format_token_amount(&block.base_fee, 9),
             "burnt_fees": burnt,
             "previous_block": previous,
-            "next_block": neighbour(block.number + 1),
+            "parent_block": parent,
+            "next_block": next,
         }),
-    );
+    )
+    .await;
     html_or_json(&state, &headers, &query, "block.html", &ctx)
 }
 
@@ -960,12 +973,13 @@ pub async fn blocks_page(
     // Bounded before the arithmetic below multiplies it.
     let page = i64::from(page_param(&query));
     let from: Option<i64> = query.get("from").and_then(|f| f.parse().ok());
-    let latest = db::get_latest_block(&state.db);
+    let latest = db::get_latest_block(&state.db).await;
     let latest_num = latest.as_ref().map(|b| b.number).unwrap_or(0);
     let end = from.unwrap_or_else(|| (latest_num - (page - 1) * per_page).max(0));
     let start = (end - per_page + 1).max(0);
     // One range query: the listing shows whichever of these heights are indexed.
     let blocks: Vec<Value> = db::get_blocks_in_range(&state.db, start, end)
+        .await
         .into_iter()
         .map(|b| {
             let gas_pct = block_pct(b.gas_used, b.gas_limit);
@@ -1008,15 +1022,19 @@ pub async fn txs_page(
         .unwrap_or_else(|e| e.into_inner())
         .get("total_txns")
         .and_then(Value::as_i64);
-    let total = counted.unwrap_or_else(|| db::get_transaction_count(&state.db));
+    let total = match counted {
+        Some(n) => n,
+        None => db::get_transaction_count(&state.db).await,
+    };
     let txs: Vec<Value> = db::get_transactions(&state.db, page, PER_PAGE)
+        .await
         .iter()
         .map(tx_row)
         .collect();
 
     let ctx = page_ctx_for(
         &state,
-        db::get_latest_block(&state.db),
+        db::get_latest_block(&state.db).await,
         json!({
             "transactions": txs,
             "total_txns": total,
@@ -1088,7 +1106,7 @@ async fn fetch_missing_trace(
         return None;
     }
     if let Ok(trace) = serde_json::to_string(&flat) {
-        if let Err(e) = db::set_trace(&state.db, &tx.hash, &trace) {
+        if let Err(e) = db::set_trace(&state.db, &tx.hash, &trace).await {
             tracing::warn!("caching trace for {} failed: {e:#}", tx.hash);
         }
     }
@@ -1116,14 +1134,14 @@ fn top_level_call(tx: &crate::models::Transaction) -> Value {
 ///
 /// Every row gets all three whether or not its token is known: Tera errors on a
 /// missing map key, so one unknown token would take the page down.
-fn enrich_balance_changes(state: &AppState, changes: &mut [Value]) {
+async fn enrich_balance_changes(state: &AppState, changes: &mut [Value]) {
     let mut token_addrs: Vec<String> = changes
         .iter()
         .filter_map(|c| c.get("token").and_then(Value::as_str).map(String::from))
         .filter(|a| !a.is_empty())
         .collect();
     token_addrs.dedup();
-    let metas = db::get_tokens_metadata(&state.db, &token_addrs);
+    let metas = db::get_tokens_metadata(&state.db, &token_addrs).await;
 
     for change in changes.iter_mut() {
         let raw = change
@@ -1245,7 +1263,7 @@ async fn resolve_call_statuses(
 /// All of it is parsed from the canonical RLP encoding at render time rather
 /// than stored per column, so this is where the transaction page pays for the
 /// columns the schema does not carry.
-fn gas_and_fee_ctx(
+async fn gas_and_fee_ctx(
     state: &AppState,
     tx: &crate::models::Transaction,
     receipt: Option<&Value>,
@@ -1275,10 +1293,10 @@ fn gas_and_fee_ctx(
     } else {
         String::new()
     };
-    let fee_token_meta = tx
-        .fee_token
-        .as_deref()
-        .and_then(|f| db::get_token_metadata(&state.db, f));
+    let fee_token_meta = match tx.fee_token.as_deref() {
+        Some(f) => db::get_token_metadata(&state.db, f).await,
+        None => None,
+    };
     let fee_breakdown = fee_breakdown(tx, gas_used, gas_price, fee_token_meta.as_ref());
     json!({
         "gas_price": gas_price,
@@ -1306,8 +1324,8 @@ pub async fn tx_page(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let Some(mut tx) = db::get_transaction(&state.db, &tx_hash) else {
-        return not_found(&state, &headers, &query, "Transaction", &tx_hash);
+    let Some(mut tx) = db::get_transaction(&state.db, &tx_hash).await else {
+        return not_found(&state, &headers, &query, "Transaction", &tx_hash).await;
     };
     let receipt: Option<Value> = tx
         .receipt_data
@@ -1321,7 +1339,7 @@ pub async fn tx_page(
         Some(trace) => Some(trace),
         None => fetch_missing_trace(&state, &tx).await,
     };
-    let block = db::get_block_by_number(&state.db, tx.block_number);
+    let block = db::get_block_by_number(&state.db, tx.block_number).await;
 
     // Tempo-style txs carry their destination in `calls[0].to`; fall back to
     // the receipt's `to` (nodes fill it with the first call's destination).
@@ -1358,7 +1376,7 @@ pub async fn tx_page(
         .as_ref()
         .map(|r| extract_balance_changes(r, &tx))
         .unwrap_or_default();
-    enrich_balance_changes(&state, &mut balance_changes);
+    enrich_balance_changes(&state, &mut balance_changes).await;
 
     // Metadata for every token the page mentions, so amounts read in the
     // token's own units rather than as raw integers. One batched query.
@@ -1368,7 +1386,8 @@ pub async fn tx_page(
             .iter()
             .flat_map(tokens_mentioned)
             .chain(tx.fee_token.clone()),
-    );
+    )
+    .await;
 
     let mut method = tx_method_badge(&tx.input);
     if method.is_none() {
@@ -1408,7 +1427,10 @@ pub async fn tx_page(
         .collect();
 
     let mut extra = serde_json::Map::new();
-    merge_into(&mut extra, gas_and_fee_ctx(&state, &tx, receipt.as_ref()));
+    merge_into(
+        &mut extra,
+        gas_and_fee_ctx(&state, &tx, receipt.as_ref()).await,
+    );
     merge_into(
         &mut extra,
         json!({
@@ -1429,7 +1451,7 @@ pub async fn tx_page(
             "active_tab": query.get("tab").cloned().unwrap_or_else(|| "overview".into()),
         }),
     );
-    let ctx = page_ctx(&state, Value::Object(extra));
+    let ctx = page_ctx(&state, Value::Object(extra)).await;
     html_or_json(&state, &headers, &query, "tx.html", &ctx)
 }
 
@@ -1445,7 +1467,7 @@ pub async fn address_page(
 ) -> Response {
     let checksummed = checksum_address(&address);
     if !is_valid_address(&checksummed) {
-        return invalid_address(&state, &headers, &query, "Address", &address);
+        return invalid_address(&state, &headers, &query, "Address", &address).await;
     }
 
     let tab = query
@@ -1457,12 +1479,13 @@ pub async fn address_page(
 
     // Both totals on every tab: the header shows them side by side, and the
     // pager needs the total for whichever tab is open.
-    let tx_count = db::get_address_transaction_count(&state.db, &checksummed);
-    let transfer_count = db::get_address_transfer_count(&state.db, &checksummed);
+    let tx_count = db::get_address_transaction_count(&state.db, &checksummed).await;
+    let transfer_count = db::get_address_transfer_count(&state.db, &checksummed).await;
 
     let (transactions, html_transactions) = if tab == "transfers" {
-        let mut transfers = db::get_address_transfers(&state.db, &checksummed, page, per_page);
-        enrich_transfers(&state, &mut transfers);
+        let mut transfers =
+            db::get_address_transfers(&state.db, &checksummed, page, per_page).await;
+        enrich_transfers(&state, &mut transfers).await;
         (transfers.clone(), transfers)
     } else {
         let txs = db::get_address_transactions(
@@ -1471,7 +1494,8 @@ pub async fn address_page(
             page,
             per_page,
             columns_for(&headers, &query),
-        );
+        )
+        .await;
         let html_txs: Vec<Value> = txs.iter().map(tx_row).collect();
         (
             txs.into_iter()
@@ -1494,7 +1518,9 @@ pub async fn address_page(
     let has_interface = interface["abis"].as_array().is_some_and(|a| !a.is_empty());
 
     let addr_info = identify_address(&checksummed);
-    let is_token_addr = db::get_token_metadata(&state.db, &checksummed).is_some()
+    let is_token_addr = db::get_token_metadata(&state.db, &checksummed)
+        .await
+        .is_some()
         || crate::contracts::is_tip20_token(&checksummed);
     let kind = if addr_info.kind == "eoa" && (is_contract(&checksummed) || is_token_addr) {
         "contract"
@@ -1503,7 +1529,7 @@ pub async fn address_page(
     };
     let label = addr_info.label.clone();
 
-    let token_meta = db::get_token_metadata(&state.db, &checksummed);
+    let token_meta = db::get_token_metadata(&state.db, &checksummed).await;
     let code = if tab == "contract" {
         contract_code(&state, &checksummed).await
     } else {
@@ -1525,7 +1551,7 @@ pub async fn address_page(
             "virtual_address": virtual_address,
             "transactions": transactions,
             "html_transactions": html_transactions,
-            "holdings": db::get_address_holdings(&state.db, &checksummed),
+            "holdings": db::get_address_holdings(&state.db, &checksummed).await,
             "tx_count": tx_count,
             "transfer_count": transfer_count,
             "page": page,
@@ -1533,7 +1559,8 @@ pub async fn address_page(
             "per_page": per_page,
             "active_tab": tab,
         }),
-    );
+    )
+    .await;
     html_or_json(&state, &headers, &query, "address.html", &ctx)
 }
 
@@ -1545,41 +1572,51 @@ pub async fn token_page(
 ) -> Response {
     let checksummed = checksum_address(&address);
     if !is_valid_address(&checksummed) {
-        return invalid_address(&state, &headers, &query, "Token", &address);
+        return invalid_address(&state, &headers, &query, "Token", &address).await;
     }
 
     // A corrupt row (NUL/control chars from the pre-fix decoder) is treated
     // as missing so the page re-fetches clean metadata on the spot.
     let stored = db::get_token_metadata(&state.db, &checksummed)
+        .await
         .filter(|m| !has_control_chars(&m.name) && !has_control_chars(&m.symbol));
     let meta = match stored {
         Some(m) => m,
         None => {
             let fetched = match fetch_token_metadata(&state.rpc, &checksummed).await {
                 Ok(fetched) => fetched,
-                Err(e) => return node_failed(&state, &headers, &query, e),
+                Err(e) => return node_failed(&state, &headers, &query, e).await,
             };
             // An address that answers to neither name() nor symbol() is not a
             // token; stored, it would be listed as one.
             if fetched.name.is_empty() && fetched.symbol.is_empty() {
-                return not_found(&state, &headers, &query, "Token", &address);
+                return not_found(&state, &headers, &query, "Token", &address).await;
             }
-            let _ = db::save_token_metadata(&state.db, &fetched);
-            db::get_token_metadata(&state.db, &checksummed).unwrap_or_else(|| {
-                // Fall back to a minimal descriptor if the save failed.
-                crate::models::TokenMetadata {
-                    address: checksummed.clone(),
-                    name: fetched.name,
-                    symbol: fetched.symbol,
-                    decimals: fetched.decimals,
-                    currency: fetched.currency,
-                    total_supply: fetched.total_supply,
-                    logo_uri: String::new(),
-                    holder_count: 0,
-                    created_at: db::now_ts(),
-                    updated_at: db::now_ts(),
+            // The page renders the fetched descriptor whether or not this lands.
+            // A web replica writes no chain data: the indexer saves a token
+            // once it sees a transfer of it (README, "Known limitations").
+            if db::role(&state.db) != db::Role::Web {
+                if let Err(e) = db::save_token_metadata(&state.db, &fetched).await {
+                    tracing::warn!("save token metadata {checksummed}: {e:#}");
                 }
-            })
+            }
+            db::get_token_metadata(&state.db, &checksummed)
+                .await
+                .unwrap_or_else(|| {
+                    // Fall back to a minimal descriptor if the save failed.
+                    crate::models::TokenMetadata {
+                        address: checksummed.clone(),
+                        name: fetched.name,
+                        symbol: fetched.symbol,
+                        decimals: fetched.decimals,
+                        currency: fetched.currency,
+                        total_supply: fetched.total_supply,
+                        logo_uri: String::new(),
+                        holder_count: 0,
+                        created_at: db::now_ts(),
+                        updated_at: db::now_ts(),
+                    }
+                })
         }
     };
 
@@ -1592,17 +1629,17 @@ pub async fn token_page(
     let page = page_param(&query);
     let per_page = PER_PAGE;
     let transfers = if tab == "transfers" {
-        db::get_token_transfers(&state.db, &checksummed, page, per_page)
+        db::get_token_transfers(&state.db, &checksummed, page, per_page).await
     } else {
         Vec::new()
     };
 
     // Kept with the balances by the writer, so the page does not recount them.
     let holders = meta.holder_count;
-    let transfer_count = db::get_token_transfer_count(&state.db, &checksummed);
+    let transfer_count = db::get_token_transfer_count(&state.db, &checksummed).await;
     // The balances are already indexed — the page just never showed them.
     let holder_rows = if tab == "holders" {
-        token_holders(&state, &checksummed, &meta, page, per_page)
+        token_holders(&state, &checksummed, &meta, page, per_page).await
     } else {
         Vec::new()
     };
@@ -1627,7 +1664,8 @@ pub async fn token_page(
             "per_page": per_page,
             "active_tab": tab,
         }),
-    );
+    )
+    .await;
     html_or_json(&state, &headers, &query, "token.html", &ctx)
 }
 
@@ -1638,8 +1676,8 @@ pub async fn tokens_page(
 ) -> Response {
     let page = page_param(&query);
     let per_page = PER_PAGE;
-    let tokens = db::get_all_tokens(&state.db, page, per_page);
-    let total = db::get_token_count(&state.db);
+    let tokens = db::get_all_tokens(&state.db, page, per_page).await;
+    let total = db::get_token_count(&state.db).await;
     let total_pages = total_pages(total, per_page);
     let ctx = page_ctx(
         &state,
@@ -1650,7 +1688,8 @@ pub async fn tokens_page(
             "total_pages": total_pages,
             "per_page": per_page,
         }),
-    );
+    )
+    .await;
     html_or_json(&state, &headers, &query, "tokens.html", &ctx)
 }
 
@@ -1690,10 +1729,10 @@ pub async fn anchoring_page(
         Ok(mut extra) => {
             extra["address"] = json!(anchoring::ADDRESS);
             extra["q"] = json!(q);
-            let ctx = page_ctx(&state, extra);
+            let ctx = page_ctx(&state, extra).await;
             html_or_json(&state, &headers, &query, "anchoring.html", &ctx)
         }
-        Err(e) => node_failed(&state, &headers, &query, e),
+        Err(e) => node_failed(&state, &headers, &query, e).await,
     }
 }
 
@@ -1705,13 +1744,13 @@ pub async fn anchoring_registry_page(
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
     let Ok(id) = registry_id.parse::<u64>() else {
-        return not_found(&state, &headers, &query, "Registry", &registry_id);
+        return not_found(&state, &headers, &query, "Registry", &registry_id).await;
     };
     let page = page_param(&query);
     match anchoring::registry(&state.rpc, id, page.into(), PER_PAGE.into()).await {
         Ok(Some((registry, records, total))) => {
             // One past the cap says whether there are more.
-            let mut events = db::get_anchoring_events(&state.db, id as i64, PER_PAGE + 1);
+            let mut events = db::get_anchoring_events(&state.db, id as i64, PER_PAGE + 1).await;
             let events_more = events.len() > PER_PAGE as usize;
             events.truncate(PER_PAGE as usize);
             let ctx = page_ctx(
@@ -1725,11 +1764,12 @@ pub async fn anchoring_registry_page(
                     "events": events,
                     "events_more": events_more,
                 }),
-            );
+            )
+            .await;
             html_or_json(&state, &headers, &query, "anchoring_registry.html", &ctx)
         }
-        Ok(None) => not_found(&state, &headers, &query, "Registry", &registry_id),
-        Err(e) => node_failed(&state, &headers, &query, e),
+        Ok(None) => not_found(&state, &headers, &query, "Registry", &registry_id).await,
+        Err(e) => node_failed(&state, &headers, &query, e).await,
     }
 }
 
@@ -1743,7 +1783,7 @@ pub async fn anchoring_record_page(
     let id = format!("{registry_id}/{record_id}");
     let (Ok(registry_id), Ok(record_id)) = (registry_id.parse::<u64>(), record_id.parse::<u64>())
     else {
-        return not_found(&state, &headers, &query, "Record", &id);
+        return not_found(&state, &headers, &query, "Record", &id).await;
     };
     let page = page_param(&query);
     match anchoring::record(
@@ -1764,16 +1804,17 @@ pub async fn anchoring_record_page(
                     "page": page,
                     "total_pages": total_pages(latest.index as i64, PER_PAGE),
                 }),
-            );
+            )
+            .await;
             html_or_json(&state, &headers, &query, "anchoring_record.html", &ctx)
         }
-        Ok(None) => not_found(&state, &headers, &query, "Record", &id),
-        Err(e) => node_failed(&state, &headers, &query, e),
+        Ok(None) => not_found(&state, &headers, &query, "Record", &id).await,
+        Err(e) => node_failed(&state, &headers, &query, e).await,
     }
 }
 
 /// A page the node answers rather than the index, when the node did not.
-fn node_failed(
+async fn node_failed(
     state: &AppState,
     headers: &HeaderMap,
     query: &HashMap<String, String>,
@@ -1783,14 +1824,14 @@ fn node_failed(
     let page = if wants_json(headers, query) {
         Json(json!({"error": format!("{err:#}")})).into_response()
     } else {
-        render_html(&state.tera, "500.html", &page_ctx(state, json!({})))
+        render_html(&state.tera, "500.html", &page_ctx(state, json!({})).await)
     };
     (StatusCode::BAD_GATEWAY, page).into_response()
 }
 
 /// An address-shaped path segment that is not an address — a token, an
 /// account — said the way the client asked to hear it.
-fn invalid_address(
+async fn invalid_address(
     state: &AppState,
     headers: &HeaderMap,
     query: &HashMap<String, String>,
@@ -1804,7 +1845,7 @@ fn invalid_address(
         )
             .into_response()
     } else {
-        not_found_html(state, kind, address, "Invalid address")
+        not_found_html(state, kind, address, "Invalid address").await
     }
 }
 
@@ -1819,8 +1860,7 @@ fn destination(kind: &str, id: &str, url: String) -> Value {
 /// a transaction hash are the same shape, so only asking the index tells them
 /// apart — and an address is answered whether or not anything has touched it,
 /// since being told "no transactions" beats being told "not found".
-fn resolve_search(db: &Db, q: &str) -> Option<Value> {
-    let block = |number: i64| destination("block", &number.to_string(), format!("/block/{number}"));
+async fn resolve_search(db: &Db, q: &str) -> Option<Value> {
     let token = |meta: crate::models::TokenMetadata| {
         destination("token", &meta.address, format!("/token/{}", meta.address))
     };
@@ -1829,24 +1869,44 @@ fn resolve_search(db: &Db, q: &str) -> Option<Value> {
         .then(|| q.parse::<i64>().ok())
         .flatten();
 
-    height
-        .filter(|n| db::get_block_by_number(db, *n).is_some())
-        // Spelled as the reader typed it, leading zeros and all.
-        .map(|_| destination("block", q, format!("/block/{q}")))
-        .or_else(|| {
-            db::get_transaction(db, q).map(|_| destination("transaction", q, format!("/tx/{q}")))
-        })
-        .or_else(|| db::get_block_by_hash(db, q).map(|b| block(b.number)))
-        .or_else(|| {
-            let checksummed = checksum_address(q);
-            is_valid_address(&checksummed)
-                .then(|| destination("address", &checksummed, format!("/address/{checksummed}")))
-        })
-        .or_else(|| db::get_token_metadata(db, q).map(token))
-        // Exact symbol or name first, then the best partial match — so pressing
-        // Enter lands where the suggestions said it would.
-        .or_else(|| db::get_token_by_symbol_or_name(db, q).map(token))
-        .or_else(|| db::search_tokens(db, q, 1).into_iter().next().map(token))
+    if let Some(n) = height {
+        if db::get_block_by_number(db, n).await.is_some() {
+            // Spelled as the reader typed it, leading zeros and all.
+            return Some(destination("block", q, format!("/block/{q}")));
+        }
+    }
+    if db::get_transaction(db, q).await.is_some() {
+        return Some(destination("transaction", q, format!("/tx/{q}")));
+    }
+    if let Some(b) = db::get_block_by_hash(db, q).await {
+        let number = b.number;
+        return Some(destination(
+            "block",
+            &number.to_string(),
+            format!("/block/{number}"),
+        ));
+    }
+    let checksummed = checksum_address(q);
+    if is_valid_address(&checksummed) {
+        return Some(destination(
+            "address",
+            &checksummed,
+            format!("/address/{checksummed}"),
+        ));
+    }
+    if let Some(meta) = db::get_token_metadata(db, q).await {
+        return Some(token(meta));
+    }
+    // Exact symbol or name first, then the best partial match — so pressing
+    // Enter lands where the suggestions said it would.
+    if let Some(meta) = db::get_token_by_symbol_or_name(db, q).await {
+        return Some(token(meta));
+    }
+    db::search_tokens(db, q, 1)
+        .await
+        .into_iter()
+        .next()
+        .map(token)
 }
 
 pub async fn search_page(
@@ -1863,7 +1923,7 @@ pub async fn search_page(
         return Redirect::to("/").into_response();
     }
 
-    let found = match resolve_search(&state.db, &q) {
+    let found = match resolve_search(&state.db, &q).await {
         found @ Some(_) => found,
         // A registry's name and a record's checksum are the contract's state, which no
         // index here holds, so they are only known by asking it.
@@ -1884,7 +1944,7 @@ pub async fn search_page(
             .to_string();
         return Redirect::to(&url).into_response();
     }
-    let ctx = page_ctx(&state, json!({"query": q, "results": []}));
+    let ctx = page_ctx(&state, json!({"query": q, "results": []})).await;
     render_html(&state.tera, "search.html", &ctx)
 }
 
@@ -1975,11 +2035,11 @@ pub async fn search_suggest(
     // `parse` from accepting a sign the reader did not mean as a number.
     let number = q.strip_prefix('#').unwrap_or(q);
     if number.chars().all(|c| c.is_ascii_digit()) {
-        if let Some(block) = number
-            .parse::<i64>()
-            .ok()
-            .and_then(|n| db::get_block_by_number(&state.db, n))
-        {
+        let block = match number.parse::<i64>() {
+            Ok(n) => db::get_block_by_number(&state.db, n).await,
+            Err(_) => None,
+        };
+        if let Some(block) = block {
             results.push(suggestion(
                 "block",
                 format!("/block/{}", block.number),
@@ -1994,7 +2054,10 @@ pub async fn search_suggest(
         let label = address_label(&state.db, &checksummed);
         // A token address goes to the token page, where the reader can
         // actually see the supply and the holders.
-        if db::get_token_metadata(&state.db, &checksummed).is_some() {
+        if db::get_token_metadata(&state.db, &checksummed)
+            .await
+            .is_some()
+        {
             results.push(suggestion(
                 "token",
                 format!("/token/{checksummed}"),
@@ -2012,7 +2075,7 @@ pub async fn search_suggest(
         ));
     } else if is_hash(q) {
         // 32 bytes: a transaction hash, or a block hash.
-        if let Some(block) = db::get_block_by_hash(&state.db, q) {
+        if let Some(block) = db::get_block_by_hash(&state.db, q).await {
             results.push(suggestion(
                 "block",
                 format!("/block/{}", block.number),
@@ -2020,7 +2083,7 @@ pub async fn search_suggest(
                 q.to_string(),
             ));
         } else {
-            let indexed = db::get_transaction(&state.db, q);
+            let indexed = db::get_transaction(&state.db, q).await;
             results.push(suggestion(
                 "transaction",
                 format!("/tx/{q}"),
@@ -2033,7 +2096,7 @@ pub async fn search_suggest(
         }
     } else {
         // A name: tokens the index knows, then the built-in contracts.
-        for meta in db::search_tokens(&state.db, q, SUGGESTION_LIMIT as u32) {
+        for meta in db::search_tokens(&state.db, q, SUGGESTION_LIMIT as u32).await {
             results.push(suggestion(
                 "token",
                 format!("/token/{}", meta.address),
@@ -2116,7 +2179,7 @@ fn is_hash(value: &str) -> bool {
 // Error helpers
 // ---------------------------------------------------------------------------
 
-fn not_found(
+async fn not_found(
     state: &AppState,
     headers: &HeaderMap,
     query: &HashMap<String, String>,
@@ -2130,14 +2193,14 @@ fn not_found(
         )
             .into_response()
     } else {
-        not_found_html(state, kind, id, &format!("{kind} not found"))
+        not_found_html(state, kind, id, &format!("{kind} not found")).await
     }
 }
 
-fn not_found_html(state: &AppState, kind: &str, id: &str, message: &str) -> Response {
+async fn not_found_html(state: &AppState, kind: &str, id: &str, message: &str) -> Response {
     // Through page_ctx like any other page: 404.html extends the layout, so a
     // hand-built context renders nothing and the reader gets bare text.
-    let ctx = page_ctx(state, json!({"type": kind, "id": id, "message": message}));
+    let ctx = page_ctx(state, json!({"type": kind, "id": id, "message": message})).await;
     match tera::Context::from_serialize(&ctx) {
         Ok(tera_ctx) => match state.tera.render("404.html", &tera_ctx) {
             Ok(html) => (StatusCode::NOT_FOUND, Html(html)).into_response(),
@@ -2197,7 +2260,7 @@ fn comma_num(n: i64) -> String {
 }
 
 /// Attach token symbol/decimals + formatted amounts to transfer rows.
-fn enrich_transfers(state: &AppState, transfers: &mut [Value]) {
+async fn enrich_transfers(state: &AppState, transfers: &mut [Value]) {
     let addrs: Vec<String> = transfers
         .iter()
         .filter_map(|t| {
@@ -2206,7 +2269,7 @@ fn enrich_transfers(state: &AppState, transfers: &mut [Value]) {
                 .map(String::from)
         })
         .collect();
-    let metas = db::get_tokens_metadata(&state.db, &addrs);
+    let metas = db::get_tokens_metadata(&state.db, &addrs).await;
     for t in transfers.iter_mut() {
         let Some(addr) = t.get("token_addr").and_then(Value::as_str) else {
             continue;
@@ -2286,17 +2349,11 @@ pub fn build_tera(db: Db) -> Result<Arc<Tera>> {
         let ts = args.get("timestamp").and_then(Value::as_i64).unwrap_or(0);
         Ok(Value::String(format_time_ago(ts)))
     });
-    let block_db = db.clone();
-    tera.register_function("get_block_url", move |args: &HashMap<String, Value>| {
+    // A height or a hash; the block page resolves either. Tera functions are
+    // sync, so this one never asks the database.
+    tera.register_function("get_block_url", |args: &HashMap<String, Value>| {
         let id = args.get("block_id").and_then(Value::as_str).unwrap_or("");
-        let url = if id.chars().all(|c| c.is_ascii_digit()) && !id.is_empty() {
-            format!("/block/{id}")
-        } else {
-            db::get_block_by_hash(&block_db, id)
-                .map(|b| format!("/block/{}", b.number))
-                .unwrap_or_else(|| format!("/block/{id}"))
-        };
-        Ok(Value::String(url))
+        Ok(Value::String(format!("/block/{id}")))
     });
     tera.register_function("get_tx_url", |args: &HashMap<String, Value>| {
         let h = args.get("tx_hash").and_then(Value::as_str).unwrap_or("");
@@ -2369,6 +2426,48 @@ pub fn format_time_ago(ts: i64) -> String {
     }
 }
 
+/// `/healthz` and `/readyz`, for an orchestrator's probes. Liveness never
+/// touches the database; readiness reads the status the database layer
+/// publishes and never takes a connection.
+pub fn health(status: watch::Receiver<db::Status>) -> Router {
+    Router::new()
+        .route("/healthz", get(|| async { "ok" }))
+        .route("/readyz", get(readyz))
+        .with_state(status)
+}
+
+async fn readyz(State(status): State<watch::Receiver<db::Status>>) -> Response {
+    let status = status.borrow().clone();
+    let code = if status.ready() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (code, Json(status)).into_response()
+}
+
+/// Turn a response whose reads failed into a 503 with `Retry-After`, never a
+/// false 404 or an empty page, and time every page by its route.
+async fn database_guard(
+    matched: axum::extract::MatchedPath,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let started = std::time::Instant::now();
+    let (resp, failed) = db::track_failures(next.run(req)).await;
+    crate::metrics::request_duration(matched.as_str(), started.elapsed().as_secs_f64());
+    if !failed {
+        return resp;
+    }
+    crate::metrics::http_503();
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(axum::http::header::RETRY_AFTER, "30")],
+        "The database is unavailable; try again shortly.",
+    )
+        .into_response()
+}
+
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/", get(home))
@@ -2390,6 +2489,7 @@ pub fn app(state: AppState) -> Router {
         .route("/search", get(search_page))
         .route("/api/search", get(search_suggest))
         .route("/api/anchoring/search", get(anchoring_suggest))
+        .route_layer(axum::middleware::from_fn(database_guard))
         // Public explorer: allow cross-origin reads from any site (the wallet
         // is hosted on a different origin and needs `?format=json`).
         .layer(CorsLayer::permissive())

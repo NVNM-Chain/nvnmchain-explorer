@@ -10,9 +10,9 @@ holdings and holder counts, and decoded call/event views on transaction
 pages.
 
 Written in Rust with [axum](https://github.com/tokio-rs/axum) + [Tera](https://tera.netlify.app/),
-rusqlite (schema created on boot), an async reqwest JSON-RPC client, a
-self-contained ABIv2 decoder with keccak, and a tokio indexer (forward tip +
-backfill).
+SQLite (rusqlite) or Postgres (sqlx 0.9) with versioned migrations, an async
+reqwest JSON-RPC client, a self-contained ABIv2 decoder with keccak, and a
+tokio indexer (forward tip + backfill).
 
 The default RPC is `https://rpc.nvnm.canary.mantrachain.dev` — the chain this
 codebase is validated against. Point it anywhere with `NVNM_RPC` (the legacy
@@ -28,12 +28,16 @@ cargo run --release
 Open http://localhost:8080. On first boot the indexer seeds from the chain
 head, tracks new blocks continuously, and backfills history downward.
 
+To run against a local node and the `docker compose` Postgres instead, copy
+`.env.example` to `.env` first (see [Configuration](#configuration-env-vars)).
+
 ## Deploying to the cloud
 
-The explorer is a single long-running process (web server + indexer) with a
-SQLite database, so a good home is an always-on small VM or container with a
-persistent disk. Platforms whose free tier sleeps (e.g. Render Free) would
-pause the indexer and are unsuitable.
+On SQLite the explorer is a single long-running process (web server +
+indexer, `ROLE=all`), so a good home is an always-on small VM or container with
+a persistent disk. Platforms whose free tier sleeps (e.g. Render Free) would
+pause the indexer and are unsuitable. The split deployment on Postgres, for
+Kubernetes, is under [Kubernetes with Postgres](#kubernetes-with-postgres).
 
 All of the options below give you a platform subdomain with TLS — no domain
 registration needed. If you already own a domain you can point a subdomain at
@@ -71,6 +75,15 @@ Railway: create a service from this repo (Dockerfile), add a volume mounted at
 `/data`, set `DB_PATH=/data/explorer.db`. Render: import `render.yaml`, pick
 Starter, deploy.
 
+### Kubernetes with Postgres
+
+For availability and data that outgrows one machine, the same image runs as
+two deployments against Postgres (Cloud SQL, or CloudNativePG in the cluster):
+one `ROLE=indexer` writer and N `ROLE=web` replicas. Releases roll the indexer
+first, then web. `deploy/k8s/README.md` has the manifests, the target setup and
+the deploy order; `docs/runbook.md` has the side-by-side cutover from SQLite
+and the operations guide.
+
 ### Persistence & schema migrations
 
 - **Data survives redeploys** — SQLite lives on a persistent volume mounted at
@@ -78,12 +91,11 @@ Starter, deploy.
   database; the container entrypoint (`deploy/entrypoint.sh`) fixes volume
   ownership on boot so the app user can write to it regardless of how the
   provider mounts empty volumes.
-- **Migrations run automatically** — on every boot `init_db` applies
-  idempotent DDL (`CREATE … IF NOT EXISTS`, `DROP … IF EXISTS`); a changed
-  column or key on an existing table makes the explorer refuse to start and
-  name the table (see `docs/database.md`); legacy databases also get a one-time rebuild of
-  the incremental token-balance table, and their anchoring events read back
-  from the node's logs.
+- **Versioned migrations run automatically** — on boot, on both backends.
+  The explorer refuses to start on a database newer than the binary, or on a
+  drifted table, which it names. Legacy databases also get a one-time rebuild
+  of the incremental token-balance table, and their anchoring events read
+  back from the node's logs. See `docs/database.md`.
 - **Volume sizing** — a full backfill of this chain is ~1.2 GB of raw block
   JSON before indexes and transactions. Use at least 2 GB; the examples use
   5 GB (~$0.75/mo on Fly), which leaves comfortable headroom.
@@ -115,9 +127,13 @@ The indexer is built for a sub-second chain:
 - **One RPC call per block** — receipts via `eth_getBlockReceipts` (with a
   per-transaction batch fallback), traces via `debug_traceBlockByNumber`, and
   blocks fetched concurrently (`INDEX_CONCURRENCY` in flight).
-- **Serialized SQLite writes** — every block (block row + txs + transfers +
+- **One writer** — every batch of blocks (block rows + txs + transfers +
   balances + token metadata) is persisted in one transaction by a single
-  writer task, measured at ~200 blocks/s while backfilling.
+  writer task. On SQLite that is a per-row write, measured at ~200 blocks/s
+  while backfilling. On Postgres it is set-based, at most 14 round trips per
+  64-block batch, on a session that holds an advisory lock, so only one
+  process ever writes; a database restart is waited out and the batch
+  retried, so no block is lost.
 - **Cheap pages** — network stats (block time, TPS, gas utilization, 24h
   counts) are recomputed in the background into a `kv` row, and token
   balances/holder counts are maintained incrementally per block, so no page
@@ -125,21 +141,38 @@ The indexer is built for a sub-second chain:
 
 ## Configuration (env vars)
 
+For local development the explorer reads `.env` at startup; `ENV_FILE` names
+another file, and an empty `ENV_FILE` reads none. A variable already set in the
+environment wins over the file, and a value holding a `$` needs single quotes.
+`.env.example` sets the variables for a local node and the `docker compose`
+Postgres; copy it to `.env`, which git ignores. Deployments set the
+environment themselves.
+
 | Var | Default | Meaning |
 |-----|---------|---------|
 | `NVNM_RPC` | `https://rpc.nvnm.canary.mantrachain.dev` | JSON-RPC endpoint (legacy `TEMPO_RPC` also accepted) |
 | `WS_URL` | `wss://ws.nvnm.canary.mantrachain.dev` | WebSocket endpoint for `newHeads` |
-| `INDEX_WS` | `1` | Set `0` to disable the WebSocket feed (pure polling) |
-| `CHAIN_ID` | `787222` | Chain id shown in the UI |
+| `INDEX_WS` | `0` | `1` follows the WebSocket feed; unset or `0` polls only |
+| `CHAIN_ID` | `787222` | Read, but nothing uses it yet |
 | `DB_PATH` | `explorer.db` | SQLite database path |
+| `DB_CACHE_KIB` | `524288` | SQLite page cache, in KiB |
+| `DATABASE_URL` | unset | Postgres instead of SQLite; wins over `DB_PATH`. `postgres://…`, or `host:port[/db][?params]`; plaintext only, so keep the database on a private network |
+| `PGUSER` / `PGPASSWORD` | unset | Postgres credentials, when the URL carries none; the password is never logged |
+| `PGSSLMODE` | unset | Only `disable`, or unset; the URL's own `sslmode` wins over it. This build has no TLS |
+| `ROLE` | `all` | `all` (web + indexer, one process), or `web` / `indexer` for the split deployment (Postgres only) |
+| `DB_WEB_ROLE` | `explorer_web` | The web replicas' database user, which the indexer grants read and cache-write access |
+| `FOLLOW_POLL_MS` | `500` | How often a `ROLE=web` replica polls for new blocks |
 | `HOST` / `PORT` | `0.0.0.0` / `8080` | Bind address |
 | `INDEX_POLL_SECONDS` | `1` | Poll interval when the WebSocket feed is unavailable |
-| `INDEX_BATCH` | `5` | Blocks indexed per cycle (forward + backfill) |
+| `INDEX_BATCH` | `32` | Blocks indexed per cycle (forward + backfill) |
 | `INDEX_CONCURRENCY` | `32` | Blocks fetched in parallel |
-| `NATIVE_SYMBOL` | `OM` | Symbol shown for native (burnt/gas) amounts |
+| `NATIVE_SYMBOL` | `NVNM` | Symbol shown for native (burnt/gas) amounts; the Docker image sets `OM` |
 | `STATS_INTERVAL_SECONDS` | `5` | How often the dashboard stats are recomputed |
+| `RECENT_BLOCK_COUNT` | `15` | Rows in the dashboard's recent blocks |
+| `RECENT_TX_COUNT` | `15` | Rows in the dashboard's recent transactions |
 | `SIGNATURE_LOOKUP_URL` | OpenChain | Signature directory for selectors no built-in ABI declares; set empty to disable ([Decoding](#decoding)) |
 | `RUST_LOG` | `nvnmchain_explorer=info` | Log verbosity |
+| `ENV_FILE` | `.env` | The settings file read at startup; empty reads none, and a variable already set wins |
 
 ## Routes
 
@@ -159,14 +192,21 @@ The indexer is built for a sub-second chain:
 | `/api/search?q=...` | Suggestions for the search box, answered from the index |
 | `/api/anchoring/search?q=...` | Suggestions for the anchoring page's field |
 | `/api/events` | SSE live feed — pushes each newly indexed tip block (drives the home page's streaming "Latest Blocks" panel) |
+| `/healthz` | Liveness; never touches the database |
+| `/readyz` | Readiness, with the role, the schema versions, the writer's state and, on the indexer, its sync progress |
+| `/metrics` | Prometheus metrics, under `ROLE=web` and `ROLE=indexer` only, for in-cluster scraping |
 
 All data endpoints accept `?format=json` or `Accept: application/json`.
 
 The home page subscribes to `/api/events` with `EventSource` and updates the
 latest-blocks panel, the latest-block stat, and the block-time stat in real
-time as blocks land — no client polling. The feed is in-process: run a single
-instance (as the deploy configs do) so the indexer and the web server share
-the same broadcast channel.
+time as blocks land — no client polling. Under `ROLE=all` the feed is
+in-process: the indexer and the web server share one broadcast channel. Web
+replicas (`ROLE=web`) get theirs from a polling follower, which reads new
+blocks and stats from Postgres every `FOLLOW_POLL_MS`.
+
+While Postgres is unreachable, pages answer `503` with `Retry-After: 30`,
+never an empty page or a false "not found".
 
 ### Decoding
 
@@ -202,9 +242,19 @@ when it hashes to the selector it was offered for, and is badged as the
 stranger's name it is. Set `SIGNATURE_LOOKUP_URL=` (empty) and the explorer
 talks to no third party.
 
+## Known limitations
+
+- **In the split deployment, a token with no mint, transfer or fee use yet is
+  not listed or searchable**, even after its page is opened, until its first
+  transfer is indexed. Its page still renders, from the node. Web replicas
+  write no chain data, and the indexer learns of a token from its transfers.
+  `ROLE=all` keeps saving a token when its page is viewed. The token-discovery
+  change that follows reads the TIP-20 factory's `TokenCreated` logs and
+  removes this.
+
 ## Indexer
 
-Two background loops share a single SQLite writer task:
+Two background loops share a single writer task:
 
 1. **Forward** — new blocks at the tip, driven by the WebSocket head feed (or
    polling fallback), indexed as soon as they appear.
@@ -226,11 +276,17 @@ holder counts and address holdings stay exact without rescanning history.
 
 ```bash
 # Unit and integration tests (no network)
-cargo test --lib --test decoder --test anchoring --test pages
+cargo test --lib --test decoder --test anchoring --test pages \
+    --test health --test migrations --test outage --test shutdown --test env_file
 
 # Integration tests against the live chain RPC
-cargo test --test live_rpc
+cargo test --test live_rpc --test baseline
 ```
+
+On Postgres, `docs/database.md` ("Running the Postgres tests") has the
+commands for every suite: fixture replay into both backends, a differential
+between them, a parity grid over every database function, migrations, locks,
+and outage drills.
 
 `tests/pages.rs` boots the HTTP API over a temp SQLite database and renders the
 real templates, so a context key a handler stops sending fails a test rather
@@ -251,7 +307,10 @@ src/
   rpc.rs        async JSON-RPC client
   ws.rs         WebSocket newHeads feed + polling fallback
   parse.rs      raw RPC → storage models
-  db.rs         SQLite layer
+  db/           the async database API: mod.rs (dispatch, label cache),
+                sqlite.rs, pg/ (Postgres), migrations.rs, config.rs
+  follow.rs     the web role's polling live feed
+  metrics.rs    Prometheus /metrics
   decoder.rs    ABI registry (from tempo-contracts) + decoder
   summary.rs    what a transaction did, in a sentence
   memo.rs       TIP-20 transfer memos
@@ -264,6 +323,8 @@ src/
   indexer.rs    background indexing
   web.rs        axum routes + template helpers
 abi/            ABIs for contracts no Tempo binding carries
+migrations/     versioned schema changes, a SQLite and a Postgres twin per version
+deploy/k8s/     the split deployment on Postgres
 templates/      Tera templates
 tests/          unit + page tests, and live RPC integration tests
 ```

@@ -10,11 +10,9 @@ use nvnmchain_explorer::tokens::{
 };
 use serde_json::{json, Value};
 
-fn temp_db(name: &str) -> (tempfile::TempDir, Db) {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join(name);
-    (dir, db::open(path.to_str().unwrap()).expect("init_db"))
-}
+#[path = "common/backend.rs"]
+mod backend;
+use backend::temp_db;
 
 /// A block carrying one transaction, in the shape the RPC returns it.
 ///
@@ -578,10 +576,10 @@ fn a_database_with_single_column_transfer_indexes_gets_the_composite_ones() {
     );
 }
 
-#[test]
-fn blob_hex_round_trip() {
+#[tokio::test]
+async fn blob_hex_round_trip() {
     // Block with one transaction (so the tx row is exercised too).
-    let (_dir, db) = temp_db("blob.db");
+    let (_dir, db) = temp_db("blob.db").await;
     let raw_block = sample_raw_block();
     let hash = raw_block["hash"].as_str().unwrap().to_string();
     let parent = raw_block["parentHash"].as_str().unwrap().to_string();
@@ -607,26 +605,30 @@ fn blob_hex_round_trip() {
         anchoring: Vec::new(),
         tokens: vec![],
     };
-    db::save_block_bundle(&db, &bundle).expect("save bundle");
+    db::save_block_bundle(&db, &bundle)
+        .await
+        .expect("save bundle");
 
     // Block reads back with identical hex, and hash lookup is case-insensitive
     // (binary storage normalizes hex case — a bonus over TEXT comparisons).
-    let got = db::get_block_by_number(&db, 16).expect("block by number");
+    let got = db::get_block_by_number(&db, 16)
+        .await
+        .expect("block by number");
     assert_eq!(got.hash, hash);
     assert_eq!(got.parent_hash, parent);
     assert_eq!(got.proposer, proposer);
     assert_eq!(got.miner, miner);
-    assert!(db::get_block_by_hash(&db, &hash).is_some());
+    assert!(db::get_block_by_hash(&db, &hash).await.is_some());
     let upper = format!("0x{}", hash[2..].to_uppercase());
     assert!(
-        db::get_block_by_hash(&db, &upper).is_some(),
+        db::get_block_by_hash(&db, &upper).await.is_some(),
         "hash lookup should be case-insensitive with BLOB storage"
     );
 
     // Transaction reads back: raw is the canonical RLP encoding, and the
     // display fields (calls, signature type, gas) are decoded from it at
     // runtime with the tempo primitives.
-    let got_tx = db::get_transaction(&db, &tx_hash).expect("tx");
+    let got_tx = db::get_transaction(&db, &tx_hash).await.expect("tx");
     assert_eq!(got_tx.raw.as_deref(), Some(rlp));
     let parsed = nvnmchain_explorer::decoder::parse_raw_tx(got_tx.raw.as_deref().unwrap());
     assert_eq!(parsed.sig_type.as_deref(), Some("WebAuthn"));
@@ -641,21 +643,21 @@ fn blob_hex_round_trip() {
 
 /// A re-index carrying no trace, raw bytes or receipt keeps the ones stored: the
 /// trace the transaction page cached, the raw bytes a failed decode left out.
-#[test]
-fn a_rewrite_without_the_blobs_keeps_them() {
-    let (_dir, db) = temp_db("keep-blobs.db");
+#[tokio::test]
+async fn a_rewrite_without_the_blobs_keeps_them() {
+    let (_dir, db) = temp_db("keep-blobs.db").await;
     let raw_block = sample_raw_block();
     let block = parse_block(&raw_block);
     let mut tx = parse_transaction(&raw_block["transactions"][0], &block);
     tx.raw = Some("0xabcd".into());
     tx.trace_data = Some("[]".into());
     tx.receipt_data = Some("{}".into());
-    db::save_transaction(&db, &tx).unwrap();
+    db::save_transaction(&db, &tx).await.unwrap();
 
     let bare = parse_transaction(&raw_block["transactions"][0], &block);
     assert!(bare.raw.is_none() && bare.trace_data.is_none());
-    db::save_transaction(&db, &bare).unwrap();
-    let stored = db::get_transaction(&db, &tx.hash).unwrap();
+    db::save_transaction(&db, &bare).await.unwrap();
+    let stored = db::get_transaction(&db, &tx.hash).await.unwrap();
     assert_eq!(stored.raw.as_deref(), Some("0xabcd"));
     assert_eq!(stored.trace_data.as_deref(), Some("[]"));
     assert_eq!(stored.receipt_data.as_deref(), Some("{}"));
@@ -663,11 +665,11 @@ fn a_rewrite_without_the_blobs_keeps_them() {
 
 /// A database from before the counters is counted once when it opens, and the
 /// writer carries on from there.
-#[test]
-fn counters_are_seeded_from_the_tables_of_an_older_database() {
+#[tokio::test]
+async fn counters_are_seeded_from_the_tables_of_an_older_database() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("counters.db");
-    let db: Db = db::open(path.to_str().unwrap()).expect("init_db");
+    let db: Db = db::open(path.to_str().unwrap()).await.expect("init_db");
     let raw_block = sample_raw_block();
     let block = parse_block(&raw_block);
     let tx = parse_transaction(&raw_block["transactions"][0], &block);
@@ -681,6 +683,7 @@ fn counters_are_seeded_from_the_tables_of_an_older_database() {
             tokens: vec![],
         },
     )
+    .await
     .expect("save");
     db::lock(&db)
         .execute("DELETE FROM counters", [])
@@ -693,9 +696,9 @@ fn counters_are_seeded_from_the_tables_of_an_older_database() {
 }
 
 /// The count the writer keeps is what a recount finds, at every step.
-#[test]
-fn holder_count_follows_the_balances() {
-    let (_dir, db) = temp_db("holders.db");
+#[tokio::test]
+async fn holder_count_follows_the_balances() {
+    let (_dir, db) = temp_db("holders.db").await;
     let raw_block = sample_raw_block();
     let block = parse_block(&raw_block);
     let tx = parse_transaction(&raw_block["transactions"][0], &block);
@@ -728,29 +731,35 @@ fn holder_count_follows_the_balances() {
             anchoring: Vec::new(),
             tokens: vec![meta.clone()],
         };
-        db::save_block_bundle(&db, &bundle).expect("save");
-        let kept = db::get_token_metadata(&db, &token)
-            .expect("token")
-            .holder_count;
-        assert_eq!(
-            kept,
-            db::get_token_holder_count(&db, &token),
-            "the kept count is what a recount finds"
-        );
-        kept
+        let (db, token) = (db.clone(), token.clone());
+        async move {
+            db::save_block_bundle(&db, &bundle).await.expect("save");
+            let kept = db::get_token_metadata(&db, &token)
+                .await
+                .expect("token")
+                .holder_count;
+            assert_eq!(
+                kept,
+                db::get_token_holder_count(&db, &token).await,
+                "the kept count is what a recount finds"
+            );
+            kept
+        }
     };
     // a pays b out of nothing: b holds, a is owed.
-    assert_eq!(save(0, &a, &b, "100"), 1);
+    assert_eq!(save(0, &a, &b, "100").await, 1);
     // b pays it back: both at zero, nobody holds.
-    assert_eq!(save(1, &b, &a, "100"), 0);
+    assert_eq!(save(1, &b, &a, "100").await, 0);
     // b holds again, and a second payment adds no holder.
-    assert_eq!(save(2, &a, &b, "50"), 1);
-    assert_eq!(save(3, &a, &b, "50"), 1);
+    assert_eq!(save(2, &a, &b, "50").await, 1);
+    assert_eq!(save(3, &a, &b, "50").await, 1);
 }
 
-#[test]
-fn duplicate_bundle_is_idempotent() {
-    let (_dir, db) = temp_db("dedup.db");
+#[tokio::test]
+async fn duplicate_bundle_is_idempotent() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("dedup.db");
+    let db: Db = db::open(path.to_str().unwrap()).await.expect("init_db");
     let raw_block = sample_raw_block();
     let block = parse_block(&raw_block);
     let tx = parse_transaction(&raw_block["transactions"][0], &block);
@@ -766,8 +775,12 @@ fn duplicate_bundle_is_idempotent() {
         anchoring: Vec::new(),
         tokens: vec![],
     };
-    db::save_block_bundle(&db, &bundle).expect("first save");
-    db::save_block_bundle(&db, &bundle).expect("duplicate save");
+    db::save_block_bundle(&db, &bundle)
+        .await
+        .expect("first save");
+    db::save_block_bundle(&db, &bundle)
+        .await
+        .expect("duplicate save");
 
     let conn = db::lock(&db);
     let count: i64 = conn
@@ -814,9 +827,11 @@ fn duplicate_bundle_is_idempotent() {
 
 /// An anchoring write reads back on its registry, newest first and the caller
 /// checksummed; re-writing the block adds no second row.
-#[test]
-fn anchoring_events_read_back_by_registry() {
-    let (_dir, db) = temp_db("anchoring.db");
+#[tokio::test]
+async fn anchoring_events_read_back_by_registry() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("anchoring.db");
+    let db: Db = db::open(path.to_str().unwrap()).await.expect("init_db");
     let raw_block = sample_raw_block();
     let block = parse_block(&raw_block);
     let tx = parse_transaction(&raw_block["transactions"][0], &block);
@@ -838,10 +853,10 @@ fn anchoring_events_read_back_by_registry() {
         anchoring: vec![event(0, "AddRegistry", 0), event(1, "AddRecord", 7)],
         tokens: vec![],
     };
-    db::save_block_bundle(&db, &bundle).expect("save");
-    db::save_block_bundle(&db, &bundle).expect("re-save");
+    db::save_block_bundle(&db, &bundle).await.expect("save");
+    db::save_block_bundle(&db, &bundle).await.expect("re-save");
 
-    let events = db::get_anchoring_events(&db, 2190, 25);
+    let events = db::get_anchoring_events(&db, 2190, 25).await;
     assert_eq!(
         events.len(),
         2,
@@ -851,8 +866,8 @@ fn anchoring_events_read_back_by_registry() {
     assert_eq!(events[0].record_id, 7);
     assert_eq!(events[0].tx_hash, tx.hash);
     assert_eq!(events[0].caller, checksum_address(caller));
-    assert!(db::get_anchoring_events(&db, 2191, 25).is_empty());
-    let latest = db::get_anchoring_events(&db, 2190, 1);
+    assert!(db::get_anchoring_events(&db, 2191, 25).await.is_empty());
+    let latest = db::get_anchoring_events(&db, 2190, 1).await;
     assert_eq!(latest.len(), 1, "the limit holds");
     assert_eq!(latest[0].event, "AddRecord", "and keeps the newest");
 
@@ -868,9 +883,9 @@ fn anchoring_events_read_back_by_registry() {
 /// shows it. The columns are BLOBs; readers that bound TEXT against them
 /// matched nothing, so these tabs were permanently empty while the counters
 /// beside them reported rows.
-#[test]
-fn indexed_transfer_reads_back_through_every_listing() {
-    let (_dir, db) = temp_db("listings.db");
+#[tokio::test]
+async fn indexed_transfer_reads_back_through_every_listing() {
+    let (_dir, db) = temp_db("listings.db").await;
     let raw_block = sample_raw_block();
     let block = parse_block(&raw_block);
     let tx = parse_transaction(&raw_block["transactions"][0], &block);
@@ -891,9 +906,11 @@ fn indexed_transfer_reads_back_through_every_listing() {
         anchoring: Vec::new(),
         tokens: vec![meta],
     };
-    db::save_block_bundle(&db, &bundle).expect("save bundle");
+    db::save_block_bundle(&db, &bundle)
+        .await
+        .expect("save bundle");
 
-    let by_token = db::get_token_transfers(&db, &token, 1, 25);
+    let by_token = db::get_token_transfers(&db, &token, 1, 25).await;
     assert_eq!(by_token.len(), 1, "token transfers");
     assert_eq!(by_token[0]["from_addr"], json!(from));
     assert_eq!(by_token[0]["to_addr"], json!(to));
@@ -907,23 +924,25 @@ fn indexed_transfer_reads_back_through_every_listing() {
     assert_ne!(tx.from_addr, checksum_address(&tx.from_addr));
 
     assert_eq!(
-        db::get_address_transfers(&db, &to, 1, 25).len(),
+        db::get_address_transfers(&db, &to, 1, 25).await.len(),
         1,
         "recipient"
     );
     assert_eq!(
-        db::get_address_transfers(&db, &from, 1, 25).len(),
+        db::get_address_transfers(&db, &from, 1, 25).await.len(),
         1,
         "sender"
     );
-    assert_eq!(db::get_token_transfer_count(&db, &token), 1);
+    assert_eq!(db::get_token_transfer_count(&db, &token).await, 1);
 
     // Holdings need the batch metadata lookup, which bound TEXT as well.
     assert_eq!(
-        db::get_tokens_metadata(&db, std::slice::from_ref(&token)).len(),
+        db::get_tokens_metadata(&db, std::slice::from_ref(&token))
+            .await
+            .len(),
         1
     );
-    let holdings = db::get_address_holdings(&db, &to);
+    let holdings = db::get_address_holdings(&db, &to).await;
     assert_eq!(holdings.len(), 1, "recipient holdings");
     assert_eq!(holdings[0]["symbol"], json!("PRB"));
     assert_eq!(holdings[0]["formatted"], json!("1"));
@@ -931,13 +950,15 @@ fn indexed_transfer_reads_back_through_every_listing() {
     // And the tokens list reports the holders the transfer created. Only the
     // recipient: the sender was never seen being funded, so its balance went
     // negative, and a negative balance is not a holding.
-    assert_eq!(db::get_token_holder_count(&db, &token), 1);
-    let stored = db::get_token_metadata(&db, &token).expect("token metadata");
+    assert_eq!(db::get_token_holder_count(&db, &token).await, 1);
+    let stored = db::get_token_metadata(&db, &token)
+        .await
+        .expect("token metadata");
     assert_eq!(stored.holder_count, 1, "holder_count on the tokens list");
 }
 
-#[test]
-fn blob_storage_queries_match_text_params() {
+#[tokio::test]
+async fn blob_storage_queries_match_text_params() {
     // Regression: `transfer_events`/`token_metadata` store addresses as raw
     // bytes (BLOBs), so any query passing a plain TEXT address silently
     // matched nothing — empty transfers tabs, empty holdings, and holder
@@ -947,7 +968,7 @@ fn blob_storage_queries_match_text_params() {
 
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("blob-queries.db");
-    let db: Db = db::open(path.to_str().unwrap()).expect("init_db");
+    let db: Db = db::open(path.to_str().unwrap()).await.expect("init_db");
 
     let raw_block = json!({
         "number": "0x10",
@@ -1006,20 +1027,22 @@ fn blob_storage_queries_match_text_params() {
         anchoring: Vec::new(),
         tokens: vec![meta],
     };
-    db::save_block_bundle(&db, &bundle).expect("save bundle");
+    db::save_block_bundle(&db, &bundle)
+        .await
+        .expect("save bundle");
 
     // Address transfers tab: query binds the address as raw bytes.
-    let addr_transfers = db::get_address_transfers(&db, &to, 1, 25);
+    let addr_transfers = db::get_address_transfers(&db, &to, 1, 25).await;
     assert_eq!(addr_transfers.len(), 1, "address transfers must be found");
 
     // Token transfers list + count agree.
-    let token_transfers = db::get_token_transfers(&db, &token, 1, 25);
+    let token_transfers = db::get_token_transfers(&db, &token, 1, 25).await;
     assert_eq!(token_transfers.len(), 1, "token transfers must be found");
-    assert_eq!(db::get_token_transfer_count(&db, &token), 1);
+    assert_eq!(db::get_token_transfer_count(&db, &token).await, 1);
 
     // Holdings: balance row exists (TEXT) and metadata resolves (BLOB via
     // hex_blob IN-clause), so the joined holding is returned.
-    let holdings = db::get_address_holdings(&db, &to);
+    let holdings = db::get_address_holdings(&db, &to).await;
     assert_eq!(holdings.len(), 1, "holdings must be resolved");
     assert_eq!(holdings[0]["symbol"], "pathUSD");
     assert_eq!(holdings[0]["formatted"], "1");
@@ -1028,8 +1051,10 @@ fn blob_storage_queries_match_text_params() {
     // token_metadata.holder_count refreshed with a hex_blob key. The sender's
     // row went negative — indexing began after it was funded — and a negative
     // balance is not a holding, so only the recipient counts.
-    assert_eq!(db::get_token_holder_count(&db, &token), 1);
-    let meta_back = db::get_token_metadata(&db, &token).expect("token metadata");
+    assert_eq!(db::get_token_holder_count(&db, &token).await, 1);
+    let meta_back = db::get_token_metadata(&db, &token)
+        .await
+        .expect("token metadata");
     assert_eq!(
         meta_back.holder_count, 1,
         "token_metadata.holder_count must be refreshed via BLOB key"
@@ -1045,22 +1070,24 @@ fn blob_storage_queries_match_text_params() {
         .expect("stale holder count");
         db::sync_holder_counts(&conn).expect("sync holder counts");
     }
-    let meta_back = db::get_token_metadata(&db, &token).expect("token metadata");
+    let meta_back = db::get_token_metadata(&db, &token)
+        .await
+        .expect("token metadata");
     assert_eq!(
         meta_back.holder_count, 1,
         "sync_holder_counts must backfill stale counts"
     );
 }
 
-#[test]
-fn huge_page_numbers_do_not_panic() {
+#[tokio::test]
+async fn huge_page_numbers_do_not_panic() {
     use nvnmchain_explorer::db::{self, Db};
 
     // `page` is user input; u32 offset math overflowed (a panic under
     // debug assertions, a garbage offset in release).
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("pages.db");
-    let db: Db = db::open(path.to_str().unwrap()).expect("init_db");
+    let db: Db = db::open(path.to_str().unwrap()).await.expect("init_db");
 
     assert!(db::get_address_transactions(
         &db,
@@ -1069,11 +1096,14 @@ fn huge_page_numbers_do_not_panic() {
         25,
         TxColumns::List,
     )
+    .await
     .is_empty());
     assert!(
-        db::get_token_transfers(&db, &format!("0x{}", "aa".repeat(20)), u32::MAX, 25).is_empty()
+        db::get_token_transfers(&db, &format!("0x{}", "aa".repeat(20)), u32::MAX, 25)
+            .await
+            .is_empty()
     );
-    assert!(db::get_all_tokens(&db, u32::MAX, 25).is_empty());
+    assert!(db::get_all_tokens(&db, u32::MAX, 25).await.is_empty());
 }
 
 /// `authorizeKey(keyId, WebAuthn, KeyRestrictions{expiry, enforceLimits, one

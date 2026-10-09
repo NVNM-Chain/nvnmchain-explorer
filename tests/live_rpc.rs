@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use nvnmchain_explorer::config::{DEFAULT_CHAIN_ID, DEFAULT_RPC_URL, DEFAULT_WS_URL};
-use nvnmchain_explorer::db::{self, Db, TxColumns};
+use nvnmchain_explorer::db::{self, TxColumns};
 use nvnmchain_explorer::indexer::{fetch_block_bundle, index_block};
 use nvnmchain_explorer::rpc::{parse_int_any, ChainRpc};
 use nvnmchain_explorer::web::{self, AppState};
@@ -16,11 +16,9 @@ use serde_json::{json, Value};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 
-fn temp_db() -> (tempfile::TempDir, Db) {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("explorer.db");
-    (dir, db::open(path.to_str().unwrap()).expect("init db"))
-}
+#[path = "common/backend.rs"]
+mod backend;
+use backend::temp_db;
 
 fn rpc() -> ChainRpc {
     ChainRpc::new(DEFAULT_RPC_URL).expect("rpc client")
@@ -134,7 +132,7 @@ async fn fetch_block_receipts_fallback() {
 #[tokio::test]
 async fn backfill_throughput() {
     let rpc = rpc();
-    let (_dir, db) = temp_db();
+    let (_dir, db) = temp_db("explorer.db").await;
     let head = rpc.eth_block_number().await.expect("head");
     let from = head.saturating_sub(300);
     let count = head - from + 1;
@@ -149,7 +147,9 @@ async fn backfill_throughput() {
             let num = next;
             set.spawn(async move {
                 if let Ok(Some(bundle)) = fetch_block_bundle(&rpc, num).await {
-                    let _ = db::save_block_bundle(&db, &bundle);
+                    if let Err(e) = db::save_block_bundle(&db, &bundle).await {
+                        eprintln!("block {num} not written: {e:#}");
+                    }
                 }
             });
             next += 1;
@@ -163,9 +163,9 @@ async fn backfill_throughput() {
     let per_sec = count as f64 / elapsed.as_secs_f64();
     eprintln!("indexed {count} blocks in {elapsed:?} ({per_sec:.0} blocks/s)");
 
-    assert_eq!(db::get_min_block_number(&db), Some(from as i64));
+    assert_eq!(db::get_min_block_number(&db).await, Some(from as i64));
     assert_eq!(
-        db::get_latest_block(&db).map(|b| b.number as u64),
+        db::get_latest_block(&db).await.map(|b| b.number as u64),
         Some(head)
     );
     assert!(
@@ -224,7 +224,7 @@ async fn chain_metadata_matches_mantra() {
 #[tokio::test]
 async fn index_recent_blocks_into_sqlite() {
     let rpc = rpc();
-    let (_dir, db) = temp_db();
+    let (_dir, db) = temp_db("explorer.db").await;
     let head = rpc.eth_block_number().await.expect("head");
 
     // Index a small window at the tip.
@@ -234,18 +234,20 @@ async fn index_recent_blocks_into_sqlite() {
     }
 
     for n in start..=head {
-        let block = db::get_block_by_number(&db, n as i64).expect("stored block");
+        let block = db::get_block_by_number(&db, n as i64)
+            .await
+            .expect("stored block");
         assert_eq!(block.number as u64, n);
         assert!(!block.hash.is_empty());
         assert!(block.timestamp > 0);
     }
-    let latest = db::get_latest_block(&db).expect("latest");
+    let latest = db::get_latest_block(&db).await.expect("latest");
     assert_eq!(latest.number as u64, head);
 
     // Transactions that exist on the chain must be stored with receipts.
     for n in start..=head {
-        let block = db::get_block_by_number(&db, n as i64).unwrap();
-        let txs = db::get_block_transactions(&db, block.number, TxColumns::Full);
+        let block = db::get_block_by_number(&db, n as i64).await.unwrap();
+        let txs = db::get_block_transactions(&db, block.number, TxColumns::Full).await;
         assert_eq!(txs.len() as i64, block.tx_count);
         for tx in &txs {
             assert_eq!(tx.block_number, block.number);
@@ -254,7 +256,7 @@ async fn index_recent_blocks_into_sqlite() {
     }
 
     // If the tip block has transactions, spot-check a receipt + decoded call.
-    let txs = db::get_block_transactions(&db, head as i64, TxColumns::Full);
+    let txs = db::get_block_transactions(&db, head as i64, TxColumns::Full).await;
     if let Some(tx) = txs.first() {
         if tx.receipt_data.is_some() {
             let receipt: Value = serde_json::from_str(tx.receipt_data.as_deref().unwrap()).unwrap();
@@ -269,7 +271,7 @@ async fn index_recent_blocks_into_sqlite() {
 #[tokio::test]
 async fn web_api_serves_indexed_data() {
     let rpc = rpc();
-    let (_dir, db) = temp_db();
+    let (_dir, db) = temp_db("explorer.db").await;
     let head = rpc.eth_block_number().await.expect("head");
     index_block(&rpc, &db, head).await.expect("index tip");
 
@@ -280,7 +282,6 @@ async fn web_api_serves_indexed_data() {
         chain_id: DEFAULT_CHAIN_ID,
         host: "127.0.0.1".into(),
         port: 0,
-        db_path: "unused".into(),
         recent_block_count: 5,
         recent_tx_count: 5,
         poll_seconds: 1.0,
@@ -366,7 +367,7 @@ async fn web_api_serves_indexed_data() {
     assert!(search.status().is_redirection() || search.status().is_success());
 
     // A transaction page if the tip block has transactions.
-    let txs = db::get_block_transactions(&db, head as i64, TxColumns::Full);
+    let txs = db::get_block_transactions(&db, head as i64, TxColumns::Full).await;
     if let Some(tx) = txs.first() {
         let tx_resp = client
             .get(format!("{base}/tx/{}", tx.hash))
@@ -415,7 +416,7 @@ async fn web_api_serves_indexed_data() {
 #[tokio::test]
 async fn anchoring_events_link_a_registry_to_its_tx() {
     let rpc = rpc();
-    let (_dir, db) = temp_db();
+    let (_dir, db) = temp_db("explorer.db").await;
     let head = rpc.eth_block_number().await.expect("head");
     // The latest write within the node's 100k-block log range.
     let logs = rpc
@@ -439,7 +440,7 @@ async fn anchoring_events_link_a_registry_to_its_tx() {
             |r| r.get(0),
         )
         .expect("the block's anchoring row");
-    let found = db::get_anchoring_events(&db, id, 25);
+    let found = db::get_anchoring_events(&db, id, 25).await;
     let event = &found[0];
     assert_eq!(event.block_number, block);
     println!(

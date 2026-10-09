@@ -14,7 +14,7 @@ jobs:
     name: Lint + format (cargo)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           submodules: true
 
@@ -35,7 +35,7 @@ jobs:
     name: Test (cargo)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           submodules: true
 
@@ -45,9 +45,33 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run unit tests
-        run: cargo test --lib --test decoder --test anchoring --test pages
+        run: >
+          cargo test --lib --test decoder --test anchoring --test pages
+          --test health --test migrations --test outage --test shutdown
+          --test env_file
 
       - name: Run live RPC integration tests
         run: cargo test --test live_rpc --test baseline
         env:
           TEMPO_RPC: https://rpc.nvnm.canary.mantrachain.dev
+
+  # A merged migration may already be applied to a deployed database, whose
+  # checksum check would then refuse every new image: the fix for a mistake is
+  # always a new version. New files are fine. See docs/database.md.
+  migrations:
+    name: Merged migrations are immutable
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: No merged migration is modified, deleted or renamed
+        run: |
+          changed=$(git diff --name-status "origin/${{ github.base_ref }}...HEAD" -- migrations/ | grep -v '^A' || true)
+          if [ -n "$changed" ]; then
+            echo "$changed"
+            echo "::error::merged migrations are immutable; add a new version instead (docs/database.md)"
+            exit 1
+          fi

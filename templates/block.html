@@ -40,7 +40,7 @@
             <div class="kv-row">
                 <div class="kv-label">Parent Hash</div>
                 <div class="kv-value mono text-xs">
-                    <a href="{{ get_block_url(block_id=block.parent_hash) }}" class="text-blue-400 break-all">{{ block.parent_hash }}</a>
+                    <a href="/block/{% if parent_block is number %}{{ parent_block }}{% else %}{{ block.parent_hash }}{% endif %}" class="text-blue-400 break-all">{{ block.parent_hash }}</a>
                 </div>
             </div>
             <div class="kv-row">

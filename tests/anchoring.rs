@@ -12,6 +12,10 @@ use nvnmchain_explorer::anchoring::{
 };
 use nvnmchain_explorer::config::Settings;
 use nvnmchain_explorer::db;
+
+#[path = "common/backend.rs"]
+mod backend;
+use backend::temp_db;
 use nvnmchain_explorer::web::{self, AppState};
 use serde_json::{json, Value};
 
@@ -219,9 +223,8 @@ async fn node(registries: u64, indexing: bool) -> String {
 }
 
 /// The explorer, reading `rpc_url`.
-async fn serve(rpc_url: String) -> (tempfile::TempDir, String) {
-    let dir = tempfile::tempdir().unwrap();
-    let db = db::open(dir.path().join("anchoring.db").to_str().unwrap()).unwrap();
+async fn serve(rpc_url: String) -> (backend::TempDb, String) {
+    let (dir, db) = temp_db("anchoring.db").await;
     let mut cfg = Settings::from_env();
     cfg.signature_lookup_url = None;
     cfg.rpc_url = rpc_url;
@@ -551,15 +554,14 @@ async fn capped_log_node(calls: Arc<std::sync::atomic::AtomicUsize>) -> String {
 /// the write in an indexed block and skips the one in a block not indexed yet.
 #[tokio::test]
 async fn backfill_narrows_to_the_node_cap_and_resumes_past_errors() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = db::open(dir.path().join("backfill.db").to_str().unwrap()).unwrap();
+    let (_dir, db) = temp_db("backfill.db").await;
     let block = nvnmchain_explorer::parse::parse_block(&json!({
         "number": "0x5dc",
         "hash": format!("0x{}", "cd".repeat(32)),
         "parentHash": format!("0x{}", "ef".repeat(32)),
         "timestamp": "0x64",
     }));
-    db::save_block(&db, &block).unwrap();
+    db::save_block(&db, &block).await.unwrap();
 
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let rpc =
@@ -568,18 +570,18 @@ async fn backfill_narrows_to_the_node_cap_and_resumes_past_errors() {
         .await
         .expect("backfill");
 
-    let events = db::get_anchoring_events(&db, 1500, 25);
+    let events = db::get_anchoring_events(&db, 1500, 25).await;
     assert_eq!(events.len(), 1);
     assert_eq!(
         (events[0].event.as_str(), events[0].timestamp),
         ("AddRegistry", 100)
     );
     assert!(
-        db::get_anchoring_events(&db, 1700, 25).is_empty(),
+        db::get_anchoring_events(&db, 1700, 25).await.is_empty(),
         "block 1700 is not indexed"
     );
     assert_eq!(
-        db::get_kv(&db, "anchoring_backfilled_to").as_deref(),
+        db::get_kv(&db, "anchoring_backfilled_to").await.as_deref(),
         Some("2000")
     );
     // One dropped, six refused on the way down to 781 blocks, then three windows.

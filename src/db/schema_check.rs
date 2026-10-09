@@ -416,7 +416,7 @@ fn index_drift(have: &Table, want: &Table) -> Vec<(Option<String>, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db;
+    use crate::db::sqlite as db;
 
     /// A database file at `name` in a fresh directory, set up by `prepare`
     /// before the explorer first opens it.

@@ -58,26 +58,28 @@ fn bundle(number: u64) -> BlockBundle {
     }
 }
 
-fn fresh() -> (tempfile::TempDir, Db) {
+async fn fresh() -> (tempfile::TempDir, Db) {
     let dir = tempfile::tempdir().unwrap();
-    let db = db::open(dir.path().join("explorer.db").to_str().unwrap()).unwrap();
+    let db = db::open(dir.path().join("explorer.db").to_str().unwrap())
+        .await
+        .unwrap();
     (dir, db)
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "prints timings; run explicitly with --ignored --nocapture"]
-fn write_scale() {
+async fn write_scale() {
     println!("\n{BLOCKS} blocks x {TXS_PER_BLOCK} txs");
 
     // What the code did before: WAL's default `synchronous = FULL`, one commit
     // per block -- an fsync each.
-    let (_dir, db) = fresh();
+    let (_dir, db) = fresh().await;
     db::lock(&db)
         .pragma_update(None, "synchronous", "FULL")
         .unwrap();
     let t = Instant::now();
     for n in 0..BLOCKS {
-        save_block_bundle(&db, &bundle(n)).unwrap();
+        save_block_bundle(&db, &bundle(n)).await.unwrap();
     }
     let full = t.elapsed();
     println!(
@@ -86,10 +88,10 @@ fn write_scale() {
         BLOCKS as f64 / full.as_secs_f64()
     );
 
-    let (_dir, db) = fresh();
+    let (_dir, db) = fresh().await;
     let t = Instant::now();
     for n in 0..BLOCKS {
-        save_block_bundle(&db, &bundle(n)).unwrap();
+        save_block_bundle(&db, &bundle(n)).await.unwrap();
     }
     let per_block = t.elapsed();
     println!(
@@ -100,13 +102,13 @@ fn write_scale() {
     );
 
     for batch in [8_u64, 64, 256] {
-        let (_dir, db) = fresh();
+        let (_dir, db) = fresh().await;
         let t = Instant::now();
         let mut n = 0;
         while n < BLOCKS {
             let last = (n + batch - 1).min(BLOCKS - 1);
             let rows: Vec<_> = (n..=last).map(bundle).collect();
-            save_block_bundles(&db, &rows).unwrap();
+            save_block_bundles(&db, &rows).await.unwrap();
             n = last + 1;
         }
         let elapsed = t.elapsed();

@@ -18,7 +18,6 @@ pub struct Settings {
     pub chain_id: u64,
     pub host: String,
     pub port: u16,
-    pub db_path: String,
     pub recent_block_count: usize,
     pub recent_tx_count: usize,
     /// Seconds between poll cycles when the WebSocket feed is unavailable.
@@ -96,7 +95,6 @@ impl Settings {
                 tracing::warn!("PORT {port} is not a port number; listening on {DEFAULT_PORT}");
                 DEFAULT_PORT
             }),
-            db_path: env_or("DB_PATH", "explorer.db"),
             recent_block_count: env_usize("RECENT_BLOCK_COUNT", 15),
             recent_tx_count: env_usize("RECENT_TX_COUNT", 15),
             poll_seconds: env_f64("INDEX_POLL_SECONDS", 1.0).clamp(0.05, 3600.0),
