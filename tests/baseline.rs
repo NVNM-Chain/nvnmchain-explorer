@@ -21,7 +21,7 @@
 //!     cargo test --test baseline build_baseline -- --ignored --nocapture
 //! ```
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::ops::RangeInclusive;
 use std::time::Duration;
 
@@ -32,11 +32,9 @@ use nvnmchain_explorer::indexer::fetch_block_bundle;
 use nvnmchain_explorer::models::BlockBundle;
 use nvnmchain_explorer::rpc::ChainRpc;
 use nvnmchain_explorer::tokens::balances_at_genesis;
+use rusqlite::types::Value as Sql;
 use rusqlite::{Connection, OpenFlags};
-
-#[allow(dead_code)]
-mod common;
-use common::baseline::{columns, diff_rows, rows, tables, SPECS};
+use serde_json::{json, Value};
 
 /// The ranges `build_baseline` indexes by default, chosen so that one small
 /// database exercises every write path: canary's first Transfer (102504); all
@@ -53,6 +51,61 @@ const RICH_RANGES: [RangeInclusive<u64>; 4] = [
 /// Blocks fetched at once, and blocks per commit.
 const CONCURRENCY: usize = 16;
 const COMMIT: usize = 64;
+
+/// How each table is compared: the natural key rows are matched on, and the
+/// columns that legitimately differ between two runs over the same blocks.
+struct Spec {
+    table: &'static str,
+    key: &'static [&'static str],
+    skip: &'static [&'static str],
+}
+
+const SPECS: &[Spec] = &[
+    // `created_at` is the wall clock at write time.
+    Spec {
+        table: "blocks",
+        key: &["number"],
+        skip: &["created_at"],
+    },
+    // `trace_data` is only written when a page asks for it.
+    Spec {
+        table: "transactions",
+        key: &["hash"],
+        skip: &["created_at", "trace_data"],
+    },
+    // `id` follows insert order, which batching and concurrency choose.
+    Spec {
+        table: "transfer_events",
+        key: &["block_number", "log_index"],
+        skip: &["id", "created_at"],
+    },
+    Spec {
+        table: "anchoring_events",
+        key: &["block_number", "log_index"],
+        skip: &[],
+    },
+    // `total_supply` is read at the chain's latest state, not at the block.
+    Spec {
+        table: "token_metadata",
+        key: &["address"],
+        skip: &["total_supply", "created_at", "updated_at"],
+    },
+    Spec {
+        table: "token_balances",
+        key: &["token_addr", "holder_addr"],
+        skip: &["updated_at"],
+    },
+    Spec {
+        table: "genesis_balances",
+        key: &["token_addr", "holder_addr"],
+        skip: &[],
+    },
+    Spec {
+        table: "counters",
+        key: &["name"],
+        skip: &[],
+    },
+];
 
 /// Written by the live loops and page views rather than by indexing a block:
 /// watermarks, the stats blob and the selector cache.
@@ -170,6 +223,64 @@ async fn add_genesis_balances(rpc: &ChainRpc, db: &Db) {
     }
 }
 
+fn columns(conn: &Connection, table: &str) -> Vec<String> {
+    let mut stmt = conn
+        .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+        .unwrap();
+    let names = stmt.query_map([], |r| r.get(0)).unwrap();
+    names.map(Result::unwrap).collect()
+}
+
+fn tables(conn: &Connection) -> Vec<String> {
+    let mut stmt = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+        .unwrap();
+    let names = stmt.query_map([], |r| r.get(0)).unwrap();
+    names.map(Result::unwrap).collect()
+}
+
+fn to_json(column: &str, value: Sql) -> Value {
+    match value {
+        Sql::Null => Value::Null,
+        Sql::Integer(i) => json!(i),
+        Sql::Real(f) => json!(f),
+        // Compared as data rather than text, so key order cannot differ.
+        Sql::Text(s) if column == "receipt_data" => serde_json::from_str(&s).unwrap_or(json!(s)),
+        Sql::Text(s) => json!(s),
+        Sql::Blob(b) => json!(format!("0x{}", hex::encode(b))),
+    }
+}
+
+/// A table's rows by key, each row its compared columns.
+type Rows = BTreeMap<String, BTreeMap<String, Value>>;
+
+fn rows(conn: &Connection, spec: &Spec, cols: &[String]) -> Rows {
+    let list = cols
+        .iter()
+        .map(|c| format!("\"{c}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut stmt = conn
+        .prepare(&format!("SELECT {list} FROM {}", spec.table))
+        .unwrap();
+    let mut out = Rows::new();
+    let mut found = stmt.query([]).unwrap();
+    while let Some(row) = found.next().unwrap() {
+        let mut fields = BTreeMap::new();
+        for (i, col) in cols.iter().enumerate() {
+            fields.insert(col.clone(), to_json(col, row.get(i).unwrap()));
+        }
+        let key = spec
+            .key
+            .iter()
+            .map(|k| fields[*k].to_string())
+            .collect::<Vec<_>>()
+            .join("/");
+        out.insert(key, fields);
+    }
+    out
+}
+
 /// Every difference between the baseline and the re-indexed database, and
 /// the rows compared per table.
 fn compare(baseline: &Connection, fresh: &Connection) -> (Vec<String>, Vec<(String, usize)>) {
@@ -218,7 +329,24 @@ fn compare(baseline: &Connection, fresh: &Connection) -> (Vec<String>, Vec<(Stri
         }
         let (base, new) = (rows(baseline, spec, &cols), rows(fresh, spec, &cols));
         compared.push((spec.table.to_string(), base.len()));
-        diffs.extend(diff_rows(spec.table, &base, &new, ("baseline", "re-index")));
+        for (key, row) in &base {
+            match new.get(key) {
+                None => diffs.push(format!("{} {key}: only in the baseline", spec.table)),
+                Some(other) => {
+                    for (col, value) in row {
+                        if other[col] != *value {
+                            diffs.push(format!(
+                                "{} {key}: {col} was {value}, now {}",
+                                spec.table, other[col]
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        for key in new.keys().filter(|k| !base.contains_key(*k)) {
+            diffs.push(format!("{} {key}: only in the re-index", spec.table));
+        }
     }
     (diffs, compared)
 }

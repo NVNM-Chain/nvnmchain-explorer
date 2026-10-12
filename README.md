@@ -78,10 +78,10 @@ Starter, deploy.
   database; the container entrypoint (`deploy/entrypoint.sh`) fixes volume
   ownership on boot so the app user can write to it regardless of how the
   provider mounts empty volumes.
-- **Migrations run automatically** — on every boot `init_db` applies
-  idempotent DDL (`CREATE … IF NOT EXISTS`, `DROP … IF EXISTS`); a changed
-  column or key on an existing table makes the explorer refuse to start and
-  name the table (see `docs/database.md`); legacy databases also get a one-time rebuild of
+- **Migrations run automatically** — on every boot `init_db` applies pending
+  schema migrations tracked by SQLite's `PRAGMA user_version`. Deploying a new
+  binary over an old database upgrades it in place (additive `ALTER TABLE`
+  steps, logged at startup); legacy databases also get a one-time rebuild of
   the incremental token-balance table, and their anchoring events read back
   from the node's logs.
 - **Volume sizing** — a full backfill of this chain is ~1.2 GB of raw block

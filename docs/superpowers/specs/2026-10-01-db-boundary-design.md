@@ -100,13 +100,13 @@ Its imports copy what the moved bodies used in `indexer.rs`:
 `use crate::db::{self, Db}`, `rusqlite::params`, `tracing::warn`,
 `anyhow::Result` and `serde_json::Value`.
 
-| Today in `indexer.rs`                                                                                                                             | After                                                                                                                     |
-|---------------------------------------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------|
-| `fn compute_and_store_stats(db: &Db) -> Result<Value>`: holds `db::lock`, runs 6 raw `query_row` calls, plus `db::counter` and `db::set_kv`       | Moves byte-for-byte into `indexer_jobs.rs`; `fn` becomes `pub fn`. `stats_loop` calls `db::compute_and_store_stats(&db)`. |
-| `fn repair_derived_tables(db: &Db)`: three `db::lock` scopes calling `table_has_rows`, `rebuild_token_balances` and `sync_holder_counts`          | Moves byte-for-byte; `fn` becomes `pub fn`. The startup `tokio::spawn` calls `db::repair_derived_tables(&rebuild_db)`.    |
-| `backfill_anchoring`'s per-window block: `conn.transaction()`, `anchoring_event_from_log(&txn, ..)`, `db::insert_anchoring`, `db::set_kv`, commit | Replaced by one call to `db::save_anchoring_window` (below).                                                              |
-| `fn anchoring_event_from_log(conn: &Connection, log)`                                                                                             | Changes only its parameter type and one line (below).                                                                     |
-| `use rusqlite::{params, Connection};`                                                                                                             | Deleted. `params!` was used only in `compute_and_store_stats`.                                                            |
+| Today in `indexer.rs` | After |
+|---|---|
+| `fn compute_and_store_stats(db: &Db) -> Result<Value>`: holds `db::lock`, runs 6 raw `query_row` calls, plus `db::counter` and `db::set_kv` | Moves byte-for-byte into `indexer_jobs.rs`; `fn` becomes `pub fn`. `stats_loop` calls `db::compute_and_store_stats(&db)`. |
+| `fn repair_derived_tables(db: &Db)`: three `db::lock` scopes calling `table_has_rows`, `rebuild_token_balances` and `sync_holder_counts` | Moves byte-for-byte; `fn` becomes `pub fn`. The startup `tokio::spawn` calls `db::repair_derived_tables(&rebuild_db)`. |
+| `backfill_anchoring`'s per-window block: `conn.transaction()`, `anchoring_event_from_log(&txn, ..)`, `db::insert_anchoring`, `db::set_kv`, commit | Replaced by one call to `db::save_anchoring_window` (below). |
+| `fn anchoring_event_from_log(conn: &Connection, log)` | Changes only its parameter type and one line (below). |
+| `use rusqlite::{params, Connection};` | Deleted. `params!` was used only in `compute_and_store_stats`. |
 
 **The anchoring window.** Decoding stays in the indexer, so `db` doesn't start
 depending on the anchoring decoder. The database hands the decoder a timestamp
@@ -216,47 +216,12 @@ runs:
 Upstream will keep writing tests and indexer code against the old alias, so
 expect a few compile errors after a merge rather than textual conflicts:
 
-0. Sync through a pull request (added in phase 2):
-   1. `git fetch upstream`.
-   2. Merge `upstream/main` into a `sync/<date>` branch.
-   3. Open a PR to `main`, and run steps 1-5 on that branch.
-   4. Merge only when CI is green, including the fixture shape test and the
-      `Postgres` workflow.
-
-   Do not use GitHub's "Sync fork" button, which every earlier sync used
-   (`4123460`, `84392e0`, `c3d4a1e`, `7ce6608`). It pushes straight to
-   `main`, where `docker.yml` publishes `:latest` whether or not CI passes.
 1. `rg -n 'Arc::new\(Mutex::new\(|db\.lock\(\)' src tests`: replace each hit
    with `db::open(..)` or `db::lock(&db)`.
 2. If upstream edited `compute_and_store_stats` or `repair_derived_tables` in
    `indexer.rs`, port the hunk with `git diff A B -- src/indexer.rs`, rewrite
    the path to `src/db/indexer_jobs.rs`, then `git apply -3`.
 3. `cargo test --lib`: the seal test names any new leak.
-4. If `cargo test --test postgres -- --include-ignored` fails on parity, port
-   the `init_db` change to `src/db/schema_pg.sql`, using the type rules at the
-   top of that file.
-5. If `every_baseline_fixture_opens` fails, the merge changed the columns or
-   keys of an existing table, and every deployed database will refuse to
-   start. Before merging the sync PR:
-   1. Pick that table's recovery from the map in `src/db/schema_check.rs`
-      (copied in `docs/database.md`). Add an entry if the table has none.
-   2. Regenerate each affected fixture over its own block range.
-      `build_baseline` never overwrites a file and defaults to `RICH_RANGES`,
-      so delete the old file first:
-
-      ```text
-      rm fixtures/baseline/canary-rich.db
-      BASELINE_BUILD=fixtures/baseline/canary-rich.db \
-          cargo test --test baseline build_baseline -- --ignored --nocapture
-      rm fixtures/baseline/canary-blocks.db
-      BASELINE_BUILD=fixtures/baseline/canary-blocks.db BASELINE_RANGES=1579026-1583674 \
-          cargo test --test baseline build_baseline -- --ignored --nocapture
-      ```
-
-   3. Update `canary-blocks.db`'s line in `tests/baseline.rs`'s doc comment:
-      it is now rebuilt by `build_baseline` at `<commit>`, no longer the
-      deployed copy, unless a fresh copy of the deployed database, taken
-      after the recovery, replaces it.
 
 ## Known phase 2 constraints (recorded, not solved here)
 
