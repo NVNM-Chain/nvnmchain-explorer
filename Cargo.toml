@@ -38,7 +38,6 @@ alloy-sol-types = "1"
 alloy-consensus = "2"
 
 [dev-dependencies]
-sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres"] }
 tempfile = "3"
 
 [profile.release]

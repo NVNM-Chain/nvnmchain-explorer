@@ -48,6 +48,6 @@ jobs:
         run: cargo test --lib --test decoder --test anchoring --test pages
 
       - name: Run live RPC integration tests
-        run: cargo test --test live_rpc --test baseline
+        run: cargo test --test live_rpc
         env:
           TEMPO_RPC: https://rpc.nvnm.canary.mantrachain.dev

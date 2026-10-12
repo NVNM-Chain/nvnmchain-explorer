@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -27,7 +27,8 @@ async fn main() -> anyhow::Result<()> {
         cfg.rpc_url, cfg.db_path
     );
 
-    let db: Db = db::open(&cfg.db_path).context("initialize database")?;
+    let conn = db::init_db(&cfg.db_path).context("initialize database")?;
+    let db: Db = Arc::new(Mutex::new(conn));
     let rpc = ChainRpc::from_settings(&cfg)?;
     let tera = web::build_tera(db.clone())?;
 

@@ -9,11 +9,13 @@ use nvnmchain_explorer::tokens::{
     decode_string_result, format_token_amount, has_control_chars, sanitize_metadata_text, TokenMeta,
 };
 use serde_json::{json, Value};
+use std::sync::{Arc, Mutex};
 
 fn temp_db(name: &str) -> (tempfile::TempDir, Db) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join(name);
-    (dir, db::open(path.to_str().unwrap()).expect("init_db"))
+    let conn = db::init_db(path.to_str().unwrap()).expect("init_db");
+    (dir, Arc::new(Mutex::new(conn)))
 }
 
 /// A block carrying one transaction, in the shape the RPC returns it.
@@ -667,7 +669,8 @@ fn a_rewrite_without_the_blobs_keeps_them() {
 fn counters_are_seeded_from_the_tables_of_an_older_database() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("counters.db");
-    let db: Db = db::open(path.to_str().unwrap()).expect("init_db");
+    let conn = db::init_db(path.to_str().unwrap()).expect("init_db");
+    let db: Db = Arc::new(Mutex::new(conn));
     let raw_block = sample_raw_block();
     let block = parse_block(&raw_block);
     let tx = parse_transaction(&raw_block["transactions"][0], &block);
@@ -944,10 +947,12 @@ fn blob_storage_queries_match_text_params() {
     // counts stuck at 0. All read/update paths must bind `hex_blob`.
     use nvnmchain_explorer::db::{self, Db};
     use nvnmchain_explorer::tokens::TokenMeta;
+    use std::sync::{Arc, Mutex};
 
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("blob-queries.db");
-    let db: Db = db::open(path.to_str().unwrap()).expect("init_db");
+    let conn = db::init_db(path.to_str().unwrap()).expect("init_db");
+    let db: Db = Arc::new(Mutex::new(conn));
 
     let raw_block = json!({
         "number": "0x10",
@@ -1055,12 +1060,15 @@ fn blob_storage_queries_match_text_params() {
 #[test]
 fn huge_page_numbers_do_not_panic() {
     use nvnmchain_explorer::db::{self, Db};
+    use std::sync::{Arc, Mutex};
 
     // `page` is user input; u32 offset math overflowed (a panic under
     // debug assertions, a garbage offset in release).
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("pages.db");
-    let db: Db = db::open(path.to_str().unwrap()).expect("init_db");
+    let db: Db = Arc::new(Mutex::new(
+        db::init_db(path.to_str().unwrap()).expect("init_db"),
+    ));
 
     assert!(db::get_address_transactions(
         &db,

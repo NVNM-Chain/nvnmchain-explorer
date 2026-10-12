@@ -4,6 +4,7 @@
 //! `https://rpc.nvnm.canary.mantrachain.dev`): chain metadata, block and tx
 //! fetching, indexing into SQLite, and the HTTP API end to end.
 
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
@@ -19,7 +20,8 @@ use tokio::sync::mpsc;
 fn temp_db() -> (tempfile::TempDir, Db) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("explorer.db");
-    (dir, db::open(path.to_str().unwrap()).expect("init db"))
+    let conn = db::init_db(path.to_str().unwrap()).expect("init db");
+    (dir, Arc::new(Mutex::new(conn)))
 }
 
 fn rpc() -> ChainRpc {

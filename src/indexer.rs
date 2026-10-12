@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use rusqlite::{params, Connection};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, watch};
@@ -573,11 +574,17 @@ pub async fn backfill_anchoring(rpc: &ChainRpc, db: &Db) -> Result<()> {
         backoff = Duration::from_secs(1);
         // One transaction per window, watermark included, holding the shared
         // connection only to write.
-        wrote += db::save_anchoring_window(db, BACKFILL_KEY, &to.to_string(), |stamp| {
-            logs.iter()
-                .filter_map(|log| anchoring_event_from_log(stamp, log))
-                .collect()
-        })?;
+        {
+            let mut conn = db::lock(db);
+            let txn = conn.transaction()?;
+            for log in &logs {
+                if let Some(event) = anchoring_event_from_log(&txn, log) {
+                    wrote += usize::from(db::insert_anchoring(&txn, &event)?);
+                }
+            }
+            db::set_kv(&txn, BACKFILL_KEY, &to.to_string())?;
+            txn.commit()?;
+        }
         from = to + 1;
         // Leave the node to the indexer between windows.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -588,12 +595,9 @@ pub async fn backfill_anchoring(rpc: &ChainRpc, db: &Db) -> Result<()> {
 
 /// One row from a raw log, stamped from the block the indexer already holds. A
 /// block not indexed yet brings its own rows when it is.
-fn anchoring_event_from_log(
-    stamp: &dyn Fn(i64) -> Option<i64>,
-    log: &Value,
-) -> Option<AnchoringEvent> {
+fn anchoring_event_from_log(conn: &Connection, log: &Value) -> Option<AnchoringEvent> {
     let block_number = crate::rpc::parse_int_any(log.get("blockNumber")?);
-    let timestamp = stamp(block_number)?;
+    let timestamp = db::get_block_timestamp(conn, block_number)?;
     let decoded = decode_event(log)?;
     anchoring_event(
         &decoded,
@@ -650,6 +654,38 @@ async fn repair_token_metadata(rpc: &ChainRpc, db: &Db) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Bring a database written by an older build back in line with what the read
+/// paths assume. Every step is idempotent, so this runs on every start.
+///
+/// Each recompute is guarded rather than run unconditionally, and the lock is
+/// taken per step: a rebuild reads whole tables, and holding the connection for
+/// that long is long enough for page views to notice.
+fn repair_derived_tables(db: &Db) {
+    let (has_transfers, has_balances) = {
+        let conn = db::lock(db);
+        (
+            db::table_has_rows(&conn, "transfer_events"),
+            db::table_has_rows(&conn, "token_balances"),
+        )
+    };
+    if has_transfers && !has_balances {
+        // Transfers on record but no incremental balances: a database from
+        // before they were maintained per block. Rebuild once, and holder
+        // counts and holdings are correct from here on.
+        let conn = db::lock(db);
+        if let Err(e) = db::rebuild_token_balances(&conn) {
+            warn!("token balance rebuild failed: {e:#}");
+        }
+    } else if has_balances {
+        // Holder counts written before the BLOB-key fix are stale; recounting
+        // them walks the balances' primary key and nothing else.
+        let conn = db::lock(db);
+        if let Err(e) = db::sync_holder_counts(&conn) {
+            warn!("holder count sync failed: {e:#}");
+        }
+    }
 }
 
 /// Sleep for `dur` unless shutdown was requested, in which case return
@@ -982,7 +1018,7 @@ pub async fn run_forever(
         }
     });
     let rebuild_db = db.clone();
-    tokio::spawn(async move { db::repair_derived_tables(&rebuild_db) });
+    tokio::spawn(async move { repair_derived_tables(&rebuild_db) });
     // Anchoring rows for blocks indexed before the table existed.
     let anchoring_rpc = rpc.clone();
     let anchoring_db = db.clone();
@@ -1102,7 +1138,7 @@ async fn stats_loop(
         if *shutdown.borrow() {
             break;
         }
-        match db::compute_and_store_stats(&db) {
+        match compute_and_store_stats(&db) {
             Ok(stats) => {
                 *cell.write().unwrap_or_else(|e| e.into_inner()) = stats.clone();
                 // Live viewers get the refresh too, tagged the way block
@@ -1116,6 +1152,105 @@ async fn stats_loop(
             break;
         }
     }
+}
+
+fn compute_and_store_stats(db: &Db) -> Result<Value> {
+    let conn = db::lock(db);
+    let now = db::now_ts();
+
+    // The counters the writer keeps, and a sum over the blocks of the last day:
+    // nothing here walks the transactions table.
+    let total_blocks = db::counter(&conn, "blocks");
+    let total_txns = db::counter(&conn, "transactions");
+    let token_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM token_metadata", [], |r| r.get(0))?;
+    let txns_24h: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(tx_count), 0) FROM blocks WHERE timestamp >= ?1",
+        params![now - 86400],
+        |r| r.get(0),
+    )?;
+    let blocks_24h: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM blocks WHERE timestamp >= ?1",
+        params![now - 86400],
+        |r| r.get(0),
+    )?;
+
+    // Rolling window over the newest blocks (cheap PK scan, no history sweep).
+    // Timestamps are ms-precision (`timestamp_ms`); the chain produces blocks
+    // faster than once per second, so second-granularity timestamps would
+    // quantize the block time to 1s.
+    let window: i64 = 100;
+    let (min_ms, max_ms, tx_sum, gas_sum, gas_den, n): (i64, i64, i64, f64, f64, i64) = conn
+        .query_row(
+            "SELECT MIN(timestamp_ms), MAX(timestamp_ms), SUM(tx_count),
+                    SUM(CASE WHEN gas_limit > 0 THEN gas_used * 1.0 / gas_limit ELSE 0 END),
+                    SUM(CASE WHEN gas_limit > 0 THEN 1 ELSE 0 END),
+                    COUNT(*)
+             FROM (SELECT timestamp_ms, tx_count, gas_used, gas_limit
+                   FROM blocks ORDER BY number DESC LIMIT ?1)",
+            params![window],
+            |r| {
+                Ok((
+                    r.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                    r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                    r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                    r.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
+                    r.get::<_, Option<f64>>(4)?.unwrap_or(0.0),
+                    r.get::<_, Option<i64>>(5)?.unwrap_or(0),
+                ))
+            },
+        )
+        .unwrap_or((0, 0, 0, 0.0, 0.0, 0));
+
+    let span_ms = (max_ms - min_ms).max(1) as f64;
+    let avg_block_time_ms = if n > 1 { span_ms / (n - 1) as f64 } else { 0.0 };
+    let tps = if span_ms > 0.0 {
+        tx_sum as f64 / span_ms * 1000.0
+    } else {
+        0.0
+    };
+    let gas_util_pct = if gas_den > 0.0 {
+        gas_sum / gas_den * 100.0
+    } else {
+        0.0
+    };
+    let latest_block = conn.query_row("SELECT MAX(number) FROM blocks", [], |r| {
+        r.get::<_, Option<i64>>(0)
+    })?;
+
+    // Index progress, so the home page and the stream never recount blocks.
+    // Read through `conn`: a helper taking `&Db` would deadlock on the
+    // connection lock this function already holds.
+    let chain_head: i64 = conn
+        .query_row("SELECT value FROM kv WHERE key='chain_head'", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let index_pct = if chain_head > 0 {
+        (total_blocks as f64 / chain_head as f64 * 100.0).clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
+
+    let stats = serde_json::json!({
+        "latest_block": latest_block,
+        "total_blocks": total_blocks,
+        "total_txns": total_txns,
+        "token_count": token_count,
+        "txns_24h": txns_24h,
+        "blocks_24h": blocks_24h,
+        "avg_block_time_ms": avg_block_time_ms,
+        "tps": tps,
+        "gas_util_pct": gas_util_pct,
+        "chain_head": chain_head,
+        "index_pct": index_pct,
+        "updated_at": now,
+    });
+    // Still written to kv: it seeds the in-memory copy across a restart.
+    db::set_kv(&conn, "stats", &stats.to_string())?;
+    Ok(stats)
 }
 
 #[cfg(test)]

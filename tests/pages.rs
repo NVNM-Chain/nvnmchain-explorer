@@ -6,7 +6,7 @@
 //! points at a closed port, and the signature directory is stubbed.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use nvnmchain_explorer::config::Settings;
 use nvnmchain_explorer::db::{self, Db, TxColumns};
@@ -27,7 +27,8 @@ const UNKNOWN_LOG_TX_HASH: &str =
 fn temp_db(name: &str) -> (tempfile::TempDir, Db) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join(name);
-    (dir, db::open(path.to_str().unwrap()).expect("init_db"))
+    let conn = db::init_db(path.to_str().unwrap()).expect("init_db");
+    (dir, Arc::new(Mutex::new(conn)))
 }
 
 fn topic(address: &str) -> String {
@@ -761,7 +762,7 @@ fn a_genesis_balance_counts_once() {
     // 100 at genesis, less the 30 sent.
     assert_eq!(held(&db).as_deref(), Some("70000000"));
     assert_eq!(db::get_token_holder_count(&db, &token), TRANSFER_COUNT + 1);
-    db::rebuild_token_balances(&db::lock(&db)).expect("rebuild");
+    db::rebuild_token_balances(&db.lock().unwrap()).expect("rebuild");
     assert_eq!(held(&db).as_deref(), Some("70000000"));
     assert_eq!(db::get_token_holder_count(&db, &token), TRANSFER_COUNT + 1);
 }
