@@ -1,7 +1,7 @@
 //! The anchoring pages, over a stub node that answers like the contract: 30 registries,
 //! registry 1 with 27 records and its record 1 with 30 versions, so every listing pages.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use alloy_primitives::{B256, U256};
 use alloy_sol_types::SolCall;
@@ -221,7 +221,8 @@ async fn node(registries: u64, indexing: bool) -> String {
 /// The explorer, reading `rpc_url`.
 async fn serve(rpc_url: String) -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().unwrap();
-    let db = db::open(dir.path().join("anchoring.db").to_str().unwrap()).unwrap();
+    let conn = db::init_db(dir.path().join("anchoring.db").to_str().unwrap()).unwrap();
+    let db = Arc::new(Mutex::new(conn));
     let mut cfg = Settings::from_env();
     cfg.signature_lookup_url = None;
     cfg.rpc_url = rpc_url;
@@ -552,7 +553,8 @@ async fn capped_log_node(calls: Arc<std::sync::atomic::AtomicUsize>) -> String {
 #[tokio::test]
 async fn backfill_narrows_to_the_node_cap_and_resumes_past_errors() {
     let dir = tempfile::tempdir().unwrap();
-    let db = db::open(dir.path().join("backfill.db").to_str().unwrap()).unwrap();
+    let conn = db::init_db(dir.path().join("backfill.db").to_str().unwrap()).unwrap();
+    let db = Arc::new(Mutex::new(conn));
     let block = nvnmchain_explorer::parse::parse_block(&json!({
         "number": "0x5dc",
         "hash": format!("0x{}", "cd".repeat(32)),
