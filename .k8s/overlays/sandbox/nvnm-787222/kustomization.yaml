@@ -1,7 +1,7 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: nvnm-tempo-devnet-1-applications
-# chainNetwork on every rendered object's metadata. includeSelectors is false
+# chainNetwork + chain_id on every rendered object's metadata. includeSelectors is false
 # because spec.selector on an existing Deployment/StatefulSet is immutable.
 # includeTemplates is NOT used: it also writes
 # spec.volumeClaimTemplates[].metadata.labels, which is immutable on an existing
@@ -9,6 +9,7 @@ namespace: nvnm-tempo-devnet-1-applications
 labels:
   - pairs:
       chainNetwork: nvnm-tempo-devnet-1
+      chain_id: nvnm-tempo-devnet-1
     includeSelectors: false
 patches:
   - target:
@@ -16,6 +17,9 @@ patches:
     patch: |-
       - op: add
         path: /spec/template/metadata/labels/chainNetwork
+        value: nvnm-tempo-devnet-1
+      - op: add
+        path: /spec/template/metadata/labels/chain_id
         value: nvnm-tempo-devnet-1
 resources:
   - ../../../base/
