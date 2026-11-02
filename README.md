@@ -113,8 +113,9 @@ The indexer is built for a sub-second chain:
   most networks), the indexer warns a few times, then retries silently on a
   long backoff while polling continues uninterrupted.
 - **One RPC call per block** — receipts via `eth_getBlockReceipts` (with a
-  per-transaction batch fallback), traces via `debug_traceBlockByNumber`, and
-  blocks fetched concurrently (`INDEX_CONCURRENCY` in flight).
+  per-transaction batch fallback), and blocks fetched concurrently
+  (`INDEX_CONCURRENCY` in flight). Call traces are not indexed: a transaction's
+  page asks the node for its trace once and keeps it in memory.
 - **Serialized SQLite writes** — every block (block row + txs + transfers +
   balances + token metadata) is persisted in one transaction by a single
   writer task, measured at ~200 blocks/s while backfilling.
@@ -125,8 +126,12 @@ The indexer is built for a sub-second chain:
 
 ## Configuration (env vars)
 
+For local development, copy `.env.example` to `.env`; it is loaded at startup
+and never overrides variables already set in the environment.
+
 | Var | Default | Meaning |
 |-----|---------|---------|
+| `ROLE` | `ALL` | `ALL`, `INDEXER` or `WEB`; informational for now (logged at startup, every role still runs indexer and server) |
 | `NVNM_RPC` | `https://rpc.nvnm.canary.mantrachain.dev` | JSON-RPC endpoint (legacy `TEMPO_RPC` also accepted) |
 | `WS_URL` | `wss://ws.nvnm.canary.mantrachain.dev` | WebSocket endpoint for `newHeads` |
 | `INDEX_WS` | `1` | Set `0` to disable the WebSocket feed (pure polling) |
@@ -136,7 +141,6 @@ The indexer is built for a sub-second chain:
 | `INDEX_POLL_SECONDS` | `1` | Poll interval when the WebSocket feed is unavailable |
 | `INDEX_BATCH` | `5` | Blocks indexed per cycle (forward + backfill) |
 | `INDEX_CONCURRENCY` | `32` | Blocks fetched in parallel |
-| `NATIVE_SYMBOL` | `OM` | Symbol shown for native (burnt/gas) amounts |
 | `STATS_INTERVAL_SECONDS` | `5` | How often the dashboard stats are recomputed |
 | `SIGNATURE_LOOKUP_URL` | OpenChain | Signature directory for selectors no built-in ABI declares; set empty to disable ([Decoding](#decoding)) |
 | `RUST_LOG` | `nvnmchain_explorer=info` | Log verbosity |
@@ -164,9 +168,34 @@ All data endpoints accept `?format=json` or `Accept: application/json`.
 
 The home page subscribes to `/api/events` with `EventSource` and updates the
 latest-blocks panel, the latest-block stat, and the block-time stat in real
-time as blocks land — no client polling. The feed is in-process: run a single
-instance (as the deploy configs do) so the indexer and the web server share
-the same broadcast channel.
+time as blocks land — no client polling. The feed is polled from the
+database, so the web server need not share a process with the indexer.
+
+### JSON API
+
+`/api/v1` serves the pages' data as plain JSON. A list is `{"items": […],
+"next_page": n}`, paged by `?page=n` until `n` is null; an error is
+`{"error": "…"}` with its status.
+
+| Path | Description |
+|------|-------------|
+| `/api/v1/blocks` | Blocks, newest first |
+| `/api/v1/blocks/{num\|hash}` | A block and its transactions |
+| `/api/v1/txs` | Transactions, newest first |
+| `/api/v1/txs/{hash}` | A transaction, its receipt and decoded events |
+| `/api/v1/addresses/{addr}` | An address's type, label and token metadata |
+| `/api/v1/addresses/{addr}/txs` | Transactions it sent or received |
+| `/api/v1/addresses/{addr}/transfers` | Token transfers it sent or received |
+| `/api/v1/addresses/{addr}/holdings` | Its token balances |
+| `/api/v1/tokens` | Tokens, most holders first |
+| `/api/v1/tokens/{addr}` | A token's metadata; 404 until the index has met it |
+| `/api/v1/tokens/{addr}/holders` | Its holders, largest balance first |
+| `/api/v1/tokens/{addr}/transfers` | Its transfers, newest first |
+| `/api/v1/anchoring/registries` | Anchoring registries, newest first |
+| `/api/v1/anchoring/registries/{id}` | A registry |
+| `/api/v1/anchoring/registries/{id}/records` | The latest version of each of its records |
+| `/api/v1/anchoring/registries/{id}/records/{record}` | A record's latest version |
+| `/api/v1/anchoring/registries/{id}/records/{record}/versions` | Its versions, newest first |
 
 ### Decoding
 
@@ -178,11 +207,11 @@ rather than silently failing to decode. The few declarations with no binding
 are Solidity signatures at the top of `src/decoder.rs`: a typo there does not
 parse, and tests pin the selectors they hash to.
 
-Multicall3, Permit2, CreateX and the anchoring contract at `0x…0a00` are not
-Tempo's, so no binding carries them. The first three are vendored JSON under
-`abi/`. Anchoring comes from the nvnmchain-contracts submodule at `contracts/`,
-which generates `layout/anchoring.abi.json` beside the bytecode Tempo's genesis
-uses, so the explorer cannot decode against an ABI the contract no longer has.
+Contracts that are not Tempo's have no binding. Their ABIs are vendored JSON
+under `abi/`, listed in `VENDORED` in `src/decoder.rs`. Anchoring's comes from
+the nvnmchain-contracts submodule at `contracts/`, which generates
+`layout/anchoring.abi.json` beside the bytecode Tempo's genesis uses, so the
+explorer cannot decode against an ABI the contract no longer has.
 
 The anchoring pages read that contract over RPC, not the index: the corpus it
 was seeded with at genesis emitted no events. So does the search box, for a whole
@@ -226,7 +255,7 @@ holder counts and address holdings stay exact without rescanning history.
 
 ```bash
 # Unit and integration tests (no network)
-cargo test --lib --test decoder --test anchoring --test pages
+cargo test --lib --test decoder --test anchoring --test pages --test baseline
 
 # Integration tests against the live chain RPC
 cargo test --test live_rpc
@@ -237,6 +266,13 @@ real templates, so a context key a handler stops sending fails a test rather
 than a page view. Nothing in it reaches the network: the RPC points at a closed
 port and the signature directory is stubbed. `tests/anchoring.rs` does the same
 over a stub node that answers like the anchoring contract.
+
+`tests/baseline.rs` replays JSON-RPC answers recorded from canary
+(`fixtures/baseline/canary-rpc.json`) through the indexer and compares every
+table it writes, row by row, with the SQLite database the same answers produced
+when they were recorded (`fixtures/baseline/canary.db`). A change in what the
+explorer stores fails it. To record both again, delete them and run
+`cargo test --test baseline record_baseline -- --ignored --nocapture`.
 
 The live tests hit the RPC: they assert the chain id, fetch and index recent
 blocks into a temp SQLite DB, and boot the HTTP API to verify the JSON

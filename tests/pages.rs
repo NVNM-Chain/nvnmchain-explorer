@@ -1,4 +1,4 @@
-//! The pages, end to end.
+//! The pages and the JSON API, end to end.
 //!
 //! These render the real templates against a real database, so a context key a
 //! handler stops sending fails a test rather than a page view. Nothing reaches
@@ -75,7 +75,7 @@ fn transaction(hash: &str, status: i64, receipt: Value) -> Transaction {
         to_addr: Some(checksum_address(TOKEN)),
         status,
         gas_used: 21_000,
-        base_fee: "0x3b9aca00".into(),
+        base_fee: "0x4a817c800".into(),
         contract_address: None,
         fee_token: Some(checksum_address(TOKEN)),
         fee_amount: "2500".into(),
@@ -187,7 +187,16 @@ fn transfer_bundle() -> BlockBundle {
 }
 
 /// A server over the fixture, with `stats` as what the indexer would have left.
+/// The RPC is a closed local port, so a handler that falls back to it fails at
+/// once rather than reaching the live chain.
 async fn serve(stats: Value) -> (tempfile::TempDir, String) {
+    let (dir, base, _indexer) = serve_beside_indexer(stats, "http://127.0.0.1:1").await;
+    (dir, base)
+}
+
+/// The same over the node at `rpc_url`, with the connection an indexer writes
+/// through; the pages get a read-only one, so a page that writes fails.
+async fn serve_beside_indexer(stats: Value, rpc_url: &str) -> (tempfile::TempDir, String, Db) {
     use nvnmchain_explorer::web::{self, AppState};
 
     let (dir, db) = temp_db("pages.db");
@@ -202,14 +211,14 @@ async fn serve(stats: Value) -> (tempfile::TempDir, String) {
     .expect("unknown-log tx");
     db::save_token_metadata(
         &db,
-        &TokenMeta {
+        &[TokenMeta {
             address: checksum_address(TOKEN),
             name: "pathUSD".into(),
             symbol: "pathUSD".into(),
             decimals: 6,
             currency: "USD".into(),
             total_supply: "1000000000".into(),
-        },
+        }],
     )
     .expect("token");
     // More transfers than fit on a page, so the counts and the pager have
@@ -217,30 +226,36 @@ async fn serve(stats: Value) -> (tempfile::TempDir, String) {
     db::save_block_bundle(&db, &transfer_bundle()).expect("transfers");
 
     let mut cfg = Settings::from_env();
-    // Nothing here may reach the network. The signature directory is exercised
-    // against a stub of its own; the RPC points at a closed local port, so any
-    // handler that falls back to it fails at once instead of calling the live
-    // chain — which would make these tests both slow and non-deterministic.
     cfg.signature_lookup_url = None;
-    cfg.rpc_url = "http://127.0.0.1:1".into();
-    let tera = web::build_tera(db.clone()).expect("templates");
+    cfg.rpc_url = rpc_url.into();
+    let pages = rusqlite::Connection::open_with_flags(
+        dir.path().join("pages.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("read-only connection");
+    let pages: Db = Arc::new(Mutex::new(pages));
+    let (running, shutdown) = tokio::sync::watch::channel(false);
     let state = AppState {
-        db,
+        tera: web::build_tera(pages.clone()).expect("templates"),
+        db: pages,
         rpc: nvnmchain_explorer::rpc::ChainRpc::from_settings(&cfg).expect("rpc"),
         cfg,
-        tera,
         block_events: tokio::sync::broadcast::channel(16).0,
         stats: Arc::new(std::sync::RwLock::new(stats)),
-        shutdown: tokio::sync::watch::channel(false).1,
+        signatures: Default::default(),
+        shutdown,
     };
+    tokio::spawn(web::feed(state.clone()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
     let addr = listener.local_addr().expect("addr");
     tokio::spawn(async move {
+        // A dropped sender ends the live stream.
+        let _running = running;
         let _ = axum::serve(listener, web::app(state)).await;
     });
-    (dir, format!("http://{addr}"))
+    (dir, format!("http://{addr}"), db)
 }
 
 async fn get_json(base: &str, path: &str) -> Value {
@@ -271,6 +286,42 @@ async fn a_block_links_only_to_neighbours_that_are_indexed() {
         .expect("block html");
     assert!(html.contains("href=\"/block/101\""), "a link forward");
     assert!(html.contains("step-off"), "and a dead end back");
+}
+
+/// A wrong scale is worse than none: this fee at 18 decimals would read as zero.
+#[tokio::test]
+async fn a_fee_in_a_token_with_no_metadata_stays_raw() {
+    let (_dir, base, indexer) = serve_beside_indexer(Value::Null, "http://127.0.0.1:1").await;
+    let mut tx = transaction(&format!("0x{}", "99".repeat(32)), 1, successful_receipt());
+    tx.fee_token = Some(checksum_address(
+        "0x20c0000000000000000000000000000000000abc",
+    ));
+    tx.fee_amount = "6146".into();
+    db::save_transaction(&indexer, &tx).expect("tx");
+
+    let html = reqwest::get(format!("{base}/block/100"))
+        .await
+        .expect("GET /block/100")
+        .text()
+        .await
+        .expect("block html");
+    assert!(html.contains("6146"), "{html}");
+}
+
+/// Gas is priced in USD whichever token pays, so a block's fees are stated in USD.
+#[tokio::test]
+async fn a_block_states_its_fees_in_usd() {
+    let (_dir, base) = serve(Value::Null).await;
+    let html = reqwest::get(format!("{base}/block/100"))
+        .await
+        .expect("GET /block/100")
+        .text()
+        .await
+        .expect("block html");
+    // A base fee of 1 gwei, and 21,000 gas used at it.
+    assert!(html.contains("0.001 USD / 1M gas"), "{html}");
+    assert!(html.contains("0.000021 USD"), "{html}");
+    assert!(!html.contains("Gwei"), "{html}");
 }
 
 /// Newest first, and only the heights the index holds: the fixture has 100 and
@@ -409,6 +460,311 @@ async fn a_token_page_for_an_unknown_address_stores_nothing() {
     assert!(address["token_meta"].is_null());
 }
 
+/// A node that traces any transaction, and how many times it was asked to.
+async fn stub_tracing_node() -> (String, Arc<AtomicUsize>) {
+    use axum::{routing::post, Json, Router};
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let handler = {
+        let hits = hits.clone();
+        move |Json(call): Json<Value>| {
+            let traced = call["method"] == "debug_traceTransaction";
+            if traced {
+                hits.fetch_add(1, Ordering::SeqCst);
+            }
+            let inner = json!({"type": "CALL", "from": TOKEN, "to": RECIPIENT, "input": "0x"});
+            let trace = json!({"type": "CALL", "from": SENDER, "to": TOKEN, "input": "0x", "calls": [inner]});
+            let result = if traced { trace } else { Value::Null };
+            async move { Json(json!({"jsonrpc": "2.0", "id": call["id"], "result": result})) }
+        }
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, Router::new().route("/", post(handler))).await;
+    });
+    (format!("http://{addr}"), hits)
+}
+
+/// A transaction stored without a trace is traced once, not on every view.
+#[tokio::test]
+async fn a_missing_trace_is_fetched_once() {
+    let (node, hits) = stub_tracing_node().await;
+    let (_dir, base, indexer) = serve_beside_indexer(Value::Null, &node).await;
+    let hash = format!("0x{}", "d1".repeat(32));
+    let mut untraced = transaction(&hash, 1, successful_receipt());
+    untraced.trace_data = None;
+    db::save_transaction(&indexer, &untraced).expect("tx");
+
+    for _ in 0..2 {
+        let page = get_json(&base, &format!("/tx/{hash}?")).await;
+        assert_eq!(page["calls"].as_array().map(Vec::len), Some(2), "{page}");
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+/// A node that answers a token's views, which arrive as one batch.
+async fn stub_token_node() -> String {
+    use axum::{routing::post, Json, Router};
+
+    fn string(s: &str) -> String {
+        format!("0x{:064x}{:064x}{:0<64}", 32, s.len(), hex::encode(s))
+    }
+    fn answer(call: &Value) -> Value {
+        let result = match call["params"][0]["data"].as_str() {
+            Some("0x06fdde03") => string("Stub Dollar"),
+            Some("0x95d89b41") => string("stubUSD"),
+            _ => format!("0x{:064x}", 6),
+        };
+        json!({"jsonrpc": "2.0", "id": call["id"], "result": result})
+    }
+    let handler = |Json(batch): Json<Vec<Value>>| async move {
+        Json(batch.iter().map(answer).collect::<Vec<_>>())
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, Router::new().route("/", post(handler))).await;
+    });
+    format!("http://{addr}")
+}
+
+/// A token the index has not met is shown from the node's answer, not stored.
+#[tokio::test]
+async fn a_token_the_index_has_not_met_is_shown_and_not_stored() {
+    let node = stub_token_node().await;
+    let (_dir, base, _indexer) = serve_beside_indexer(Value::Null, &node).await;
+    let before = get_json(&base, "/tokens?").await["total"].clone();
+    let unmet = "0x20C0000000000000000000000000000000000abc";
+
+    let page = get_json(&base, &format!("/token/{unmet}?")).await;
+    assert_eq!(page["token"]["name"], json!("Stub Dollar"));
+    assert_eq!(page["token"]["symbol"], json!("stubUSD"));
+    assert_eq!(page["token"]["decimals"], json!(6));
+
+    assert_eq!(get_json(&base, "/tokens?").await["total"], before);
+}
+
+/// A node whose `eth_getCode` answers from `codes` and `eth_getStorageAt` from `slots`, by
+/// address, and `0x` for any other.
+async fn stub_code_node(
+    codes: Vec<(&'static str, String)>,
+    slots: Vec<(&'static str, String)>,
+) -> String {
+    use axum::{routing::post, Json, Router};
+
+    let handler = move |Json(call): Json<Value>| {
+        let answers = if call["method"] == "eth_getStorageAt" {
+            &slots
+        } else {
+            &codes
+        };
+        let code = answers
+            .iter()
+            .find(|(address, _)| call["params"][0] == *address)
+            .map_or("0x".to_string(), |(_, code)| code.clone());
+        async move { Json(json!({"jsonrpc": "2.0", "id": call["id"], "result": code})) }
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, Router::new().route("/", post(handler))).await;
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn an_unlisted_address_is_what_its_code_says() {
+    // Digits only: each address is its own checksum.
+    let contract = "0x7777777777777777777777777777777777777777";
+    let precompile = "0x8888888888888888888888888888888888888888";
+    let delegating = "0x9999999999999999999999999999999999999999";
+    let node = stub_code_node(
+        vec![
+            (contract, "0x6080604052".into()),
+            (precompile, "0xef".into()),
+            (delegating, format!("0xef0100{}", "ab".repeat(20))),
+        ],
+        vec![],
+    )
+    .await;
+    let (_dir, base, _indexer) = serve_beside_indexer(Value::Null, &node).await;
+
+    for (address, kind) in [
+        (contract, "contract"),
+        (precompile, "precompile"),
+        (delegating, "eoa"),
+        ("0x6666666666666666666666666666666666666666", "eoa"),
+    ] {
+        let page = get_json(&base, &format!("/address/{address}?")).await;
+        assert_eq!(page["type"], json!(kind), "{address}");
+        // The bytecode goes out on the Contract tab only.
+        assert_eq!(page["code"], Value::Null, "{address}");
+    }
+    let tab = get_json(&base, &format!("/address/{contract}?tab=contract")).await;
+    assert_eq!(tab["code"]["bytes"], json!(5));
+}
+
+/// A proxy's Contract tab names what it delegates to; other code names nothing.
+#[tokio::test]
+async fn a_proxy_names_its_implementation() {
+    let proxy = "0x0000000000000000000000000000000000000A00";
+    let implementation = "0xF873bbD8B4ed0580425592a37b218BC46A628C70";
+    let plain = "0x7777777777777777777777777777777777777777";
+    let node = stub_code_node(
+        vec![
+            (proxy, "0x363d3d373d3d363d7f360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc545af43d6000803e6038573d6000fd5b3d6000f3".into()),
+            (plain, "0x6080604052".into()),
+        ],
+        vec![(proxy, format!("0x{:0>64}", implementation[2..].to_lowercase()))],
+    )
+    .await;
+    let (_dir, base, _indexer) = serve_beside_indexer(Value::Null, &node).await;
+
+    let tab = get_json(&base, &format!("/address/{proxy}?tab=contract")).await;
+    assert_eq!(tab["code"]["proxy"], json!("ERC-1967"));
+    assert_eq!(tab["code"]["implementation"], json!(implementation));
+    let tab = get_json(&base, &format!("/address/{plain}?tab=contract")).await;
+    assert_eq!(tab["code"]["implementation"], Value::Null);
+
+    let html = reqwest::get(format!("{base}/address/{proxy}?tab=contract"))
+        .await
+        .expect("contract tab")
+        .text()
+        .await
+        .expect("body");
+    assert!(html.contains("ERC-1967 proxy: calls run the code at"));
+    assert!(
+        html.contains(">Anchoring Implementation<"),
+        "linked by name"
+    );
+}
+
+/// Every page names the commit the binary was built from, when the build said.
+#[tokio::test]
+async fn pages_name_the_build_commit() {
+    let (_dir, base) = serve(Value::Null).await;
+    let page = get_json(&base, "/blocks?").await;
+    assert_eq!(page["commit"], json!(option_env!("GIT_SHA")));
+    if let Some(sha) = option_env!("GIT_SHA") {
+        let html = reqwest::get(format!("{base}/blocks"))
+            .await
+            .expect("blocks")
+            .text()
+            .await
+            .expect("body");
+        assert!(
+            html.contains(&format!("/commit/{sha}\"")),
+            "the footer links the commit"
+        );
+        assert!(
+            html.contains(&format!(">{}<", &sha[..7])),
+            "and shows it short"
+        );
+    }
+}
+
+/// The activity charts draw the stats' series, and are left out until the
+/// stats have one.
+#[tokio::test]
+async fn the_activity_charts_draw_the_stats_series() {
+    let stats = json!({ "latest_block": 101, "total_txns": 3, "token_count": 1 });
+    let mut series = stats.clone();
+    series["tx_per_minute"] = json!([0, 2, 1]);
+    series["gas_per_minute"] = json!([0, 42000, 21000]);
+    let (_dir, base) = serve(series).await;
+    let page = reqwest::get(format!("{base}/")).await.expect("home");
+    let page = page.text().await.expect("html");
+    assert!(page.contains(r#"data-series="[0,2,1]""#), "{page}");
+    assert!(page.contains(r#"data-series="[0,42000,21000]""#));
+
+    for stats in [Value::Null, stats] {
+        let (_dir, base) = serve(stats).await;
+        let page = reqwest::get(format!("{base}/")).await.expect("home");
+        assert_eq!(page.status(), 200);
+        assert!(!page
+            .text()
+            .await
+            .expect("html")
+            .contains(r#"id="chart-tx""#));
+    }
+}
+
+/// What an indexer stores reaches a viewer and the home page through the
+/// database alone.
+#[tokio::test]
+async fn the_live_feed_follows_the_database() {
+    use futures_util::StreamExt;
+
+    let (_dir, base, indexer) = serve_beside_indexer(Value::Null, "http://127.0.0.1:1").await;
+    let feed = reqwest::get(format!("{base}/api/events"))
+        .await
+        .expect("GET /api/events");
+    let mut feed = feed.bytes_stream();
+
+    let mut next = block();
+    next.number = 102;
+    next.hash = format!("0x{}", "12".repeat(32));
+    next.tx_count = 0;
+    db::save_block(&indexer, &next).expect("block");
+    db::lock(&indexer)
+        .execute(
+            "INSERT INTO kv (key, value, updated_at) VALUES ('stats', '{\"total_blocks\":3}', 0)",
+            [],
+        )
+        .expect("stats");
+
+    let mut seen = String::new();
+    let carried = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !(seen.contains(r#""number":102"#) && seen.contains("event: stats")) {
+            let chunk = feed.next().await.expect("feed open").expect("chunk");
+            seen.push_str(&String::from_utf8_lossy(&chunk));
+        }
+    })
+    .await;
+    assert!(
+        carried.is_ok(),
+        "no new block and stats on the feed: {seen}"
+    );
+
+    let home = get_json(&base, "/?").await;
+    assert_eq!(home["stats"]["total_blocks"], json!(3));
+    assert_eq!(home["latest_num"], json!(102));
+}
+
+/// Index progress that stopped moving says so instead of showing a frozen percentage.
+#[tokio::test]
+async fn stale_index_progress_says_it_is_not_updating() {
+    let stats = |updated_at: i64| {
+        json!({
+            "latest_block": 100,
+            "chain_head": 100,
+            "total_blocks": 100,
+            "total_txns": 0,
+            "token_count": 0,
+            "updated_at": updated_at,
+        })
+    };
+    let (_dir, base) = serve(stats(db::now_ts() - 3600)).await;
+    assert_eq!(get_json(&base, "/?").await["index_stale"], json!(true));
+    let html = reqwest::get(format!("{base}/"))
+        .await
+        .expect("home")
+        .text()
+        .await
+        .expect("body");
+    assert!(html.contains("not updating"), "{html}");
+
+    let (_dir, base) = serve(stats(db::now_ts())).await;
+    assert_eq!(get_json(&base, "/?").await["index_stale"], json!(false));
+}
+
 /// Pressing Enter in the search box resolves to one destination, and the
 /// candidates are tried in the order a reader means them. A block hash and a
 /// transaction hash are the same shape, so only asking the index tells them
@@ -509,12 +865,29 @@ async fn the_fee_breakdown_splits_the_gas_cost() {
     let page = get_json(&base, &format!("/tx/{TX_HASH}?")).await;
     let fee = &page["fee_breakdown"];
 
-    // 21,000 gas at 20 gwei, of which 1 gwei per gas was burnt as base fee.
+    // 21,000 gas at 20 gwei, of which the block's base fee is 1 gwei.
+    assert_eq!(page["base_fee"], json!("1000000000"));
     assert_eq!(fee["total_wei"], json!("420000000000000"));
-    assert_eq!(fee["burnt_wei"], json!("21000000000000"));
-    assert_eq!(fee["tip_wei"], json!("399000000000000"));
+    assert_eq!(fee["base_wei"], json!("21000000000000"));
+    assert_eq!(fee["priority_wei"], json!("399000000000000"));
     // What was actually charged is a TIP-20 amount, not wei.
     assert_eq!(fee["charged"], json!("0.0025 pathUSD"));
+}
+
+#[tokio::test]
+async fn a_transaction_states_its_fees_in_usd() {
+    let (_dir, base) = serve(Value::Null).await;
+    let html = reqwest::get(format!("{base}/tx/{TX_HASH}"))
+        .await
+        .expect("GET tx")
+        .text()
+        .await
+        .expect("tx html");
+    // 21,000 gas at 20 gwei, of which 1 gwei per gas is the base fee.
+    assert!(html.contains("0.02 USD / 1M gas"), "{html}");
+    assert!(html.contains("0.001 USD / 1M gas"), "{html}");
+    assert!(html.contains("0.00042 USD"), "{html}");
+    assert!(html.contains("0.000021 USD"), "{html}");
 }
 
 /// Every template the transaction page can render must render.
@@ -792,6 +1165,54 @@ async fn addresses_are_copyable_and_labelled() {
     assert!(body.contains(">pathUSD<"), "the token is named");
 }
 
+/// A sentence's accounts and an address argument both link to the address.
+#[tokio::test]
+async fn the_addresses_in_sentences_and_arguments_are_links() {
+    let (_dir, base) = serve(Value::Null).await;
+    let body = reqwest::get(format!("{base}/tx/{TX_HASH}"))
+        .await
+        .expect("tx page")
+        .text()
+        .await
+        .expect("body");
+    let to = "0x2222222222222222222222222222222222222222";
+    let link = format!(r#"<a href="/address/{to}" class="text-blue-400 hover:text-blue-300">"#);
+    assert!(
+        body.contains(&format!("{link}0x2222…2222</a>")),
+        "the sentence links its recipient"
+    );
+    // `copy_address`'s own link, whose href Tera escapes.
+    assert!(
+        body.contains(&format!("hover:text-blue-300\">{to}</a>")),
+        "so does the argument"
+    );
+}
+
+/// A sentence is escaped before its accounts are linked, and an address it shows twice gets two
+/// links, not one inside the other.
+#[test]
+fn a_sentence_is_escaped_then_linked() {
+    let (_dir, db) = temp_db("link.db");
+    let mut tera = (*nvnmchain_explorer::web::build_tera(db).expect("tera")).clone();
+    let to = "0x2222222222222222222222222222222222222222";
+    let mut context = tera::Context::new();
+    context.insert("headline", "<b>Move</b> 0x2222…2222 to 0x2222…2222");
+    context.insert("accounts", &[to, to]);
+    let html = tera
+        .render_str(
+            "{{ headline | link_accounts(accounts=accounts) | safe }}",
+            &context,
+        )
+        .expect("render");
+    let link = format!(
+        r#"<a href="/address/{to}" class="text-blue-400 hover:text-blue-300">0x2222…2222</a>"#
+    );
+    assert_eq!(
+        html,
+        format!("&lt;b&gt;Move&lt;&#x2F;b&gt; {link} to {link}")
+    );
+}
+
 /// A precompile is named by the built-in table rather than by the database.
 #[tokio::test]
 async fn precompiles_are_labelled_without_a_database_row() {
@@ -952,17 +1373,17 @@ async fn an_unknown_selector_is_named_by_the_directory() {
     }))
     .await;
 
-    let (_dir, db) = temp_db("signatures.db");
+    let cache = signatures::Cache::default();
     let mut cfg = Settings::from_env();
     cfg.signature_lookup_url = Some(url);
     let client = reqwest::Client::new();
 
-    let names = signatures::resolve(&db, &cfg, &client, std::slice::from_ref(&selector)).await;
+    let names = signatures::resolve(&cache, &cfg, &client, std::slice::from_ref(&selector)).await;
     assert_eq!(names.get(&selector).map(String::as_str), Some(signature));
     assert_eq!(hits.load(Ordering::SeqCst), 1);
 
     // The answer is cached, so a second page view asks nobody.
-    let again = signatures::resolve(&db, &cfg, &client, std::slice::from_ref(&selector)).await;
+    let again = signatures::resolve(&cache, &cfg, &client, std::slice::from_ref(&selector)).await;
     assert_eq!(again, names);
     assert_eq!(hits.load(Ordering::SeqCst), 1);
 
@@ -994,18 +1415,18 @@ async fn a_wrong_or_missing_answer_is_remembered_as_a_miss() {
     }))
     .await;
 
-    let (_dir, db) = temp_db("bad-signatures.db");
+    let cache = signatures::Cache::default();
     let mut cfg = Settings::from_env();
     cfg.signature_lookup_url = Some(url);
     let client = reqwest::Client::new();
 
     assert!(
-        signatures::resolve(&db, &cfg, &client, std::slice::from_ref(&selector))
+        signatures::resolve(&cache, &cfg, &client, std::slice::from_ref(&selector))
             .await
             .is_empty(),
         "a signature that does not hash to the selector must be refused"
     );
-    signatures::resolve(&db, &cfg, &client, std::slice::from_ref(&selector)).await;
+    signatures::resolve(&cache, &cfg, &client, std::slice::from_ref(&selector)).await;
     assert_eq!(
         hits.load(Ordering::SeqCst),
         1,
@@ -1016,11 +1437,10 @@ async fn a_wrong_or_missing_answer_is_remembered_as_a_miss() {
 /// With no directory configured, nothing is asked and nothing breaks.
 #[tokio::test]
 async fn the_directory_can_be_turned_off() {
-    let (_dir, db) = temp_db("no-directory.db");
     let mut cfg = Settings::from_env();
     cfg.signature_lookup_url = None;
     let names = signatures::resolve(
-        &db,
+        &signatures::Cache::default(),
         &cfg,
         &reqwest::Client::new(),
         &["0xdeadbeef".to_string()],
@@ -1143,4 +1563,192 @@ async fn canonical_contracts_are_named_and_searchable() {
         .expect("writes")
         .iter()
         .any(|f| f["name"] == json!("aggregate3")));
+}
+
+#[tokio::test]
+async fn the_zone_contracts_are_named_with_their_interfaces() {
+    let (_dir, base) = serve(Value::Null).await;
+    let factory = "0x5AF2000000000000000000000000000000000000";
+    let portal = "0x5ad0000000000000000000000000000000000003";
+
+    let (dir, db) = temp_db("zones.db");
+    let label = |address| nvnmchain_explorer::web::address_label(&db, address);
+    for (address, name) in [
+        (factory, "Zone Factory"),
+        (
+            "0x5AD1000000000000000000000000000000000000",
+            "Zone Portal Implementation",
+        ),
+        (portal, "Zone Portal #3"),
+    ] {
+        assert_eq!(label(address).as_deref(), Some(name), "{address}");
+    }
+    // The prefix alone, zone id 0, is no portal: ids start at 1.
+    assert_eq!(label("0x5ad0000000000000000000000000000000000000"), None);
+    drop(dir);
+
+    let page = get_json(&base, &format!("/address/{factory}?tab=contract")).await;
+    assert_eq!(page["interface"]["abis"], json!(["zone_factory"]));
+    assert!(page["interface"]["writes"]
+        .as_array()
+        .expect("writes")
+        .iter()
+        .any(|f| f["name"] == json!("createZone")));
+
+    let page = get_json(&base, &format!("/address/{portal}?tab=contract")).await;
+    assert_eq!(page["interface"]["abis"], json!(["zone_portal"]));
+}
+
+/// The anchoring contract's interface has an owner.
+#[tokio::test]
+async fn the_anchoring_interface_has_an_owner() {
+    let (_dir, base) = serve(Value::Null).await;
+    let page = get_json(
+        &base,
+        "/address/0x0000000000000000000000000000000000000a00?tab=contract",
+    )
+    .await;
+    let named = |kind: &str, name: &str| {
+        page["interface"][kind]
+            .as_array()
+            .expect(kind)
+            .iter()
+            .any(|f| f["name"] == json!(name))
+    };
+    assert!(named("reads", "owner"));
+    assert!(named("writes", "transferOwnership"));
+    assert!(named("events", "OwnershipTransferred"));
+}
+
+// ---------------------------------------------------------------------------
+// JSON API
+// ---------------------------------------------------------------------------
+
+async fn api(base: &str, path: &str) -> (u16, Value) {
+    let response = reqwest::get(format!("{base}/api/v1{path}"))
+        .await
+        .unwrap_or_else(|e| panic!("GET {path}: {e}"));
+    let status = response.status().as_u16();
+    let body = response
+        .json()
+        .await
+        .unwrap_or_else(|e| panic!("GET {path} json: {e}"));
+    (status, body)
+}
+
+fn numbers(items: &Value) -> Vec<i64> {
+    items
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|b| b["number"].as_i64().expect("number"))
+        .collect()
+}
+
+#[tokio::test]
+async fn the_api_serves_blocks_and_transactions() {
+    let (_dir, base, indexer) = serve_beside_indexer(Value::Null, "http://127.0.0.1:1").await;
+    let (_, blocks) = api(&base, "/blocks").await;
+    assert_eq!(numbers(&blocks["items"]), [101, 100]);
+    assert_eq!(blocks["next_page"], Value::Null, "nothing below 100");
+
+    let (_, hundred) = api(&base, "/blocks/100").await;
+    let txs = hundred["transactions"].as_array().expect("transactions");
+    assert_eq!(txs.len(), 3);
+    assert!(txs.iter().all(|t| t.get("receipt_data").is_none()));
+    let by_hash = format!("/blocks/{}", hundred["hash"].as_str().expect("hash"));
+    assert_eq!(api(&base, &by_hash).await.1["number"], json!(100));
+
+    let (_, listed) = api(&base, "/txs").await;
+    assert_eq!(listed["items"].as_array().expect("items").len(), 3);
+    assert_eq!(listed["next_page"], Value::Null);
+
+    let (_, tx) = api(&base, &format!("/txs/{TX_HASH}")).await;
+    assert_eq!(tx["method"], json!("transfer"));
+    assert_eq!(tx["receipt"]["status"], json!("0x1"));
+    let events: Vec<&Value> = tx["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .map(|e| &e["name"])
+        .collect();
+    assert_eq!(events, [&json!("Transfer"), &json!("TransferWithMemo")]);
+
+    for missing in ["/blocks/99", &format!("/txs/0x{}", "00".repeat(32))] {
+        let (status, body) = api(&base, missing).await;
+        assert_eq!(status, 404, "{missing}");
+        assert!(body["error"].is_string(), "{missing}");
+    }
+
+    // Page 2 covers 52..=76, none of them indexed; page 3 holds 50.
+    let mut low = block();
+    low.number = 50;
+    low.hash = format!("0x{}", "50".repeat(32));
+    db::save_block(&indexer, &low).expect("block 50");
+    let (_, blocks) = api(&base, "/blocks?page=2").await;
+    assert!(numbers(&blocks["items"]).is_empty());
+    assert_eq!(blocks["next_page"], json!(3));
+    let (_, blocks) = api(&base, "/blocks?page=3").await;
+    assert_eq!(numbers(&blocks["items"]), [50]);
+    assert_eq!(blocks["next_page"], Value::Null);
+}
+
+#[tokio::test]
+async fn the_api_serves_an_address() {
+    let (_dir, base) = serve(Value::Null).await;
+    let (_, sender) = api(&base, &format!("/addresses/{SENDER}")).await;
+    assert_eq!(sender["address"], json!(checksum_address(SENDER)));
+    assert_eq!(sender["type"], json!("eoa"));
+    let (_, token) = api(&base, &format!("/addresses/{TOKEN}")).await;
+    assert_eq!(token["token"]["symbol"], json!("pathUSD"));
+
+    let (_, txs) = api(&base, &format!("/addresses/{SENDER}/txs")).await;
+    assert_eq!(txs["items"].as_array().expect("items").len(), 3);
+
+    let (_, first) = api(&base, &format!("/addresses/{SENDER}/transfers")).await;
+    assert_eq!(first["items"].as_array().expect("items").len(), 25);
+    assert_eq!(first["items"][0]["token_symbol"], json!("pathUSD"));
+    assert_eq!(first["next_page"], json!(2));
+    let (_, last) = api(&base, &format!("/addresses/{SENDER}/transfers?page=2")).await;
+    assert_eq!(
+        last["items"].as_array().expect("items").len() as i64,
+        TRANSFER_COUNT - 25
+    );
+    assert_eq!(last["next_page"], Value::Null);
+
+    let holder = format!("0x{:040x}", 1);
+    let (_, holdings) = api(&base, &format!("/addresses/{holder}/holdings")).await;
+    assert_eq!(holdings["items"][0]["balance"], json!("1000000"));
+    assert_eq!(holdings["next_page"], Value::Null);
+
+    let (status, body) = api(&base, "/addresses/0x12/txs").await;
+    assert_eq!(status, 400);
+    assert!(body["error"].is_string());
+}
+
+#[tokio::test]
+async fn the_api_serves_tokens() {
+    let (_dir, base) = serve(Value::Null).await;
+    let (_, tokens) = api(&base, "/tokens").await;
+    assert_eq!(tokens["items"][0]["symbol"], json!("pathUSD"));
+    assert_eq!(tokens["next_page"], Value::Null);
+    let (_, token) = api(&base, &format!("/tokens/{TOKEN}")).await;
+    assert_eq!(token["decimals"], json!(6));
+
+    for list in ["holders", "transfers"] {
+        let (_, first) = api(&base, &format!("/tokens/{TOKEN}/{list}")).await;
+        assert_eq!(first["items"].as_array().expect(list).len(), 25, "{list}");
+        assert_eq!(first["next_page"], json!(2), "{list}");
+        let (_, last) = api(&base, &format!("/tokens/{TOKEN}/{list}?page=2")).await;
+        assert_eq!(last["next_page"], Value::Null, "{list}");
+    }
+    let (_, holders) = api(&base, &format!("/tokens/{TOKEN}/holders")).await;
+    // 10⁶ units of a 10⁹ supply, in percent.
+    assert_eq!(holders["items"][0]["share"], json!("0.1000"));
+
+    let unknown = format!("0x{}", "99".repeat(20));
+    for path in ["", "/holders", "/transfers"] {
+        let (status, _) = api(&base, &format!("/tokens/{unknown}{path}")).await;
+        assert_eq!(status, 404, "{path}");
+    }
 }

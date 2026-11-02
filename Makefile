@@ -13,6 +13,7 @@ check:
 
 test:
 	cargo test --test decoder
+	cargo test --test baseline
 	cargo test --test live_rpc
 
 install: build

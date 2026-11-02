@@ -12,6 +12,7 @@ const NAME_CALL: &str = "0x06fdde03";
 const SYMBOL_CALL: &str = "0x95d89b41";
 const DECIMALS_CALL: &str = "0x313ce567";
 const TOTAL_SUPPLY_CALL: &str = "0x18160ddd";
+const CURRENCY_CALL: &str = "0xe5a6b10f";
 const BALANCE_OF_CALL: &str = "0x70a08231";
 const GENESIS: &str = "0x0";
 /// The JSON-RPC error code of a call that ran and reverted.
@@ -41,16 +42,9 @@ pub struct TokenMeta {
 /// A few non-standard contracts return the string in place (length in word 0),
 /// so that shape is accepted as a fallback.
 pub fn decode_string_result(raw: &str) -> String {
-    if raw.is_empty() || raw == "0x" {
+    let Some(bytes) = abi_words(raw) else {
         return String::new();
-    }
-    let bytes = match hex::decode(raw.strip_prefix("0x").unwrap_or(raw)) {
-        Ok(b) => b,
-        Err(_) => return String::new(),
     };
-    if bytes.len() < 32 {
-        return String::new();
-    }
     let offset = u64::from_be_bytes(bytes[24..32].try_into().unwrap_or([0; 8])) as usize;
     // Standard dynamic-string encoding: the first word is an offset into the
     // buffer pointing at the length word, followed by the payload.
@@ -67,32 +61,23 @@ pub fn decode_string_result(raw: &str) -> String {
     String::from_utf8_lossy(&bytes[32..32 + len]).into_owned()
 }
 
+/// A call's return data as bytes, if it holds at least one ABI word.
+fn abi_words(raw: &str) -> Option<Vec<u8>> {
+    let bytes = hex::decode(raw.strip_prefix("0x").unwrap_or(raw)).ok()?;
+    (bytes.len() >= 32).then_some(bytes)
+}
+
 fn decode_uint_result(raw: &str, default: i64) -> i64 {
-    if raw.is_empty() || raw == "0x" {
-        return default;
-    }
-    let bytes = match hex::decode(raw.strip_prefix("0x").unwrap_or(raw)) {
-        Ok(b) => b,
-        Err(_) => return default,
-    };
-    if bytes.len() < 32 {
-        return default;
-    }
-    u64::from_be_bytes(bytes[24..32].try_into().unwrap_or([0; 8])) as i64
+    abi_words(raw).map_or(default, |bytes| {
+        u64::from_be_bytes(bytes[24..32].try_into().unwrap_or([0; 8])) as i64
+    })
 }
 
 fn decode_uint256_result(raw: &str) -> String {
-    if raw.is_empty() || raw == "0x" {
-        return "0".into();
-    }
-    let bytes = match hex::decode(raw.strip_prefix("0x").unwrap_or(raw)) {
-        Ok(b) => b,
-        Err(_) => return "0".into(),
-    };
-    if bytes.len() < 32 {
-        return "0".into();
-    }
-    num_bigint::BigInt::from_bytes_be(num_bigint::Sign::Plus, &bytes).to_string()
+    abi_words(raw).map_or_else(
+        || "0".into(),
+        |bytes| num_bigint::BigInt::from_bytes_be(num_bigint::Sign::Plus, &bytes).to_string(),
+    )
 }
 
 /// Clean a decoded `name()`/`symbol()` string. Real token metadata is
@@ -115,66 +100,74 @@ pub fn has_control_chars(s: &str) -> bool {
     s.chars().any(|c| c.is_control())
 }
 
-/// Read several of a token's views at the chain head in one HTTP request. A view
-/// the token lacks comes back as `"0x"`, which the decoders read as "no answer";
-/// a request that never arrives is an error.
-async fn view_calls<const N: usize>(
+/// The views read for each token.
+const TOKEN_VIEWS: [&str; 5] = [
+    NAME_CALL,
+    SYMBOL_CALL,
+    DECIMALS_CALL,
+    TOTAL_SUPPLY_CALL,
+    CURRENCY_CALL,
+];
+
+/// Fetch TIP-20 token metadata from the chain, all of `addresses` in one request,
+/// in their order. An address answering to no view has an empty name and symbol;
+/// an unreachable node is an error, so a token is never stored from an answer the
+/// node never gave.
+pub async fn fetch_token_metadata(
     rpc: &ChainRpc,
-    address: &str,
-    selectors: &[&str; N],
-) -> Result<[String; N]> {
-    let calls: Vec<(String, Value)> = selectors
+    addresses: impl IntoIterator<Item = impl AsRef<str>>,
+) -> Result<Vec<TokenMeta>> {
+    // Reserved addresses included: a chain is free to name the tokens genesis
+    // puts there whatever it likes.
+    let addresses: Vec<String> = addresses
+        .into_iter()
+        .map(|a| checksum_address(a.as_ref()))
+        .collect();
+    if addresses.is_empty() {
+        return Ok(Vec::new());
+    }
+    let calls = addresses
         .iter()
-        .map(|data| {
-            (
-                "eth_call".to_string(),
-                json!([{"to": address, "data": data}, "latest"]),
-            )
+        .flat_map(|address| {
+            TOKEN_VIEWS.map(|data| {
+                (
+                    "eth_call".to_string(),
+                    json!([{"to": address, "data": data}, "latest"]),
+                )
+            })
         })
         .collect();
     let results = rpc
         .batch_call(calls)
         .await
-        .with_context(|| format!("reading token views for {address}"))?;
-    Ok(std::array::from_fn(|i| {
-        results
-            .get(i)
-            .and_then(|result| result.as_ref().ok())
-            .and_then(Value::as_str)
-            .filter(|hex| !hex.is_empty())
-            .unwrap_or("0x")
-            .to_string()
-    }))
-}
-
-/// Fetch TIP-20 token metadata from the chain. An address answering to no view
-/// has an empty name and symbol; an unreachable node is an error, so a token is
-/// never stored from an answer the node never gave.
-pub async fn fetch_token_metadata(rpc: &ChainRpc, address: &str) -> Result<TokenMeta> {
-    let checksummed = checksum_address(address);
-
-    // One request per token, reserved addresses included: a chain is free to
-    // name the tokens genesis puts there whatever it likes.
-    let [name, symbol, decimals_raw, supply_raw] = view_calls(
-        rpc,
-        &checksummed,
-        &[NAME_CALL, SYMBOL_CALL, DECIMALS_CALL, TOTAL_SUPPLY_CALL],
-    )
-    .await?;
-
-    // Guard against stale/bad decodes: a mis-decoded ABI word must not be
-    // stored or rendered as a name/symbol.
-    let name = sanitize_metadata_text(&decode_string_result(&name));
-    let symbol = sanitize_metadata_text(&decode_string_result(&symbol));
-
-    Ok(TokenMeta {
-        address: checksummed,
-        name,
-        currency: infer_currency(&symbol),
-        symbol,
-        decimals: decode_uint_result(&decimals_raw, 18),
-        total_supply: decode_uint256_result(&supply_raw),
-    })
+        .with_context(|| format!("reading token views for {}", addresses.join(", ")))?;
+    Ok(addresses
+        .into_iter()
+        .zip(results.chunks(TOKEN_VIEWS.len()))
+        .map(|(address, views)| {
+            // A view the token lacks comes back as `"0x"`, which the decoders read
+            // as "no answer".
+            let [name, symbol, decimals, supply, currency] = std::array::from_fn(|i| {
+                views
+                    .get(i)
+                    .and_then(|result| result.as_ref().ok())
+                    .and_then(Value::as_str)
+                    .filter(|hex| !hex.is_empty())
+                    .unwrap_or("0x")
+            });
+            // Guard against stale/bad decodes: a mis-decoded ABI word must not be
+            // stored or rendered as text.
+            let text = |raw: &str| sanitize_metadata_text(&decode_string_result(raw));
+            TokenMeta {
+                address,
+                name: text(name),
+                symbol: text(symbol),
+                currency: text(currency),
+                decimals: decode_uint_result(decimals, 18),
+                total_supply: decode_uint256_result(supply),
+            }
+        })
+        .collect())
 }
 
 /// Each holder's balance at block 0, in one request. A token not created yet
@@ -209,17 +202,6 @@ pub async fn balances_at_genesis(
         })
         .collect::<Result<_>>()
         .context("reading balances at genesis")
-}
-
-fn infer_currency(symbol: &str) -> String {
-    let upper = symbol.to_uppercase();
-    if upper.ends_with("USD") || matches!(upper.as_str(), "USDC" | "USDT" | "DAI" | "FRAX") {
-        "USD".into()
-    } else if upper.ends_with("EUR") {
-        "EUR".into()
-    } else {
-        symbol.to_string()
-    }
 }
 
 /// Format a token amount with up to six significant decimal places.
@@ -261,11 +243,6 @@ pub fn format_token_amount_with_symbol(amount: &str, decimals: i64, symbol: &str
     } else {
         format!("{formatted} {symbol}")
     }
-}
-
-/// Convenience JSON wrapper for the token page.
-pub fn token_to_json(meta: &TokenMeta) -> serde_json::Value {
-    json!(meta)
 }
 
 #[cfg(test)]
@@ -394,29 +371,35 @@ mod tests {
         assert!(node.asked().iter().all(|p| p[1] == GENESIS));
     }
 
-    /// The indexer fetches metadata for every token a block introduces, so the
-    /// cost of a token is the cost of one round trip, not four.
+    /// The indexer fetches metadata for every token a block range introduces, so
+    /// the tokens cost one round trip, not one per view.
     #[tokio::test]
-    async fn a_token_is_read_in_one_request() {
+    async fn tokens_are_read_in_one_request() {
         let node = stub_node(vec![
             (NAME_CALL, abi_string("Test USD")),
             (SYMBOL_CALL, abi_string("TUSD")),
             (DECIMALS_CALL, abi_uint(6)),
             (TOTAL_SUPPLY_CALL, abi_uint(1_000_000)),
+            (CURRENCY_CALL, abi_string("EUR")),
         ])
         .await;
         let rpc = ChainRpc::new(&node.url).expect("rpc");
-        let token = "0x3333333333333333333333333333333333333333";
+        let tokens = [
+            "0x3333333333333333333333333333333333333333",
+            "0x6666666666666666666666666666666666666666",
+        ];
 
-        let meta = fetch_token_metadata(&rpc, token).await.expect("fetched");
-        assert_eq!(meta.address, checksum_address(token));
+        let metas = fetch_token_metadata(&rpc, tokens).await.expect("fetched");
+        let addresses: Vec<_> = metas.iter().map(|m| m.address.as_str()).collect();
+        assert_eq!(addresses, tokens.map(checksum_address));
+        let meta = &metas[0];
         assert_eq!(meta.name, "Test USD");
         assert_eq!(meta.symbol, "TUSD");
         assert_eq!(meta.decimals, 6);
         assert_eq!(meta.total_supply, "1000000");
-        assert_eq!(meta.currency, "USD", "inferred from the symbol");
-        assert_eq!(node.requests(), 1, "four views, one round trip");
-        assert_eq!(node.asked().len(), 4);
+        assert_eq!(meta.currency, "EUR", "read from the token");
+        assert_eq!(node.requests(), 1, "ten views, one round trip");
+        assert_eq!(node.asked().len(), 10);
     }
 
     /// A token at a reserved address is named by the chain, not by the
@@ -432,13 +415,14 @@ mod tests {
         .await;
         let rpc = ChainRpc::new(&node.url).expect("rpc");
 
-        let meta = fetch_token_metadata(&rpc, RESERVED_TOKENS[0])
+        let meta = fetch_token_metadata(&rpc, [RESERVED_TOKENS[0]])
             .await
-            .expect("fetched");
+            .expect("fetched")
+            .remove(0);
         assert_eq!(meta.symbol, "nUSD");
         assert_eq!(meta.decimals, 6);
         assert_eq!(meta.total_supply, "42");
-        assert_eq!(node.requests(), 1, "four views, one round trip");
+        assert_eq!(node.requests(), 1, "every view, one round trip");
     }
 
     /// A token missing a view is still a token: whatever it does answer lands,
@@ -448,13 +432,15 @@ mod tests {
         let node = stub_node(vec![(SYMBOL_CALL, abi_string("ODD"))]).await;
         let rpc = ChainRpc::new(&node.url).expect("rpc");
 
-        let meta = fetch_token_metadata(&rpc, "0x5555555555555555555555555555555555555555")
+        let meta = fetch_token_metadata(&rpc, ["0x5555555555555555555555555555555555555555"])
             .await
-            .expect("fetched");
+            .expect("fetched")
+            .remove(0);
         assert_eq!(meta.symbol, "ODD");
         assert_eq!(meta.name, "");
         assert_eq!(meta.decimals, 18, "the ERC-20 default");
         assert_eq!(meta.total_supply, "0");
+        assert_eq!(meta.currency, "");
     }
 
     /// Under one whole token the quotient is zero, which carries no sign, so an
@@ -481,7 +467,7 @@ mod tests {
     #[tokio::test]
     async fn an_unreachable_node_is_an_error_not_a_nameless_token() {
         let rpc = ChainRpc::new("http://127.0.0.1:1").expect("rpc");
-        let err = fetch_token_metadata(&rpc, "0x4444444444444444444444444444444444444444")
+        let err = fetch_token_metadata(&rpc, ["0x4444444444444444444444444444444444444444"])
             .await
             .unwrap_err()
             .to_string();

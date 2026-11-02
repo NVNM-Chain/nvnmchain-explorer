@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "_macros.html" as ui %}
 {% block title %}Block {{ block.number }} ⋅ nvnmchain Explorer{% endblock %}
 {% block content %}
 
@@ -40,7 +41,7 @@
             <div class="kv-row">
                 <div class="kv-label">Parent Hash</div>
                 <div class="kv-value mono text-xs">
-                    <a href="{{ get_block_url(block_id=block.parent_hash) }}" class="text-blue-400 break-all">{{ block.parent_hash }}</a>
+                    <a href="/block/{{ block.parent_hash }}" class="text-blue-400 break-all">{{ block.parent_hash }}</a>
                 </div>
             </div>
             <div class="kv-row">
@@ -87,16 +88,11 @@
             </div>
             <div class="kv-row">
                 <div class="kv-label">Base Fee</div>
-                <div class="kv-value"><span class="mono">{{ base_fee_gwei }}</span> Gwei</div>
+                <div class="kv-value mono">{{ ui::gas_price(wei=block.base_fee) }}</div>
             </div>
             <div class="kv-row">
-                <div class="kv-label">Burnt Fees</div>
-                <div class="kv-value">
-                    {% if burnt_fees and burnt_fees != '0' %}
-                    <span class="mono">{{ format_token_amount(amount=burnt_fees, decimals=18) }}</span>
-                    <span class="text-dim">{{ native_symbol }}</span>
-                    {% else %}—{% endif %}
-                </div>
+                <div class="kv-label">Base Fees</div>
+                <div class="kv-value mono">{% if base_fees != '0' %}{{ ui::usd(wei=base_fees) }}{% else %}—{% endif %}</div>
             </div>
             <div class="kv-row">
                 <div class="kv-label">Size</div>
@@ -158,7 +154,7 @@
                     {% if tx.fee_formatted %}
                     {{ tx.fee_formatted }}
                     {% elif tx.fee_token and tx.fee_amount and tx.fee_amount != '0' %}
-                    {{ format_token_amount(amount=tx.fee_amount, decimals=18) }}
+                    {{ tx.fee_amount }}
                     {% else %}
                     {{ tx.gas_used }} gas
                     {% endif %}

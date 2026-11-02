@@ -8,7 +8,11 @@
     <div class="card-body">
         <div class="flex items-center justify-between gap-3 mb-2">
             <span class="text-xs text-dim">Index progress — <span id="idx-indexed" class="mono">{{ indexed_display }}</span> / <span id="idx-head" class="mono">{{ head_display }}</span> blocks indexed</span>
+            {% if index_stale %}
+            <span id="idx-pct" class="badge badge-error">not updating, last {{ format_time_ago(timestamp=stats.updated_at) }}</span>
+            {% else %}
             <span id="idx-pct" class="mono text-xs text-blue-400">{{ index_pct_display }}%</span>
+            {% endif %}
         </div>
         <div class="h-1.5 rounded-full" style="background: rgba(255,255,255,0.06); overflow: hidden;">
             <div id="idx-bar" style="width: {{ index_pct_display }}%; height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-2));"></div>
@@ -29,7 +33,7 @@
     </div>
     <div class="card card-body">
         <div id="stat-tps" class="stat-value">{% if stats %}{{ stats.tps_display }}{% else %}—{% endif %}</div>
-        <div class="stat-label">TPS (100 blk)</div>
+        <div class="stat-label">TPS (last hour)</div>
     </div>
     <div class="card card-body">
         <div id="stat-gas" class="stat-value">{% if stats %}{{ stats.gas_util_display }}{% else %}—{% endif %}</div>
@@ -45,40 +49,44 @@
     </div>
 </div>
 
-<!-- Activity sparklines -->
-{% if recent_blocks %}
+<!-- Activity per minute, drawn by the script below from the stats -->
+{% if stats and stats.tx_per_minute %}
 <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-8">
     <div class="card">
         <div class="card-header flex items-center justify-between">
-            <span>Transactions per block <span class="text-faint font-normal">(last {{ recent_blocks | length }})</span></span>
+            <span>Transactions per minute <span class="text-faint font-normal">(last hour)</span></span>
+            <span id="chart-tx-peak" class="text-faint font-normal"></span>
         </div>
         <div class="card-body">
-            <svg class="spark w-full" viewBox="0 0 160 32" preserveAspectRatio="none" style="height:64px;">
+            <svg id="chart-tx" class="spark w-full" viewBox="0 0 160 32" preserveAspectRatio="none" style="height:64px;"
+                 data-series="{{ stats.tx_per_minute | json_encode() }}" data-unit="">
                 <defs>
                     <linearGradient id="sparkFill" x1="0" y1="0" x2="0" y2="1">
                         <stop offset="0%" stop-color="#6ea8ff"/>
                         <stop offset="100%" stop-color="#6ea8ff" stop-opacity="0"/>
                     </linearGradient>
                 </defs>
-                <polygon class="spark-area" points="0,32 {{ spark_tx }} 160,32"/>
-                <polyline points="{{ spark_tx }}"/>
+                <polygon class="spark-area"/>
+                <polyline/>
             </svg>
         </div>
     </div>
     <div class="card">
         <div class="card-header flex items-center justify-between">
-            <span>Gas utilization % <span class="text-faint font-normal">(last {{ recent_blocks | length }})</span></span>
+            <span>Gas used per minute <span class="text-faint font-normal">(last hour)</span></span>
+            <span id="chart-gas-peak" class="text-faint font-normal"></span>
         </div>
         <div class="card-body">
-            <svg class="spark gas w-full" viewBox="0 0 160 32" preserveAspectRatio="none" style="height:64px;">
+            <svg id="chart-gas" class="spark gas w-full" viewBox="0 0 160 32" preserveAspectRatio="none" style="height:64px;"
+                 data-series="{{ stats.gas_per_minute | json_encode() }}" data-unit=" gas">
                 <defs>
                     <linearGradient id="sparkFillGas" x1="0" y1="0" x2="0" y2="1">
                         <stop offset="0%" stop-color="#a78bfa"/>
                         <stop offset="100%" stop-color="#a78bfa" stop-opacity="0"/>
                     </linearGradient>
                 </defs>
-                <polygon class="spark-area" points="0,32 {{ spark_gas }} 160,32" style="fill:url(#sparkFillGas);"/>
-                <polyline points="{{ spark_gas }}"/>
+                <polygon class="spark-area" style="fill:url(#sparkFillGas);"/>
+                <polyline/>
             </svg>
         </div>
     </div>
@@ -184,6 +192,27 @@
     var blockTime = document.getElementById('stat-block-time');
     var live = document.getElementById('live-indicator');
     var prevMs = null;
+
+    // One point per minute, newest on the right, scaled to the hour's peak.
+    function drawChart(id, series) {
+        var svg = document.getElementById(id);
+        if (!svg || !Array.isArray(series) || !series.length) return;
+        var peak = Math.max.apply(null, series);
+        var top = Math.max(peak, 1);
+        var step = 160 / Math.max(series.length - 1, 1);
+        var pts = series.map(function (v, i) {
+            return (i * step).toFixed(1) + ',' + (30 - v / top * 26).toFixed(1);
+        }).join(' ');
+        svg.querySelector('polyline').setAttribute('points', pts);
+        svg.querySelector('polygon').setAttribute('points', '0,32 ' + pts + ' 160,32');
+        var label = document.getElementById(id + '-peak');
+        if (label) label.textContent = 'peak ' + peak.toLocaleString('en-US') + svg.dataset.unit;
+    }
+    ['chart-tx', 'chart-gas'].forEach(function (id) {
+        var svg = document.getElementById(id);
+        if (svg) drawChart(id, JSON.parse(svg.dataset.series));
+    });
+
     if (!window.EventSource || !panel) return;
 
     // Transactions may not have been cached at render time; keep the
@@ -380,10 +409,17 @@
         put('stat-tokens', num(s.token_count));
         if (typeof s.tps === 'number') put('stat-tps', s.tps.toFixed(2));
         if (typeof s.gas_util_pct === 'number') put('stat-gas', s.gas_util_pct.toFixed(1) + '%');
+        drawChart('chart-tx', s.tx_per_minute);
+        drawChart('chart-gas', s.gas_per_minute);
         put('idx-indexed', num(s.total_blocks));
         put('idx-head', num(s.chain_head));
         if (typeof s.index_pct === 'number') {
-            put('idx-pct', s.index_pct.toFixed(1) + '%');
+            var pct = document.getElementById('idx-pct');
+            if (pct) {
+                // Fresh stats: the index is updating again.
+                pct.className = 'mono text-xs text-blue-400';
+                pct.textContent = s.index_pct.toFixed(1) + '%';
+            }
             var bar = document.getElementById('idx-bar');
             if (bar) bar.style.width = s.index_pct.toFixed(1) + '%';
         }

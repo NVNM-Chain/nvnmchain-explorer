@@ -103,16 +103,25 @@ fn tempo_contracts() -> Vec<(&'static str, JsonAbi)> {
             "current_committee",
             current_committee::ICurrentCommittee::abi::contract(),
         ),
+        ("zone_factory", zone_factory::IZoneFactory::abi::contract()),
+        // Only the events a portal logs while `createZone` sets it up.
+        ("zone_portal", zone_factory::IZonePortal::abi::contract()),
     ]
 }
 
 /// Contracts that are not Tempo's, so no binding carries them; without these their calls decode to
 /// a bare selector. The canonical deployments are vendored under `abi/`; anchoring comes from the
-/// nvnmchain-contracts submodule, so it cannot drift from what it decodes.
+/// nvnmchain-contracts submodule, so it cannot drift from what it decodes. Safe's is the L2 build
+/// of v1.3.0, the one deployed here: later versions index arguments this one does not.
 const VENDORED: &[(&str, &str)] = &[
     ("multicall3", include_str!("../abi/multicall3.json")),
     ("permit2", include_str!("../abi/permit2.json")),
     ("createx", include_str!("../abi/createx.json")),
+    ("safe", include_str!("../abi/safe.json")),
+    (
+        "safe_proxy_factory",
+        include_str!("../abi/safe_proxy_factory.json"),
+    ),
     (
         "anchoring",
         include_str!("../contracts/layout/anchoring.abi.json"),
@@ -603,6 +612,17 @@ pub fn decode_function_call(data: &str) -> Option<DecodedCall> {
     })
 }
 
+/// A call's function name, else its selector, read from the selector alone.
+pub fn function_name(data: &str) -> Option<String> {
+    let selector_hex = data.strip_prefix("0x").unwrap_or(data).get(..8)?;
+    let mut selector = [0u8; 4];
+    hex::decode_to_slice(selector_hex, &mut selector).ok()?;
+    Some(match REGISTRY.function(&selector) {
+        Some((_, function)) => function.name.clone(),
+        None => format!("0x{}", hex::encode(selector)),
+    })
+}
+
 /// Decode calldata against a signature learned at runtime — what the 4-byte
 /// directory answers with. The signature is checked against the selector
 /// first, so a directory that answers with the wrong function names nothing.
@@ -692,8 +712,7 @@ pub const APPROVAL_SIGNATURE: &str = "Approval(address,address,uint256)";
 /// chain reports `topic0` in.
 ///
 /// Derived, never written out: a mistyped hash does not fail loudly, it
-/// silently matches nothing. `TRANSFER_WITH_MEMO_TOPIC` was 63 hex digits, so
-/// no memo transfer was ever indexed.
+/// silently matches nothing, as `TRANSFER_WITH_MEMO_TOPIC` once did at 63 hex digits.
 pub static TRANSFER_TOPIC: LazyLock<String> =
     LazyLock::new(|| keccak_hex(TRANSFER_SIGNATURE.as_bytes()));
 pub static TRANSFER_WITH_MEMO_TOPIC: LazyLock<String> =
@@ -908,11 +927,9 @@ fn walk_trace(node: &Value, depth: usize, result: &mut Vec<Value>) {
     let children = node
         .get("calls")
         .or_else(|| node.get("children"))
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+        .and_then(Value::as_array);
     let mut child_indices = Vec::new();
-    for child in &children {
+    for child in children.into_iter().flatten() {
         child_indices.push(result.len());
         walk_trace(child, depth + 1, result);
     }
@@ -945,12 +962,8 @@ pub const FEE_MANAGER_ADDRESS: &str = "0xfeEC00000000000000000000000000000000000
 
 pub fn extract_balance_changes(receipt: &Value, tx: &Transaction) -> Vec<Value> {
     let mut changes = Vec::new();
-    let logs = receipt
-        .get("logs")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    for log in &logs {
+    let logs = receipt.get("logs").and_then(Value::as_array);
+    for log in logs.into_iter().flatten() {
         if let Some(decoded) = decode_event(log) {
             if decoded.name.as_deref() == Some("Transfer") {
                 // Checksummed: the token metadata this is rendered with is
@@ -977,18 +990,13 @@ pub fn extract_balance_changes(receipt: &Value, tx: &Transaction) -> Vec<Value> 
     if let Some(fee_token) = tx.fee_token.as_deref() {
         let fee_ok = tx.fee_amount.parse::<i64>().map(|n| n > 0).unwrap_or(false);
         if fee_ok {
+            let is = |c: &Value, key: &str, want: &str| {
+                c.get(key)
+                    .and_then(Value::as_str)
+                    .is_some_and(|got| got.eq_ignore_ascii_case(want))
+            };
             for c in changes.iter_mut() {
-                let addr = c
-                    .get("address")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_lowercase();
-                let token = c
-                    .get("token")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_lowercase();
-                if addr == FEE_MANAGER_ADDRESS.to_lowercase() && token == fee_token.to_lowercase() {
+                if is(c, "address", FEE_MANAGER_ADDRESS) && is(c, "token", fee_token) {
                     c["is_fee"] = json!(true);
                     c["change_type"] = json!("fee");
                 }
@@ -998,27 +1006,13 @@ pub fn extract_balance_changes(receipt: &Value, tx: &Transaction) -> Vec<Value> 
     changes
 }
 
-/// Extract internal calls: use the flattened trace when available, otherwise
-/// fall back to the top-level `calls` field of the raw transaction.
-pub fn extract_calls(tx: &Transaction, trace: &[Value]) -> Vec<Value> {
+/// The calls to show: the flattened trace when there is one, else the raw
+/// transaction's top-level calls, decoded.
+pub fn extract_calls(tx: &Transaction, parsed: &ParsedTx, trace: &[Value]) -> Vec<Value> {
     if !trace.is_empty() {
-        let mut out = trace.to_vec();
-        for call in out.iter_mut() {
-            if call.get("input").is_some() && call.get("data").is_none() {
-                call["data"] = call["input"].clone();
-            }
-        }
-        return out;
+        return trace.to_vec();
     }
-
-    // Tempo-style txs carry their calls in the raw RLP object; parse it with
-    // the official tempo primitives.
-    let mut calls = tx
-        .raw
-        .as_deref()
-        .map(parse_raw_tx)
-        .unwrap_or_default()
-        .calls;
+    let mut calls = parsed.calls.clone();
     for call in calls.iter_mut() {
         call["from"] = json!(tx.from_addr);
         let data = call.get("data").and_then(Value::as_str).unwrap_or("0x");
@@ -1027,14 +1021,6 @@ pub fn extract_calls(tx: &Transaction, trace: &[Value]) -> Vec<Value> {
             .unwrap_or(Value::Null);
     }
     calls
-}
-
-pub fn parse_decimal_or_hex(s: &str) -> i128 {
-    if let Some(h) = s.strip_prefix("0x") {
-        i128::from_str_radix(h, 16).unwrap_or(0)
-    } else {
-        s.parse().unwrap_or(0)
-    }
 }
 
 #[cfg(test)]
@@ -1197,6 +1183,22 @@ mod tests {
         assert_eq!(event.params[3].name, "memo");
         assert_eq!(event.params[3].value, memo);
         assert!(event.params[3].indexed);
+    }
+
+    /// A row's badge comes from the selector alone, whatever follows it.
+    #[test]
+    fn a_listing_names_a_call_by_its_selector() {
+        let args = "00".repeat(64);
+        assert_eq!(
+            function_name(&format!("0xA9059CBB{args}")).as_deref(),
+            Some("transfer")
+        );
+        assert_eq!(
+            function_name(&format!("0xDEADBEEF{args}")).as_deref(),
+            Some("0xdeadbeef")
+        );
+        assert_eq!(function_name("0x"), None);
+        assert_eq!(function_name("0xa905"), None);
     }
 
     #[test]

@@ -44,8 +44,8 @@
         <div class="t-row flex text-xs items-center">
             <div class="w-20 px-3 py-3 mono">v{{ version.index }}{% if version.isLatest %} <span class="badge badge-success">latest</span>{% endif %}</div>
             <div class="flex-1 px-3 py-3 min-w-0">
-                <span class="block truncate" title="{{ version.uri }}">{{ version.uri | fallback(value="—") }}</span>
-                {% if version.metadata %}<span class="block truncate mono text-faint" title="{{ version.metadata }}">{{ version.metadata }}</span>{% endif %}
+                <span class="block break-all">{{ version.uri | fallback(value="—") }}</span>
+                {% if version.metadata %}<span class="block break-all mono text-faint">{{ version.metadata }}</span>{% endif %}
             </div>
             <div class="w-28 px-3 py-3"><span class="badge">{{ version.status }}</span></div>
             <div class="w-56 px-3 py-3 text-right text-faint">{{ version.timestamp }}</div>

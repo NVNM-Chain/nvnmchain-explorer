@@ -14,18 +14,28 @@ use nvnmchain_explorer::web;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Local development: pick up a `.env` from the working directory. Variables
+    // already set in the environment win, so deployments are unaffected.
+    let dotenv = dotenvy::dotenv();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "nvnmchain_explorer=info".into()),
         )
         .init();
+    match dotenv {
+        Ok(path) => info!("loaded environment from {}", path.display()),
+        Err(e) if e.not_found() => {}
+        Err(e) => warn!("could not fully load .env: {e}"),
+    }
 
     let cfg = Settings::from_env();
     info!(
         "starting nvnmchain Explorer (rpc={}, db={})",
         cfg.rpc_url, cfg.db_path
     );
+    // Informational only for now: indexer and web server both run in every role.
+    info!("role: {}", cfg.role);
 
     let conn = db::init_db(&cfg.db_path).context("initialize database")?;
     let db: Db = Arc::new(Mutex::new(conn));
@@ -38,35 +48,23 @@ async fn main() -> anyhow::Result<()> {
     let indexer_db = db.clone();
     let indexer_cfg = IndexerConfig::from_settings(&cfg);
     let ws_url = cfg.ws_url.clone();
-    // Sized for ~an hour of sub-second blocks; combined with the writer's
+    // Sized for ~an hour of sub-second blocks; combined with the feed's
     // in-order emission and the SSE lag-replay, live viewers never see gaps.
     let (block_tx, _) = broadcast::channel::<serde_json::Value>(8192);
-    let indexer_block_tx = block_tx.clone();
     // Ctrl+C (or SIGTERM via the graceful-shutdown future) flips this watch;
     // every indexer loop checks it so the process stops promptly instead of
     // continuing to fetch/index for minutes.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let indexer_shutdown = shutdown_rx.clone();
-    // Home-page stats live here; the stats task refreshes them, the web
-    // handlers read them. Seeded from kv so a restart paints real numbers
-    // before the first recompute.
+    // Seeded from kv so the first page view has stats; the feed keeps them current.
     let home_stats = Arc::new(std::sync::RwLock::new(
         db::get_kv(&db, "stats")
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or(serde_json::Value::Null),
     ));
-    let indexer_stats = home_stats.clone();
     let indexer_task = tokio::spawn(async move {
         info!("indexer websocket feed: {ws_url}");
-        indexer::run_forever(
-            indexer_rpc,
-            indexer_db,
-            indexer_cfg,
-            indexer_block_tx,
-            indexer_stats,
-            indexer_shutdown,
-        )
-        .await
+        indexer::run_forever(indexer_rpc, indexer_db, indexer_cfg, indexer_shutdown).await
     });
 
     let state = web::AppState {
@@ -76,8 +74,10 @@ async fn main() -> anyhow::Result<()> {
         tera,
         block_events: block_tx,
         stats: home_stats,
+        signatures: Default::default(),
         shutdown: shutdown_rx.clone(),
     };
+    tokio::spawn(web::feed(state.clone()));
     let app = web::app(state);
 
     let addr = format!("{}:{}", cfg.host, cfg.port);
@@ -98,6 +98,14 @@ async fn main() -> anyhow::Result<()> {
         });
     });
 
+    // The indexer's window to flush starts at the signal, beside the connections'.
+    let mut stopping = shutdown_rx.clone();
+    let indexer_stopped = tokio::spawn(async move {
+        if stopping.wait_for(|&stop| stop).await.is_ok() {
+            let _ = tokio::time::timeout(Duration::from_secs(10), indexer_task).await;
+        }
+    });
+
     tokio::select! {
         r = server => r.context("server error")?,
         // Backstop: graceful shutdown waits on in-flight connections, and a
@@ -107,10 +115,8 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // The indexer loops exit on the shutdown signal; give them a bounded
-    // window to flush in-flight work, then exit regardless.
     info!("server stopped; waiting for indexer shutdown");
-    let _ = tokio::time::timeout(Duration::from_secs(10), indexer_task).await;
+    let _ = indexer_stopped.await;
     info!("shutdown complete");
     Ok(())
 }

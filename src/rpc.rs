@@ -1,20 +1,28 @@
 //! Async JSON-RPC client, mirroring `app/rpc.py`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use num_bigint::BigInt;
-use reqwest::Client;
+use reqwest::header::{HeaderValue, RETRY_AFTER};
+use reqwest::{Client, RequestBuilder, StatusCode};
 use serde_json::{json, Value};
+use tokio::time::Instant;
 
 use crate::config::Settings;
 
 pub struct ChainRpc {
     client: Client,
     url: String,
+    /// `x-api-key` for JSON-RPC requests only. Set per request, not as a
+    /// client default, so [`ChainRpc::http_client`] never carries it to a
+    /// third party.
+    api_key: Option<HeaderValue>,
     req_id: AtomicU64,
+    pace: Option<Arc<BatchPace>>,
 }
 
 impl Clone for ChainRpc {
@@ -22,9 +30,35 @@ impl Clone for ChainRpc {
         Self {
             client: self.client.clone(),
             url: self.url.clone(),
+            api_key: self.api_key.clone(),
             req_id: AtomicU64::new(self.req_id.load(Ordering::Relaxed)),
+            pace: self.pace.clone(),
         }
     }
+}
+
+/// Spaces batch requests `gap` apart across a client and its clones, for a
+/// gateway that rate-limits them.
+struct BatchPace {
+    gap: Duration,
+    next: tokio::sync::Mutex<Instant>,
+}
+
+impl BatchPace {
+    async fn wait(&self) {
+        let mut next = self.next.lock().await;
+        tokio::time::sleep_until(*next).await;
+        *next = Instant::now() + self.gap;
+    }
+}
+
+/// What a 429 asks us to wait, a minute when it does not say.
+fn retry_after(resp: &reqwest::Response) -> Duration {
+    let secs = resp
+        .headers()
+        .get(RETRY_AFTER)
+        .and_then(|v| v.to_str().ok()?.parse().ok());
+    Duration::from_secs(secs.unwrap_or(60))
 }
 
 #[derive(Debug)]
@@ -42,6 +76,33 @@ impl std::fmt::Display for RpcError {
 
 impl std::error::Error for RpcError {}
 
+impl RpcError {
+    /// The error a JSON-RPC response carries, if any.
+    fn of(response: &Value) -> Option<Self> {
+        let err = response.get("error").filter(|e| !e.is_null())?;
+        Some(Self {
+            code: err.get("code").and_then(Value::as_i64).unwrap_or(0),
+            message: err
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+            data: err.get("data").cloned(),
+        })
+    }
+}
+
+#[cfg(test)]
+impl ChainRpc {
+    /// A client to `app`, served on a port of its own for one test.
+    pub(crate) async fn test_node(app: axum::Router) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        Self::new(url).unwrap()
+    }
+}
+
 impl ChainRpc {
     pub fn new(url: impl Into<String>) -> Result<Self> {
         let client = Client::builder()
@@ -51,12 +112,40 @@ impl ChainRpc {
         Ok(Self {
             client,
             url: url.into(),
+            api_key: None,
             req_id: AtomicU64::new(0),
+            pace: None,
+        })
+    }
+
+    /// Space batch requests `gap` apart, clones included, and wait out a 429
+    /// rather than fail on it.
+    pub fn paced(mut self, gap: Duration) -> Self {
+        self.pace = Some(Arc::new(BatchPace {
+            gap,
+            next: tokio::sync::Mutex::new(Instant::now()),
+        }));
+        self
+    }
+
+    /// This client on connections of its own, pace and key kept. A connection
+    /// dies with the tokio runtime that opened it, so a client used from several
+    /// runtimes, one per `#[tokio::test]`, needs a copy for each.
+    pub fn with_own_connections(&self) -> Result<Self> {
+        Ok(Self {
+            client: Self::new(&self.url)?.client,
+            ..self.clone()
         })
     }
 
     pub fn from_settings(settings: &Settings) -> Result<Self> {
-        Self::new(&settings.rpc_url)
+        Ok(Self::new(&settings.rpc_url)?.with_api_key(settings.rpc_api_key.clone()))
+    }
+
+    /// Send `key` as `x-api-key` on every JSON-RPC request.
+    pub fn with_api_key(mut self, key: Option<HeaderValue>) -> Self {
+        self.api_key = key;
+        self
     }
 
     /// The shared HTTP client, for the few requests that are not JSON-RPC —
@@ -64,6 +153,15 @@ impl ChainRpc {
     /// process rather than one per subsystem.
     pub fn http_client(&self) -> &Client {
         &self.client
+    }
+
+    /// A JSON-RPC POST to the node, with the API key when there is one.
+    fn post(&self) -> RequestBuilder {
+        let req = self.client.post(&self.url);
+        match &self.api_key {
+            Some(key) => req.header("x-api-key", key.clone()),
+            None => req,
+        }
     }
 
     fn next_id(&self) -> u64 {
@@ -78,40 +176,35 @@ impl ChainRpc {
             "params": params,
         });
         let resp = self
-            .client
-            .post(&self.url)
+            .post()
             .json(&payload)
             .send()
             .await
             .with_context(|| format!("RPC request {method} failed"))?;
-        let body: Value = resp
+        let mut body: Value = resp
             .json()
             .await
             .with_context(|| format!("RPC response for {method} was not JSON"))?;
-        if let Some(err) = body.get("error").filter(|e| !e.is_null()) {
-            let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
-            let message = err
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown")
-                .to_string();
-            let data = err.get("data").cloned();
-            return Err(RpcError {
-                code,
-                message,
-                data,
-            }
-            .into());
+        if let Some(err) = RpcError::of(&body) {
+            return Err(err.into());
         }
-        Ok(body.get("result").cloned().unwrap_or(Value::Null))
+        Ok(body.get_mut("result").map_or(Value::Null, Value::take))
     }
 
     /// Send several JSON-RPC calls in a single HTTP request. Results come back
-    /// in request order, each either `Ok(result)` or the per-call error.
+    /// in request order, each either `Ok(result)` or the per-call error. One
+    /// call goes alone: no batch for a gateway that rate-limits them.
     pub async fn batch_call(
         &self,
         calls: Vec<(String, Value)>,
     ) -> Result<Vec<Result<Value, RpcError>>> {
+        if calls.len() == 1 {
+            let (method, params) = calls.into_iter().next().unwrap();
+            return match self.call(&method, params).await {
+                Ok(value) => Ok(vec![Ok(value)]),
+                Err(e) => Ok(vec![Err(e.downcast::<RpcError>()?)]),
+            };
+        }
         let payload: Vec<Value> = calls
             .iter()
             .enumerate()
@@ -124,21 +217,35 @@ impl ChainRpc {
                 })
             })
             .collect();
-        let resp = self
-            .client
-            .post(&self.url)
-            .json(&payload)
-            .send()
-            .await
-            .context("batch RPC request failed")?;
+        let resp = loop {
+            if let Some(pace) = &self.pace {
+                pace.wait().await;
+            }
+            let resp = self.post().json(&payload).send().await.with_context(|| {
+                let methods: BTreeSet<&str> = calls.iter().map(|(m, _)| m.as_str()).collect();
+                let methods: Vec<&str> = methods.into_iter().collect();
+                format!("batch RPC request ({}) failed", methods.join(", "))
+            })?;
+            if self.pace.is_none() || resp.status() != StatusCode::TOO_MANY_REQUESTS {
+                break resp;
+            }
+            // Asking again before the gateway says only prolongs its block.
+            tokio::time::sleep(retry_after(&resp)).await;
+        };
         let body: Value = resp
             .json()
             .await
             .context("batch RPC response was not JSON")?;
-        let items = body
-            .as_array()
-            .context("batch RPC response is not an array")?;
-        let mut by_id: HashMap<u64, &Value> = HashMap::with_capacity(items.len());
+        let items = match body {
+            Value::Array(items) => items,
+            // One error for the whole batch, as reth answers past its response size cap.
+            other => match RpcError::of(&other) {
+                Some(err) => return Err(err.into()),
+                None => bail!("batch RPC response is not an array: {other}"),
+            },
+        };
+        // Results are moved out, not copied: a batch of full blocks is large.
+        let mut by_id: HashMap<u64, Value> = HashMap::with_capacity(items.len());
         for item in items {
             if let Some(id) = item.get("id").and_then(Value::as_u64) {
                 by_id.insert(id, item);
@@ -147,22 +254,11 @@ impl ChainRpc {
         let mut out = Vec::with_capacity(calls.len());
         for i in 0..calls.len() {
             let id = i as u64 + 1;
-            match by_id.get(&id) {
-                Some(item) => {
-                    if let Some(err) = item.get("error").filter(|e| !e.is_null()) {
-                        out.push(Err(RpcError {
-                            code: err.get("code").and_then(Value::as_i64).unwrap_or(0),
-                            message: err
-                                .get("message")
-                                .and_then(Value::as_str)
-                                .unwrap_or("unknown")
-                                .to_string(),
-                            data: err.get("data").cloned(),
-                        }));
-                    } else {
-                        out.push(Ok(item.get("result").cloned().unwrap_or(Value::Null)));
-                    }
-                }
+            match by_id.remove(&id) {
+                Some(mut item) => match RpcError::of(&item) {
+                    Some(err) => out.push(Err(err)),
+                    None => out.push(Ok(item.get_mut("result").map_or(Value::Null, Value::take))),
+                },
                 None => out.push(Err(RpcError {
                     code: -32603,
                     message: "no response for batched request".into(),
@@ -183,34 +279,9 @@ impl ChainRpc {
         hex_to_u64(&result).context("invalid eth_chainId result")
     }
 
-    pub async fn eth_gas_price(&self) -> Result<u64> {
-        let result = self.call("eth_gasPrice", json!([])).await?;
-        hex_to_u64(&result).context("invalid eth_gasPrice result")
-    }
-
     pub async fn eth_get_block_by_number(&self, num: u64, full: bool) -> Result<Option<Value>> {
         let result = self
             .call("eth_getBlockByNumber", json!([format!("0x{num:x}"), full]))
-            .await?;
-        if result.is_null() {
-            Ok(None)
-        } else {
-            Ok(Some(result))
-        }
-    }
-
-    pub async fn eth_get_block_by_hash(&self, hash: &str, full: bool) -> Result<Option<Value>> {
-        let result = self.call("eth_getBlockByHash", json!([hash, full])).await?;
-        if result.is_null() {
-            Ok(None)
-        } else {
-            Ok(Some(result))
-        }
-    }
-
-    pub async fn eth_get_transaction_receipt(&self, tx_hash: &str) -> Result<Option<Value>> {
-        let result = self
-            .call("eth_getTransactionReceipt", json!([tx_hash]))
             .await?;
         if result.is_null() {
             Ok(None)
@@ -258,23 +329,6 @@ impl ChainRpc {
         Ok(Some(receipts))
     }
 
-    pub async fn eth_get_transaction_by_hash(&self, tx_hash: &str) -> Result<Option<Value>> {
-        let result = self
-            .call("eth_getTransactionByHash", json!([tx_hash]))
-            .await?;
-        if result.is_null() {
-            Ok(None)
-        } else {
-            Ok(Some(result))
-        }
-    }
-
-    pub async fn eth_get_balance(&self, address: &str, block: &str) -> Result<String> {
-        let result = self.call("eth_getBalance", json!([address, block])).await?;
-        Ok(decimal_amount(&result))
-    }
-
-    #[allow(dead_code)]
     pub async fn eth_get_code(&self, address: &str, block: &str) -> Result<String> {
         let result = self.call("eth_getCode", json!([address, block])).await?;
         Ok(result
@@ -287,30 +341,6 @@ impl ChainRpc {
     pub async fn eth_get_logs(&self, filter: Value) -> Result<Vec<Value>> {
         let result = self.call("eth_getLogs", json!([filter])).await?;
         Ok(result.as_array().cloned().unwrap_or_default())
-    }
-
-    pub async fn eth_get_transaction_count(&self, address: &str, block: &str) -> Result<u64> {
-        let result = self
-            .call("eth_getTransactionCount", json!([address, block]))
-            .await?;
-        hex_to_u64(&result).context("invalid eth_getTransactionCount result")
-    }
-
-    pub async fn eth_fee_history(
-        &self,
-        block_count: u64,
-        newest_block: &str,
-        reward_percentiles: Vec<f64>,
-    ) -> Result<Value> {
-        self.call(
-            "eth_feeHistory",
-            json!([
-                format!("0x{block_count:x}"),
-                newest_block,
-                reward_percentiles
-            ]),
-        )
-        .await
     }
 
     pub async fn eth_get_storage_at(
@@ -338,27 +368,6 @@ impl ChainRpc {
             json!([tx_hash, {"tracer": "callTracer"}]),
         )
         .await
-    }
-
-    /// Trace a transaction with the callTracer; `None` when tracing is
-    /// unavailable. Not on the index path — kept for debugging.
-    pub async fn debug_trace_transaction(&self, tx_hash: &str) -> Option<Value> {
-        self.try_debug_trace_transaction(tx_hash)
-            .await
-            .ok()
-            .filter(|v| !v.is_null())
-    }
-
-    /// Trace all transactions in a block with the callTracer. Not on the index
-    /// path — kept for debugging.
-    pub async fn debug_trace_block(&self, block_num: u64) -> Option<Value> {
-        self.call(
-            "debug_traceBlockByNumber",
-            json!([format!("0x{block_num:x}"), {"tracer": "callTracer"}]),
-        )
-        .await
-        .ok()
-        .filter(|v| !v.is_null())
     }
 }
 
@@ -445,21 +454,6 @@ pub fn str_field(value: &Value, key: &str) -> String {
         .to_string()
 }
 
-/// Resolve a block reference `"latest"`/number to a concrete height,
-/// falling back to the head.
-pub async fn resolve_block_ref(rpc: &ChainRpc, reference: &str) -> Result<Option<u64>> {
-    if reference == "latest" || reference == "pending" || reference == "earliest" {
-        return Ok(Some(rpc.eth_block_number().await?));
-    }
-    let s = reference.strip_prefix("0x").unwrap_or(reference);
-    match u64::from_str_radix(s, 16) {
-        Ok(n) => Ok(Some(n)),
-        Err(_) => {
-            bail!("invalid block reference: {reference}")
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -507,5 +501,118 @@ mod tests {
         assert_eq!(parse_int_any(&json!("")), 0);
         assert_eq!(parse_int_any(&json!("nonsense")), 0);
         assert_eq!(parse_int_any(&Value::Null), 0);
+    }
+
+    /// A node that answers every request with an empty JSON-RPC result and
+    /// records the `x-api-key` each request carried.
+    async fn key_recording_node() -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    ) {
+        use axum::{http::HeaderMap, routing::post, Json, Router};
+        use std::sync::{Arc, Mutex};
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = seen.clone();
+        let handler = move |headers: HeaderMap, Json(body): Json<Value>| {
+            let key = headers
+                .get("x-api-key")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            record.lock().unwrap_or_else(|e| e.into_inner()).push(key);
+            let answer =
+                |call: &Value| json!({"jsonrpc": "2.0", "id": call["id"], "result": "0x1"});
+            let reply = match &body {
+                Value::Array(calls) => Value::Array(calls.iter().map(answer).collect()),
+                call => answer(call),
+            };
+            async move { Json(reply) }
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, Router::new().route("/", post(handler))).await;
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// The key goes on every JSON-RPC request, single and batched, and stays
+    /// off the shared client the signature directory borrows.
+    #[tokio::test]
+    async fn the_api_key_rides_on_rpc_requests_only() {
+        let (url, seen) = key_recording_node().await;
+        let rpc = ChainRpc::new(&url)
+            .expect("rpc")
+            .with_api_key(Some(HeaderValue::from_static("s3cret")));
+
+        rpc.call("eth_blockNumber", json!([])).await.expect("call");
+        // Two calls: `batch_call` sends a lone call through `call`.
+        rpc.batch_call(vec![
+            ("eth_chainId".into(), json!([])),
+            ("eth_blockNumber".into(), json!([])),
+        ])
+        .await
+        .expect("batch");
+        rpc.clone()
+            .call("eth_blockNumber", json!([]))
+            .await
+            .expect("clone");
+        rpc.http_client()
+            .post(&url)
+            .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "x", "params": []}))
+            .send()
+            .await
+            .expect("plain");
+
+        let seen = seen.lock().unwrap().clone();
+        let key = Some("s3cret".to_string());
+        assert_eq!(seen, [key.clone(), key.clone(), key, None]);
+    }
+
+    #[tokio::test]
+    async fn no_api_key_sends_no_header() {
+        let (url, seen) = key_recording_node().await;
+        let rpc = ChainRpc::new(&url).expect("rpc");
+        rpc.call("eth_blockNumber", json!([])).await.expect("call");
+        assert_eq!(*seen.lock().unwrap(), [None]);
+    }
+
+    #[tokio::test]
+    async fn a_paced_client_spaces_batches_and_waits_out_a_429() {
+        use axum::response::IntoResponse;
+        use axum::{routing::post, Json, Router};
+        use std::sync::atomic::AtomicBool;
+
+        // Turns the first batch away for a second, then answers.
+        let turned_away = Arc::new(AtomicBool::new(false));
+        let handler = move |Json(body): Json<Value>| async move {
+            if !turned_away.swap(true, Ordering::SeqCst) {
+                return (StatusCode::TOO_MANY_REQUESTS, [(RETRY_AFTER, "1")]).into_response();
+            }
+            let answers = body
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| json!({"jsonrpc": "2.0", "id": c["id"], "result": c["method"]}));
+            Json(Value::Array(answers.collect())).into_response()
+        };
+        let rpc = ChainRpc::test_node(Router::new().route("/", post(handler)))
+            .await
+            .paced(Duration::from_millis(300));
+        let started = Instant::now();
+        // The second batch goes through a copy, which keeps the pace.
+        for rpc in [rpc.clone(), rpc.with_own_connections().unwrap()] {
+            let results = rpc
+                .batch_call(vec![
+                    ("eth_chainId".into(), json!([])),
+                    ("eth_blockNumber".into(), json!([])),
+                ])
+                .await;
+            assert_eq!(results.unwrap()[1].as_ref().unwrap(), "eth_blockNumber");
+        }
+        // A second for the 429, then one gap.
+        assert!(started.elapsed() >= Duration::from_millis(1300));
     }
 }

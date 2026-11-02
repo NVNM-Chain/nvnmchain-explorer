@@ -17,5 +17,3 @@ services:
         value: /data/explorer.db
       - key: RUST_LOG
         value: nvnmchain_explorer=info
-      - key: NATIVE_SYMBOL
-        value: OM

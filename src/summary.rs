@@ -23,7 +23,7 @@ use crate::tempo_address::is_virtual;
 use crate::tokens::format_token_amount;
 
 /// `0x1234…5678` — long enough to recognise, short enough to read in a line.
-fn truncate(value: &str) -> String {
+pub(crate) fn truncate(value: &str) -> String {
     truncate_hash(value, 4, 4)
 }
 
@@ -721,6 +721,12 @@ static PHRASES: &[Phrase] = &[
         &[Slot::Word("to"), Slot::Account("newOwner")],
     ),
     phrase(
+        "Upgraded(address)",
+        "upgraded",
+        "Upgrade",
+        &[Slot::Word("to"), Slot::Account("implementation")],
+    ),
+    phrase(
         "Initialized(uint64)",
         "initialized",
         "Initialize",
@@ -853,6 +859,168 @@ static PHRASES: &[Phrase] = &[
         ("Registry", Slot::Value("registryId")),
         ("Record", Slot::Value("checksum")),
     ]),
+    // ---- Zone factory (0x5AF2…) ----------------------------------------
+    phrase(
+        "ZoneCreated(uint32,address,address,bool,bool,address,address[],uint8,address)",
+        "zone created",
+        "Create Zone",
+        &[
+            Slot::Value("zoneId"),
+            Slot::Word("at"),
+            Slot::Account("portal"),
+        ],
+    )
+    .notes(&[
+        ("Admin", Slot::Account("admin")),
+        ("Token", Slot::Token("initialToken")),
+    ]),
+    // ---- Zone portal (0x5AD0… + zone id) -------------------------------
+    phrase(
+        "SequencerSetUpdated(uint64,uint8,address[])",
+        "sequencer set updated",
+        "Update Sequencer Set",
+        &[Slot::Word("with threshold"), Slot::Value("threshold")],
+    )
+    .notes(&[("Nonce", Slot::Value("nonce"))]),
+    phrase(
+        "TokenEnabled(address,string,string,string)",
+        "token enabled",
+        "Enable Token",
+        &[Slot::Token("token")],
+    ),
+    phrase(
+        "RoleUpdated(address,uint8,uint8)",
+        "role updated",
+        "Update Role",
+        &[Slot::Word("for"), Slot::Account("account")],
+    )
+    .notes(&[("From", Slot::Value("prev")), ("To", Slot::Value("next"))]),
+    phrase(
+        "EnforcementModesUpdated(bool,bool)",
+        "enforcement modes updated",
+        "Update Enforcement Modes",
+        &[],
+    )
+    .notes(&[
+        ("Access mode", Slot::Value("accessMode")),
+        ("Gateway mode", Slot::Value("gatewayMode")),
+    ]),
+    phrase(
+        "LeaderUpdated(address,address,uint64,uint64)",
+        "leader updated",
+        "Update Leader",
+        &[Slot::Word("to"), Slot::Account("newLeader")],
+    )
+    .notes(&[("Epoch", Slot::Value("leaderEpoch"))]),
+    // ---- Safe ----------------------------------------------------------
+    phrase(
+        "ProxyCreation(address,address)",
+        "multisig deployed",
+        "Deploy Multisig",
+        &[Slot::Account("proxy")],
+    ),
+    phrase(
+        "SafeSetup(address,address[],uint256,address,address)",
+        "multisig set up",
+        "Set Up Multisig",
+        &[Slot::Word("with threshold"), Slot::Value("threshold")],
+    ),
+    phrase(
+        "SafeMultiSigTransaction(address,uint256,bytes,uint8,uint256,uint256,uint256,address,address,bytes,bytes)",
+        "multisig call",
+        "Multisig Call",
+        &[Slot::Word("to"), Slot::Account("to")],
+    ),
+    phrase(
+        "SafeModuleTransaction(address,address,uint256,bytes,uint8)",
+        "module call",
+        "Module Call",
+        &[Slot::Word("to"), Slot::Account("to")],
+    ),
+    phrase(
+        "ExecutionSuccess(bytes32,uint256)",
+        "multisig executed",
+        "Execute Multisig Transaction",
+        &[Slot::Hex("txHash")],
+    ),
+    phrase(
+        "ExecutionFailure(bytes32,uint256)",
+        "multisig reverted",
+        "Multisig Transaction Failed",
+        &[Slot::Hex("txHash")],
+    ),
+    phrase(
+        "ExecutionFromModuleSuccess(address)",
+        "module executed",
+        "Execute Module Transaction",
+        &[Slot::Word("from"), Slot::Account("module")],
+    ),
+    phrase(
+        "ExecutionFromModuleFailure(address)",
+        "module reverted",
+        "Module Transaction Failed",
+        &[Slot::Word("from"), Slot::Account("module")],
+    ),
+    phrase(
+        "ApproveHash(bytes32,address)",
+        "hash approved",
+        "Approve Hash",
+        &[Slot::Hex("approvedHash"), Slot::Word("by"), Slot::Account("owner")],
+    ),
+    phrase(
+        "SignMsg(bytes32)",
+        "message signed",
+        "Sign Message",
+        &[Slot::Hex("msgHash")],
+    ),
+    phrase(
+        "AddedOwner(address)",
+        "owner added",
+        "Add Owner",
+        &[Slot::Account("owner")],
+    ),
+    phrase(
+        "RemovedOwner(address)",
+        "owner removed",
+        "Remove Owner",
+        &[Slot::Account("owner")],
+    ),
+    phrase(
+        "ChangedThreshold(uint256)",
+        "threshold changed",
+        "Change Threshold",
+        &[Slot::Word("to"), Slot::Value("threshold")],
+    ),
+    phrase(
+        "EnabledModule(address)",
+        "module enabled",
+        "Enable Module",
+        &[Slot::Account("module")],
+    ),
+    phrase(
+        "DisabledModule(address)",
+        "module disabled",
+        "Disable Module",
+        &[Slot::Account("module")],
+    ),
+    phrase(
+        "ChangedFallbackHandler(address)",
+        "fallback handler changed",
+        "Change Fallback Handler",
+        &[Slot::Word("to"), Slot::Account("handler")],
+    ),
+    phrase(
+        "ChangedGuard(address)",
+        "guard changed",
+        "Change Guard",
+        &[Slot::Word("to"), Slot::Account("guard")],
+    ),
+    phrase(
+        "SafeReceived(address,uint256)",
+        "multisig funded",
+        "Receive",
+        &[Slot::Word("from"), Slot::Account("sender")],
+    ),
 ];
 
 // ---------------------------------------------------------------------------
@@ -897,6 +1065,8 @@ pub struct KnownEvent {
     pub details: Vec<(String, String)>,
     pub from: Option<String>,
     pub to: Option<String>,
+    /// The addresses the headline shows truncated, in its order, for a page to link.
+    pub accounts: Vec<String>,
     /// A TIP-20 transfer into the fee manager — the fee, not the payment.
     pub is_fee: bool,
     /// Position in the receipt's log list, so the UI can pair the two.
@@ -904,11 +1074,16 @@ pub struct KnownEvent {
 }
 
 /// Whether an event is worth leading with. Bookkeeping the chain does beside
-/// the actual work — a nonce bump, a key check — is not.
+/// the actual work — a nonce bump, a key check, a multisig announcing its call — is not.
 fn is_preferred(event: &KnownEvent) -> bool {
     !matches!(
         event.kind.as_str(),
-        "key authorized" | "key revoked" | "nonce incremented" | "access key spend"
+        "key authorized"
+            | "key revoked"
+            | "nonce incremented"
+            | "access key spend"
+            | "multisig call"
+            | "module call"
     )
 }
 
@@ -985,6 +1160,14 @@ fn known_event(
             .collect(),
         from: event.param("from").map(String::from),
         to: event.param("to").map(String::from),
+        accounts: definition
+            .slots
+            .iter()
+            .filter_map(|slot| match slot {
+                Slot::Account(name) => event.param(name).map(String::from),
+                _ => None,
+            })
+            .collect(),
         is_fee: false,
         log_index,
     };
@@ -1089,6 +1272,17 @@ fn same_address(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
 }
 
+/// A memo transfer emits `Transfer` then `TransferWithMemo` for one send; whether
+/// `event` and `next` are that pair. The second carries the note, so it is the one kept.
+fn restated_by(event: &DecodedEvent, next: &DecodedEvent) -> bool {
+    event.name.as_deref() == Some("Transfer")
+        && next.name.as_deref() == Some("TransferWithMemo")
+        && event.contract == next.contract
+        && ["from", "to", "amount"]
+            .iter()
+            .all(|param| event.param(param) == next.param(param))
+}
+
 /// Say what every log in a receipt did, in receipt order.
 pub fn known_events(
     events: &[DecodedEvent],
@@ -1098,6 +1292,7 @@ pub fn known_events(
     events
         .iter()
         .enumerate()
+        .filter(|(i, e)| !events.get(i + 1).is_some_and(|next| restated_by(e, next)))
         .filter_map(|(i, e)| known_event(e, i, tokens, sender))
         .collect()
 }
@@ -1112,6 +1307,8 @@ pub struct TxSummary {
     /// `success`, `failure`, or `neutral` — what the card is coloured by.
     pub tone: String,
     pub headline: String,
+    /// As [`KnownEvent::accounts`], for the headline.
+    pub accounts: Vec<String>,
     pub details: Vec<String>,
     /// The failure in words, when there was one.
     pub error: Option<String>,
@@ -1154,6 +1351,7 @@ pub fn build_summary(
         return TxSummary {
             tone: "success".into(),
             headline: "Transaction succeeded.".into(),
+            accounts: Vec::new(),
             details: vec!["No high-level events were detected for this transaction.".into()],
             error: None,
             raw_reason: None,
@@ -1164,6 +1362,7 @@ pub fn build_summary(
     TxSummary {
         tone: "success".into(),
         headline: format!("{}.", event.headline),
+        accounts: event.accounts.clone(),
         details: vec![format!(
             "{interpreted} interpreted event{} detected.",
             if interpreted == 1 { "" } else { "s" }
@@ -1236,6 +1435,7 @@ fn failure_summary(failure: &Failure, events: &[KnownEvent], tokens: &Tokens) ->
     TxSummary {
         tone: "failure".into(),
         headline: format!("{action}."),
+        accounts: Vec::new(),
         details,
         error,
         raw_reason,
@@ -1306,6 +1506,7 @@ fn insufficient_balance_summary(
     Some(TxSummary {
         tone: "failure".into(),
         headline: format!("Transfer failed: insufficient {label}.{amounts}"),
+        accounts: Vec::new(),
         details,
         error: Some(format!("insufficient {label}")),
         raw_reason: raw_reason.map(String::from),
@@ -1398,6 +1599,23 @@ mod tests {
         known_event(&decoded, 0, &token_map(), sender).expect("phrased")
     }
 
+    /// An upgrade names the implementation, and keeps it whole for a page to link.
+    #[test]
+    fn an_upgrade_names_its_implementation() {
+        let implementation = "0x63Ff0c732C26951034baD4e4EbD163a9eec5a927";
+        let event = say(
+            &json!({
+                "address": "0x0000000000000000000000000000000000000a00",
+                "topics": [keccak_hex(b"Upgraded(address)"), topic(implementation)],
+                "data": "0x",
+                "logIndex": "0x0",
+            }),
+            None,
+        );
+        assert_eq!(event.headline, "Upgrade to 0x63Ff…a927");
+        assert_eq!(event.accounts, [implementation]);
+    }
+
     /// The headline sentence the whole feature exists for.
     #[test]
     fn a_transfer_reads_as_a_sentence() {
@@ -1481,21 +1699,47 @@ mod tests {
         assert_eq!(revoked.kind, "revoke role");
     }
 
-    /// A memo rides along as a note, and a binary payload does not.
-    #[test]
-    fn a_memo_becomes_a_note() {
-        let mut memo_bytes = vec![0u8; 32];
-        memo_bytes[..7].copy_from_slice(b"invoice");
-        let log = json!({
+    /// The `TransferWithMemo` log a memo transfer emits after its `Transfer`.
+    fn memo_log(from: &str, to: &str, amount: u128, memo: &str) -> serde_json::Value {
+        let mut word = [0u8; 32];
+        word[..memo.len()].copy_from_slice(memo.as_bytes());
+        json!({
             "address": "0x20c0000000000000000000000000000000000000",
             "topics": [
                 crate::decoder::TRANSFER_WITH_MEMO_TOPIC.as_str(),
-                topic("0x2222222222222222222222222222222222222222"),
-                topic("0x1111111111111111111111111111111111111111"),
-                format!("0x{}", hex::encode(&memo_bytes)),
+                topic(from),
+                topic(to),
+                format!("0x{}", hex::encode(word)),
             ],
-            "data": format!("0x{:064x}", 1_000_000u128),
-        });
+            "data": format!("0x{amount:064x}"),
+        })
+    }
+
+    #[test]
+    fn a_memo_transfer_reads_once_with_its_note() {
+        let (from, to) = (
+            "0x2222222222222222222222222222222222222222",
+            "0x1111111111111111111111111111111111111111",
+        );
+        let logs = [
+            transfer_log(from, to, 1_000_000),
+            memo_log(from, to, 1_000_000, "invoice"),
+        ];
+        let events: Vec<_> = logs.iter().filter_map(decode_event).collect();
+        let known = known_events(&events, &token_map(), None);
+        assert_eq!(known.len(), 1);
+        assert_eq!(known[0].note.as_deref(), Some("invoice"));
+    }
+
+    /// A memo rides along as a note, and a binary payload does not.
+    #[test]
+    fn a_memo_becomes_a_note() {
+        let log = memo_log(
+            "0x2222222222222222222222222222222222222222",
+            "0x1111111111111111111111111111111111111111",
+            1_000_000,
+            "invoice",
+        );
         assert_eq!(say(&log, None).note.as_deref(), Some("invoice"));
     }
 

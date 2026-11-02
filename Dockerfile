@@ -16,6 +16,8 @@ COPY templates ./templates
 # Compiled in via include_str!; the runtime image does not need a copy.
 COPY abi ./abi
 COPY contracts/layout ./contracts/layout
+# After the dependency layer, so a new commit does not rebuild the dependencies.
+ARG GIT_SHA
 RUN cargo build --release --locked
 
 # stable (trixie) glibc >= whatever rust:1.97-slim ships, so the binary runs
@@ -29,7 +31,6 @@ COPY deploy/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 ENV DB_PATH=/data/explorer.db \
-    RUST_LOG=nvnmchain_explorer=info \
-    NATIVE_SYMBOL=OM
+    RUST_LOG=nvnmchain_explorer=info
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

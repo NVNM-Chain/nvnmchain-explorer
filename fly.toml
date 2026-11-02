@@ -13,7 +13,6 @@ primary_region = 'sin'
 [env]
   DB_PATH = '/data/explorer.db'
   INDEX_WS = '0'
-  NATIVE_SYMBOL = 'NVNM'
   RUST_LOG = 'nvnmchain_explorer=info'
 
 [[mounts]]

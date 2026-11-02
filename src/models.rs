@@ -78,6 +78,7 @@ pub struct Transaction {
     pub to_addr: Option<String>,
     pub status: i64,
     pub gas_used: i64,
+    /// The receipt's effective gas price, despite the name; the block has the base fee.
     pub base_fee: String,
     pub contract_address: Option<String>,
     pub fee_token: Option<String>,

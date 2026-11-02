@@ -1,6 +1,7 @@
-//! The anchoring pages, over a stub node that answers like the contract: 30 registries,
+//! The anchoring pages and API, over a stub node that answers like the contract: 30 registries,
 //! registry 1 with 27 records and its record 1 with 30 versions, so every listing pages.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use alloy_primitives::{B256, U256};
@@ -191,23 +192,29 @@ fn respond(request: &Value, registries: u64, indexing: bool) -> Value {
 
 /// A node with no name index: the search namespace is not registered.
 async fn stub_node(registries: u64) -> String {
-    node(registries, false).await
+    node(registries, false).await.0
 }
 
 /// A node started with `--anchoring.name-index`, which also answers the search.
 async fn stub_indexing_node(registries: u64) -> String {
-    node(registries, true).await
+    node(registries, true).await.0
 }
 
-async fn node(registries: u64, indexing: bool) -> String {
-    let handler = move |State(registries): State<u64>, Json(body): Json<Value>| async move {
-        Json(match body.as_array() {
-            Some(batch) => json!(batch
-                .iter()
-                .map(|r| respond(r, registries, indexing))
-                .collect::<Vec<_>>()),
-            None => respond(&body, registries, indexing),
-        })
+/// The node's URL, and how many HTTP requests it has answered.
+async fn node(registries: u64, indexing: bool) -> (String, Arc<AtomicUsize>) {
+    let requests = Arc::new(AtomicUsize::new(0));
+    let counted = requests.clone();
+    let handler = move |State(registries): State<u64>, Json(body): Json<Value>| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        async move {
+            Json(match body.as_array() {
+                Some(batch) => json!(batch
+                    .iter()
+                    .map(|r| respond(r, registries, indexing))
+                    .collect::<Vec<_>>()),
+                None => respond(&body, registries, indexing),
+            })
+        }
     };
     let app = Router::new()
         .route("/", post(handler))
@@ -215,7 +222,7 @@ async fn node(registries: u64, indexing: bool) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await });
-    format!("http://{addr}")
+    (format!("http://{addr}"), requests)
 }
 
 /// The explorer, reading `rpc_url`.
@@ -233,6 +240,7 @@ async fn serve(rpc_url: String) -> (tempfile::TempDir, String) {
         cfg,
         block_events: tokio::sync::broadcast::channel(16).0,
         stats: Arc::new(std::sync::RwLock::new(Value::Null)),
+        signatures: Default::default(),
         shutdown: tokio::sync::watch::channel(false).1,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -333,6 +341,30 @@ async fn what_does_not_exist_is_not_found() {
         "/anchoring/1/x",
     ] {
         assert_eq!(get(&base, path).await.0, 404, "{path}");
+    }
+}
+
+/// A page asks the node once for each step that needs an earlier answer: a page of records
+/// needs their count, and a page of versions the latest one.
+#[tokio::test]
+async fn a_page_asks_the_node_once_per_step() {
+    let (rpc, requests) = node(30, false).await;
+    let (_dir, base) = serve(rpc).await;
+    for (path, asked) in [
+        ("/anchoring", 1),
+        ("/anchoring/1", 2),
+        ("/anchoring/1/1", 2),
+        ("/api/v1/anchoring/registries/1", 1),
+        ("/api/v1/anchoring/registries/1/records", 2),
+        ("/api/v1/anchoring/registries/1/records/1", 1),
+    ] {
+        let before = requests.load(Ordering::SeqCst);
+        let status = reqwest::get(format!("{base}{path}"))
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, 200, "{path}");
+        assert_eq!(requests.load(Ordering::SeqCst) - before, asked, "{path}");
     }
 }
 
@@ -586,4 +618,53 @@ async fn backfill_narrows_to_the_node_cap_and_resumes_past_errors() {
     );
     // One dropped, six refused on the way down to 781 blocks, then three windows.
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 10);
+}
+
+async fn api(base: &str, path: &str) -> (u16, Value) {
+    let response = reqwest::get(format!("{base}/api/v1/anchoring{path}"))
+        .await
+        .unwrap();
+    (response.status().as_u16(), response.json().await.unwrap())
+}
+
+#[tokio::test]
+async fn the_api_serves_registries_records_and_versions() {
+    let (_dir, base) = serve(stub_node(30).await).await;
+    let (_, first) = api(&base, "/registries").await;
+    assert_eq!(
+        ids(&first["items"], "id"),
+        (6..=30).rev().collect::<Vec<_>>()
+    );
+    assert_eq!(first["next_page"], 2);
+    let (_, last) = api(&base, "/registries?page=2").await;
+    assert_eq!(ids(&last["items"], "id"), [5, 4, 3, 2, 1]);
+    assert_eq!(last["next_page"], Value::Null);
+
+    assert_eq!(api(&base, "/registries/1").await.1["name"], "reg-1");
+    let (_, records) = api(&base, "/registries/1/records?page=2").await;
+    assert_eq!(ids(&records["items"], "recordId"), [2, 1]);
+    assert_eq!(records["next_page"], Value::Null);
+
+    assert_eq!(api(&base, "/registries/1/records/1").await.1["index"], 30);
+    let (_, versions) = api(&base, "/registries/1/records/1/versions").await;
+    assert_eq!(
+        ids(&versions["items"], "index"),
+        (6..=30).rev().collect::<Vec<_>>()
+    );
+    assert_eq!(versions["next_page"], 2);
+
+    for path in [
+        "/registries/31",
+        "/registries/31/records",
+        "/registries/1/records/28",
+        "/registries/1/records/28/versions",
+    ] {
+        assert_eq!(api(&base, path).await.0, 404, "{path}");
+    }
+    let malformed = reqwest::get(format!("{base}/api/v1/anchoring/registries/x"))
+        .await
+        .unwrap();
+    assert_eq!(malformed.status(), 400);
+    let (_dir, unreachable) = serve("http://127.0.0.1:1".into()).await;
+    assert_eq!(api(&unreachable, "/registries").await.0, 502);
 }

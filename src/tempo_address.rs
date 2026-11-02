@@ -12,7 +12,7 @@
 use crate::decoder::checksum_address;
 
 /// The ten bytes that mark an address as virtual (TIP-1022).
-pub const VIRTUAL_MAGIC: [u8; 10] = [0xfd; 10];
+const VIRTUAL_MAGIC: [u8; 10] = [0xfd; 10];
 
 /// The two operator-chosen fields of a virtual address.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]

@@ -25,20 +25,20 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tower-http = { version = "0.6", features = ["cors"] }
 
-# Tempo tx types: RLP-decode the typed 0x76 transaction
-# (https://tempo.xyz/developers/docs/sdk/rust)
-tempo-primitives = { git = "https://github.com/tempoxyz/tempo", tag = "tempo-alloy@1.10.1" }
-# The chain's own contract bindings: every precompile interface as Solidity the
-# compiler checks, rather than ABI JSON vendored into this repo.
+# The chain's own crates: its tx types to RLP-decode the typed 0x76 transaction, and every
+# precompile interface as Solidity the compiler checks rather than ABI JSON vendored here.
+tempo-primitives = { git = "https://github.com/NVNM-Chain/nvnmchain-tempo", rev = "f55ca164df" }
 tempo-contracts = { git = "https://github.com/NVNM-Chain/nvnmchain-tempo", rev = "f55ca164df", default-features = false, features = ["std"] }
 alloy-eips = "2"
 alloy-json-abi = "1"
 alloy-primitives = "1"
 alloy-sol-types = "1"
 alloy-consensus = "2"
+dotenvy = "0.15"
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }
 
 [profile.release]
 lto = "thin"

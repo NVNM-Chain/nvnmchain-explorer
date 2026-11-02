@@ -150,6 +150,9 @@
             The chain reports the marker <span class="mono">{{ code.hex }}</span>.
         </div>
         {% else %}
+        {% if code.implementation %}
+        <div class="text-sm mb-2">{{ code.proxy }} proxy: calls run the code at {{ ui::copy_address(address=code.implementation, full=true) }}</div>
+        {% endif %}
         <div class="text-xs text-faint mb-2">{{ code.bytes | comma }} bytes {{ ui::copy(text=code.hex, label="Copy bytecode") }}</div>
         <pre class="text-xs mono pre-wrap" style="max-height: 24rem; overflow-y: auto;">{{ code.hex }}</pre>
         {% endif %}

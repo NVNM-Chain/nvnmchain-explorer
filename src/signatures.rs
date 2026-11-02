@@ -8,12 +8,13 @@
 //! slow one, or one an operator turned off all leave the bare selector.
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use serde_json::Value;
 
 use crate::config::{Settings, SIGNATURE_TTL_SECONDS};
-use crate::db::{self, Db};
+use crate::db;
 use crate::decoder::keccak256;
 
 /// A page view must not wait on a third party for a nicety.
@@ -23,11 +24,17 @@ const LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 /// worth a second round trip.
 const MAX_LOOKUP: usize = 32;
 
+/// Entries held before the cache starts over.
+const MAX_CACHED: usize = 10_000;
+
+/// What the directory said about each selector and when; a miss is an empty string.
+pub type Cache = Mutex<HashMap<String, (String, i64)>>;
+
 /// Signatures for `selectors`, from the cache and then the directory, keyed by
 /// lowercase selector. One the directory does not know is absent from the
 /// result and remembered as a miss.
 pub async fn resolve(
-    db: &Db,
+    cache: &Cache,
     settings: &Settings,
     client: &reqwest::Client,
     selectors: &[String],
@@ -39,8 +46,18 @@ pub async fn resolve(
         return HashMap::new();
     }
 
-    let fresh_after = db::now_ts() - SIGNATURE_TTL_SECONDS;
-    let cached = db::get_selector_names(db, &wanted, fresh_after);
+    let now = db::now_ts();
+    let cached: HashMap<String, String> = {
+        let held = cache.lock().unwrap_or_else(|e| e.into_inner());
+        wanted
+            .iter()
+            .filter_map(|selector| {
+                let (signature, asked) = held.get(selector)?;
+                (*asked >= now - SIGNATURE_TTL_SECONDS)
+                    .then(|| (selector.clone(), signature.clone()))
+            })
+            .collect()
+    };
     let missing: Vec<String> = wanted
         .iter()
         .filter(|s| !cached.contains_key(*s))
@@ -64,18 +81,14 @@ pub async fn resolve(
     let fetched = fetch(client, url, &missing).await;
     // Everything asked about is remembered, so a selector the directory does
     // not know is not asked about again until the entry goes stale.
-    let answers: Vec<(String, String)> = missing
-        .iter()
-        .map(|selector| {
-            (
-                selector.clone(),
-                fetched.get(selector).cloned().unwrap_or_default(),
-            )
-        })
-        .collect();
-    if let Err(e) = db::save_selector_names(db, &answers) {
-        tracing::warn!("caching selector names failed: {e:#}");
+    let mut held = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if held.len() >= MAX_CACHED {
+        held.clear();
     }
+    held.extend(missing.into_iter().map(|selector| {
+        let signature = fetched.get(&selector).cloned().unwrap_or_default();
+        (selector, (signature, now))
+    }));
     resolved.extend(fetched);
     resolved
 }

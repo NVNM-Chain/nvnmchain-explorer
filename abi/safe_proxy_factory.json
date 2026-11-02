@@ -1,0 +1,143 @@
+[
+ {
+  "type": "event",
+  "name": "ProxyCreation",
+  "inputs": [
+   {
+    "name": "proxy",
+    "type": "address",
+    "indexed": false
+   },
+   {
+    "name": "singleton",
+    "type": "address",
+    "indexed": false
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "function",
+  "name": "calculateCreateProxyWithNonceAddress",
+  "inputs": [
+   {
+    "name": "_singleton",
+    "type": "address"
+   },
+   {
+    "name": "initializer",
+    "type": "bytes"
+   },
+   {
+    "name": "saltNonce",
+    "type": "uint256"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "proxy",
+    "type": "address"
+   }
+  ],
+  "stateMutability": "nonpayable"
+ },
+ {
+  "type": "function",
+  "name": "createProxy",
+  "inputs": [
+   {
+    "name": "singleton",
+    "type": "address"
+   },
+   {
+    "name": "data",
+    "type": "bytes"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "proxy",
+    "type": "address"
+   }
+  ],
+  "stateMutability": "nonpayable"
+ },
+ {
+  "type": "function",
+  "name": "createProxyWithCallback",
+  "inputs": [
+   {
+    "name": "_singleton",
+    "type": "address"
+   },
+   {
+    "name": "initializer",
+    "type": "bytes"
+   },
+   {
+    "name": "saltNonce",
+    "type": "uint256"
+   },
+   {
+    "name": "callback",
+    "type": "address"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "proxy",
+    "type": "address"
+   }
+  ],
+  "stateMutability": "nonpayable"
+ },
+ {
+  "type": "function",
+  "name": "createProxyWithNonce",
+  "inputs": [
+   {
+    "name": "_singleton",
+    "type": "address"
+   },
+   {
+    "name": "initializer",
+    "type": "bytes"
+   },
+   {
+    "name": "saltNonce",
+    "type": "uint256"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "proxy",
+    "type": "address"
+   }
+  ],
+  "stateMutability": "nonpayable"
+ },
+ {
+  "type": "function",
+  "name": "proxyCreationCode",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "bytes"
+   }
+  ],
+  "stateMutability": "pure"
+ },
+ {
+  "type": "function",
+  "name": "proxyRuntimeCode",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "bytes"
+   }
+  ],
+  "stateMutability": "pure"
+ }
+]

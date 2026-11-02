@@ -5,6 +5,7 @@ use nvnmchain_explorer::decoder::{
 };
 use nvnmchain_explorer::models::{AnchoringEvent, BlockBundle, Transaction, TransferEvent};
 use nvnmchain_explorer::parse::{parse_block, parse_transaction};
+use nvnmchain_explorer::summary::{build_summary, known_events, Tokens};
 use nvnmchain_explorer::tokens::{
     decode_string_result, format_token_amount, has_control_chars, sanitize_metadata_text, TokenMeta,
 };
@@ -187,6 +188,46 @@ fn decode_the_anchoring_contract() {
     assert_eq!(event.name.as_deref(), Some("UpdateRecordStatus"));
     assert_eq!(event.params[0].value, checksum_address(&caller));
     assert_eq!(event.params[4].value, "Revoked");
+}
+
+#[test]
+fn decode_the_zone_contracts() {
+    let call = decode_function_call("0x89677d9e").expect("decoded");
+    assert_eq!(call.name.as_deref(), Some("createZone"));
+
+    let log = json!({
+        "address": "0x5ad0000000000000000000000000000000000003",
+        "topics": ["0x3e5479494e0a078954a7ff8437aeca3bf7519b51a2fc06b3821251147ff9c5f7"],
+        "data": format!("0x{:064x}{:064x}", 0, 1),
+        "logIndex": "0x0",
+    });
+    let event = decode_event(&log).expect("decoded event");
+    assert_eq!(event.name.as_deref(), Some("EnforcementModesUpdated"));
+    assert_eq!(event.params[1].value, "true");
+}
+
+/// Testnet transaction 0xb5f3b38398dfa524bba7d3da6e9bd3c131f77ffedf9655f9163c4cf2f974f2e8.
+#[test]
+fn a_multisig_transaction_leads_with_what_it_did() {
+    let logs: Vec<Value> =
+        serde_json::from_str(include_str!("../fixtures/safe_tx_logs.json")).expect("fixture");
+    let events: Vec<_> = logs.iter().filter_map(decode_event).collect();
+    let tokens = Tokens::new();
+    let known = known_events(&events, &tokens, None);
+    let said: Vec<_> = known.iter().map(|e| e.headline.as_str()).collect();
+    assert_eq!(
+        said,
+        [
+            "Multisig Call to 0x20C0…0000",
+            "Send 1000000 to 0xE3BE…e0d2",
+            "Execute Multisig Transaction 0xe420…b866",
+            "Pay Fee 201 to 0xfeEC…0000",
+        ]
+    );
+    assert_eq!(
+        build_summary(true, &known, None, &tokens).headline,
+        "Send 1000000 to 0xE3BE…e0d2."
+    );
 }
 
 #[test]
@@ -390,7 +431,7 @@ fn balance_changes_from_receipt() {
     assert_eq!(changes[1]["change"], "+500");
     assert_eq!(changes[0]["is_fee"], false);
 
-    let calls = extract_calls(&tx, &[]);
+    let calls = extract_calls(&tx, &Default::default(), &[]);
     assert!(calls.is_empty());
 }
 
@@ -797,22 +838,17 @@ fn duplicate_bundle_is_idempotent() {
     );
 
     // Balance deltas are applied once per transfer, not once per write.
-    let recipient: String = conn
-        .query_row(
+    let bytes = |a: &str| hex::decode(&a[2..]).unwrap();
+    let balance = |holder: &str| -> String {
+        conn.query_row(
             "SELECT balance FROM token_balances WHERE token_addr=?1 AND holder_addr=?2",
-            rusqlite::params![token, to],
+            rusqlite::params![bytes(&token), bytes(holder)],
             |r| r.get(0),
         )
-        .expect("recipient balance");
-    assert_eq!(recipient, "100", "balance must not be double-applied");
-    let sender: String = conn
-        .query_row(
-            "SELECT balance FROM token_balances WHERE token_addr=?1 AND holder_addr=?2",
-            rusqlite::params![token, from],
-            |r| r.get(0),
-        )
-        .expect("sender balance");
-    assert_eq!(sender, "-100", "sender delta applied exactly once");
+        .expect("balance")
+    };
+    assert_eq!(balance(&to), "100", "balance must not be double-applied");
+    assert_eq!(balance(&from), "-100", "sender delta applied exactly once");
 }
 
 /// An anchoring write reads back on its registry, newest first and the caller

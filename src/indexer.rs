@@ -9,23 +9,23 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::RangeInclusive;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 
 use crate::config::Settings;
 use crate::contracts::RESERVED_TOKENS;
 use crate::db::{self, Db};
-use crate::decoder::{checksum_address, decode_event, DecodedEvent};
+use crate::decoder::{checksum_address, decode_event, DecodedEvent, TRANSFER_TOPIC};
 use crate::models::{AnchoringEvent, BlockBundle, Transaction, TransferEvent};
 use crate::parse::{parse_block, parse_transaction};
-use crate::rpc::ChainRpc;
+use crate::rpc::{ChainRpc, RpcError};
 use crate::summary::ZERO_ADDRESS;
 use crate::tokens::{fetch_token_metadata, has_control_chars};
 
@@ -114,7 +114,6 @@ fn assemble_bundle(raw_block: &Value, receipts: Option<&Value>) -> BlockBundle {
             continue;
         }
         let mut tx = parse_transaction(tx_data, &block);
-        tx.timestamp = block.timestamp;
         // Re-encode the RPC object with the official tempo primitives; the
         // block already carries the signed tx, so no extra per-tx RPC. Read in
         // place: a copy of every transaction object per block adds up.
@@ -146,6 +145,8 @@ fn assemble_bundle(raw_block: &Value, receipts: Option<&Value>) -> BlockBundle {
 
 /// Fetch `nums` in one HTTP request of `eth_getBlockByNumber`, then a second
 /// request of `eth_getBlockReceipts` only for blocks that have transactions.
+/// A range the node answers with one error, as reth does past its response size cap, is fetched
+/// in halves; a request that fails outright is not retried.
 async fn fetch_raw_blocks(
     rpc: &ChainRpc,
     nums: RangeInclusive<u64>,
@@ -162,7 +163,17 @@ async fn fetch_raw_blocks(
             )
         })
         .collect();
-    let results = rpc.batch_call(calls).await?;
+    let results = match rpc.batch_call(calls).await {
+        Err(e) if e.is::<RpcError>() && nums.start() < nums.end() => {
+            let (from, to) = nums.into_inner();
+            let mid = from + (to - from) / 2;
+            info!("blocks {from}..={to} refused ({e}); fetching in halves");
+            let mut blocks = Box::pin(fetch_raw_blocks(rpc, from..=mid)).await?;
+            blocks.extend(Box::pin(fetch_raw_blocks(rpc, mid + 1..=to)).await?);
+            return Ok(blocks);
+        }
+        results => results?,
+    };
 
     let mut blocks = Vec::with_capacity(results.len());
     let mut need_receipts = Vec::new();
@@ -253,7 +264,8 @@ fn without_missing_receipts(blocks: Vec<(Value, Option<Value>)>) -> Vec<(Value, 
         .collect()
 }
 
-async fn fetch_block_bundles(
+/// The bundles for `nums`; tokens in `known_tokens` are not described again.
+pub async fn fetch_block_bundles(
     rpc: &ChainRpc,
     known_tokens: Arc<Mutex<HashSet<String>>>,
     nums: RangeInclusive<u64>,
@@ -308,26 +320,15 @@ async fn attach_token_metadata(
         return;
     }
 
-    let mut set = tokio::task::JoinSet::new();
-    for addr in wanted {
-        let rpc = rpc.clone();
-        set.spawn(async move {
-            let meta = fetch_token_metadata(&rpc, &addr).await;
-            (addr, meta)
-        });
-    }
-    let mut metas = HashMap::new();
-    while let Some(res) = set.join_next().await {
-        match res {
-            Ok((_, Ok(meta))) => {
-                metas.insert(meta.address.clone(), meta);
-            }
-            // Nothing stored and nothing remembered, so the next block that
-            // mentions the token asks again.
-            Ok((addr, Err(e))) => warn!("token metadata for {addr} unavailable: {e:#}"),
-            Err(e) => warn!("token metadata task failed: {e:#}"),
+    let metas: HashMap<_, _> = match fetch_token_metadata(rpc, wanted).await {
+        Ok(metas) => metas.into_iter().map(|m| (m.address.clone(), m)).collect(),
+        // Nothing stored and nothing remembered, so the next block that
+        // mentions a token asks again.
+        Err(e) => {
+            warn!("token metadata unavailable: {e:#}");
+            return;
         }
-    }
+    };
     known_tokens
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -419,11 +420,21 @@ fn index_log(
     anchoring: &mut Vec<AnchoringEvent>,
 ) {
     let emitter = log.get("address").and_then(Value::as_str).unwrap_or("");
+    let topic0 = log
+        .pointer("/topics/0")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    // Not `TransferWithMemo`: a memo transfer emits it beside its `Transfer`.
+    let is_transfer = topic0.eq_ignore_ascii_case(TRANSFER_TOPIC.as_str());
+    // Only the contract's own logs: any contract may emit under the same signature.
+    let is_anchoring = emitter.eq_ignore_ascii_case(crate::anchoring::ADDRESS);
+    if !is_transfer && !is_anchoring {
+        return;
+    }
     let Some(decoded) = decode_event(log) else {
         return;
     };
-    // Only the contract's own logs: any contract may emit under the same signature.
-    if emitter.eq_ignore_ascii_case(crate::anchoring::ADDRESS) {
+    if is_anchoring {
         anchoring.extend(anchoring_event(
             &decoded,
             &tx.hash,
@@ -433,10 +444,7 @@ fn index_log(
         ));
     }
     // Transfers, so the address and token transfer tabs have data.
-    if !matches!(
-        decoded.name.as_deref(),
-        Some("Transfer") | Some("TransferWithMemo")
-    ) {
+    if !is_transfer {
         return;
     }
     let from = decoded.param("from").unwrap_or_default();
@@ -626,34 +634,16 @@ async fn repair_token_metadata(rpc: &ChainRpc, db: &Db) -> Result<()> {
         return Ok(());
     }
     info!("repairing {} token metadata row(s)", stale.len());
-    // Fetched together, the way a block's new tokens are: every row here is one
-    // round trip, and a database that needs repairing tends to need a lot of it.
-    let mut set = tokio::task::JoinSet::new();
-    for addr in stale {
-        let rpc = rpc.clone();
-        set.spawn(async move { fetch_token_metadata(&rpc, &addr).await });
+    let (empty, repaired): (Vec<_>, Vec<_>) = fetch_token_metadata(rpc, &stale)
+        .await?
+        .into_iter()
+        .partition(|meta| meta.name.is_empty() && meta.symbol.is_empty());
+    // A token that answers to neither view has nothing to repair the row with;
+    // leave it for the next start rather than blanking it.
+    for meta in empty {
+        warn!("nothing to repair {} with; leaving the row", meta.address)
     }
-    while let Some(res) = set.join_next().await {
-        match res {
-            // A token that answers to neither view has nothing to repair the
-            // row with; leave it for the next start rather than blanking it.
-            Ok(Ok(meta)) if meta.name.is_empty() && meta.symbol.is_empty() => {
-                warn!("nothing to repair {} with; leaving the row", meta.address)
-            }
-            // Written as they arrive: the writes take the lock, so they queue anyway.
-            Ok(Ok(meta)) => {
-                if let Err(e) = db::save_token_metadata(db, &meta) {
-                    warn!(
-                        "failed to repair token metadata for {}: {e:#}",
-                        meta.address
-                    );
-                }
-            }
-            Ok(Err(e)) => warn!("token metadata repair skipped: {e:#}"),
-            Err(e) => warn!("token metadata repair task failed: {e:#}"),
-        }
-    }
-    Ok(())
+    db::save_token_metadata(db, &repaired)
 }
 
 /// Bring a database written by an older build back in line with what the read
@@ -707,6 +697,8 @@ struct Indexer {
     bundle_tx: mpsc::Sender<BlockBundle>,
     shutdown: watch::Receiver<bool>,
     tip_lag: Arc<AtomicU64>,
+    /// The newest head the node announced; the stats recompute stores it.
+    chain_head: Arc<AtomicU64>,
 }
 
 impl Indexer {
@@ -753,18 +745,6 @@ impl Indexer {
         }
         out.sort_by_key(|b| b.block.number);
         out
-    }
-
-    /// `fetch_range` from `from`, cut at the first block that did not come back. What lies
-    /// above the hole is dropped and fetched again with it; nothing steps over a hole,
-    /// since neither loop ever comes back for one.
-    async fn fetch_from(&self, from: u64, to: u64) -> Vec<BlockBundle> {
-        contiguous_from(self.fetch_range(from, to).await, from)
-    }
-
-    /// `fetch_range` up to `to`, cut at the first block below it that did not come back.
-    async fn fetch_down_to(&self, from: u64, to: u64) -> Vec<BlockBundle> {
-        contiguous_down_to(self.fetch_range(from, to).await, to)
     }
 
     async fn send_bundles(&self, bundles: impl IntoIterator<Item = BlockBundle>) -> bool {
@@ -832,7 +812,7 @@ async fn wait_for_seed(db: &Db) -> u64 {
     }
 }
 
-async fn forward_loop(mut ix: Indexer, block_events: broadcast::Sender<Value>) {
+async fn forward_loop(mut ix: Indexer) {
     let (head_tx, mut head_rx) = mpsc::channel::<u64>(256);
     tokio::spawn(crate::ws::head_watcher(
         ix.rpc.clone(),
@@ -855,7 +835,7 @@ async fn forward_loop(mut ix: Indexer, block_events: broadcast::Sender<Value>) {
         // A fast head feed delivers every block; fold queued heads into one
         // range so we fetch a batch instead of one HTTP request per block.
         let mut head = drain_heads(&mut head_rx, head);
-        db::set_chain_head(&ix.db, head as i64);
+        ix.chain_head.store(head, Ordering::Relaxed);
 
         if sent == 0 && head > 0 {
             sent = wait_for_seed(&ix.db).await;
@@ -873,10 +853,11 @@ async fn forward_loop(mut ix: Indexer, block_events: broadcast::Sender<Value>) {
                 return;
             }
             head = drain_heads(&mut head_rx, head);
-            db::set_chain_head(&ix.db, head as i64);
+            ix.chain_head.store(head, Ordering::Relaxed);
             let end = sent.saturating_add(ix.cfg.batch).min(head);
             ix.set_tip_lag(head.saturating_sub(sent));
-            let bundles = ix.fetch_from(sent + 1, end).await;
+            // Cut at the first hole: this loop never comes back for one.
+            let bundles = contiguous_from(ix.fetch_range(sent + 1, end).await, sent + 1);
             // Nothing past `sent` came back: the fetch failed, or the node has
             // not caught up with the head it announced. Ask again after a
             // moment; stepping over the block would leave a hole for good.
@@ -887,15 +868,6 @@ async fn forward_loop(mut ix: Indexer, block_events: broadcast::Sender<Value>) {
                 }
                 continue;
             };
-            // Live feed is tip-only and in number order: concurrent fetches
-            // complete out of order, and backfill must not reach viewers.
-            for b in &bundles {
-                let _ = block_events.send(crate::models::block_event_json(
-                    &b.block,
-                    &b.txs,
-                    crate::models::STREAM_TX_CAP,
-                ));
-            }
             if !ix.send_bundles(bundles).await {
                 return;
             }
@@ -950,7 +922,7 @@ async fn backfill_loop(mut ix: Indexer) {
         let start = target.saturating_sub(ix.cfg.batch).max(1);
         // Cut at the first hole below the target: the frontier only descends,
         // so a block left above it would never be fetched again.
-        let bundles = ix.fetch_down_to(start, target - 1).await;
+        let bundles = contiguous_down_to(ix.fetch_range(start, target - 1).await, target - 1);
         if bundles.is_empty() {
             consecutive_failures += 1;
             let backoff = Duration::from_millis(200 * consecutive_failures.min(10) as u64);
@@ -971,30 +943,60 @@ async fn backfill_loop(mut ix: Indexer) {
     }
 }
 
+/// How long the writer waits before trying a failed write again.
+const WRITE_RETRY: Duration = Duration::from_secs(5);
+
+/// Persist what the fetch loops send, retrying a failed write: the loops never
+/// come back for a batch.
+async fn write_loop(
+    db: Db,
+    mut bundle_rx: mpsc::Receiver<BlockBundle>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    // Bundles one commit may carry. A writer that keeps up sees an empty queue
+    // and commits per block; batching engages only once it falls behind.
+    const MAX_BATCH: usize = 64;
+
+    while let Some(bundle) = bundle_rx.recv().await {
+        // On shutdown, stop draining the queue: in-flight bundles are
+        // dropped and re-fetched on the next start.
+        if *shutdown.borrow() {
+            break;
+        }
+        // Fold in whatever is already queued; `try_recv` never waits, so
+        // this adds no latency.
+        let mut batch = vec![bundle];
+        while batch.len() < MAX_BATCH {
+            let Ok(next) = bundle_rx.try_recv() else {
+                break;
+            };
+            batch.push(next);
+        }
+        while let Err(e) = db::save_block_bundles(&db, &batch) {
+            let (first, last) = (batch[0].block.number, batch[batch.len() - 1].block.number);
+            tracing::error!("blocks {first}..={last} not written, retrying: {e:#}");
+            if sleep_or_shutdown(&mut shutdown, WRITE_RETRY).await {
+                return;
+            }
+        }
+    }
+}
+
 /// Run the indexer: one serialized DB writer plus forward and backfill loops.
-/// Newly written blocks are broadcast on `block_events` for live viewers.
 pub async fn run_forever(
     rpc: ChainRpc,
     db: Db,
     cfg: IndexerConfig,
-    block_events: broadcast::Sender<Value>,
-    stats: Arc<RwLock<Value>>,
     shutdown: watch::Receiver<bool>,
 ) {
     let stats_interval = cfg.stats_interval;
-    let stats_db = db.clone();
-    let stats_events = block_events.clone();
-    let stats_shutdown = shutdown.clone();
-    tokio::spawn(async move {
-        stats_loop(
-            stats_db,
-            stats,
-            stats_events,
-            stats_interval,
-            stats_shutdown,
-        )
-        .await
-    });
+    let chain_head = Arc::new(AtomicU64::new(0));
+    tokio::spawn(stats_loop(
+        db.clone(),
+        stats_interval,
+        chain_head.clone(),
+        shutdown.clone(),
+    ));
 
     tokio::spawn(genesis_loop(
         rpc.clone(),
@@ -1028,50 +1030,8 @@ pub async fn run_forever(
         }
     });
 
-    let (bundle_tx, mut bundle_rx) = mpsc::channel::<BlockBundle>(1024);
-    let writer_db = db.clone();
-    let writer_shutdown = shutdown.clone();
-    // The writer only persists. The forward loop streams what it fetched, in
-    // number order, before handing it here: concurrent fetches complete out
-    // of order, so the writer could not emit gaplessly, and backfill must not
-    // reach the live feed at all. A viewer can see a block a moment before it
-    // is queryable, while the writer commits it.
-    // How many queued bundles may share one commit. Only bounds how much one
-    // transaction holds: a writer that is keeping up sees an empty queue and
-    // commits per block; batching engages only once it falls behind.
-    const MAX_BATCH: usize = 64;
-
-    let writer = tokio::spawn(async move {
-        while let Some(bundle) = bundle_rx.recv().await {
-            // On shutdown, stop draining the queue: in-flight bundles are
-            // dropped and re-fetched on the next start.
-            if *writer_shutdown.borrow() {
-                break;
-            }
-            // Fold in whatever is already queued; `try_recv` never waits, so
-            // this adds no latency.
-            let mut batch = vec![bundle];
-            while batch.len() < MAX_BATCH {
-                let Ok(next) = bundle_rx.try_recv() else {
-                    break;
-                };
-                batch.push(next);
-            }
-            if let Err(e) = db::save_block_bundles(&writer_db, &batch) {
-                // One bad bundle failed the whole batch; write the rest on
-                // their own so one block is lost rather than sixty-four.
-                let (first, last) = (batch[0].block.number, batch[batch.len() - 1].block.number);
-                warn!(
-                    "db write failed for blocks {first}..={last}: {e:#}; writing them one by one"
-                );
-                for bundle in &batch {
-                    if let Err(e) = db::save_block_bundle(&writer_db, bundle) {
-                        tracing::error!("block {} not written: {e:#}", bundle.block.number);
-                    }
-                }
-            }
-        }
-    });
+    let (bundle_tx, bundle_rx) = mpsc::channel::<BlockBundle>(1024);
+    let writer = tokio::spawn(write_loop(db.clone(), bundle_rx, shutdown.clone()));
 
     let ix = Indexer {
         rpc,
@@ -1081,8 +1041,9 @@ pub async fn run_forever(
         bundle_tx: bundle_tx.clone(),
         shutdown,
         tip_lag: Arc::new(AtomicU64::new(0)),
+        chain_head,
     };
-    let forward = tokio::spawn(forward_loop(ix.clone(), block_events));
+    let forward = tokio::spawn(forward_loop(ix.clone()));
     let backfill = tokio::spawn(backfill_loop(ix));
     drop(bundle_tx);
 
@@ -1129,24 +1090,16 @@ async fn add_genesis_balances(rpc: &ChainRpc, db: &Db) -> Result<()> {
 /// the web layer never has to scan history at request time.
 async fn stats_loop(
     db: Db,
-    cell: Arc<RwLock<Value>>,
-    events: broadcast::Sender<Value>,
     interval: Duration,
+    chain_head: Arc<AtomicU64>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
         if *shutdown.borrow() {
             break;
         }
-        match compute_and_store_stats(&db) {
-            Ok(stats) => {
-                *cell.write().unwrap_or_else(|e| e.into_inner()) = stats.clone();
-                // Live viewers get the refresh too, tagged the way block
-                // payloads are. Droppable: anyone who misses one is corrected
-                // by the next tick.
-                let _ = events.send(json!({ "type": "stats", "stats": stats }));
-            }
-            Err(e) => warn!("stats recompute failed: {e:#}"),
+        if let Err(e) = compute_and_store_stats(&db, chain_head.load(Ordering::Relaxed)) {
+            warn!("stats recompute failed: {e:#}");
         }
         if sleep_or_shutdown(&mut shutdown, interval).await {
             break;
@@ -1154,7 +1107,10 @@ async fn stats_loop(
     }
 }
 
-fn compute_and_store_stats(db: &Db) -> Result<Value> {
+/// Minutes of activity the home page charts and averages.
+const CHART_MINUTES: usize = 60;
+
+fn compute_and_store_stats(db: &Db, head: u64) -> Result<Value> {
     let conn = db::lock(db);
     let now = db::now_ts();
 
@@ -1175,64 +1131,49 @@ fn compute_and_store_stats(db: &Db) -> Result<Value> {
         |r| r.get(0),
     )?;
 
-    // Rolling window over the newest blocks (cheap PK scan, no history sweep).
-    // Timestamps are ms-precision (`timestamp_ms`); the chain produces blocks
-    // faster than once per second, so second-granularity timestamps would
-    // quantize the block time to 1s.
-    let window: i64 = 100;
-    let (min_ms, max_ms, tx_sum, gas_sum, gas_den, n): (i64, i64, i64, f64, f64, i64) = conn
-        .query_row(
-            "SELECT MIN(timestamp_ms), MAX(timestamp_ms), SUM(tx_count),
-                    SUM(CASE WHEN gas_limit > 0 THEN gas_used * 1.0 / gas_limit ELSE 0 END),
-                    SUM(CASE WHEN gas_limit > 0 THEN 1 ELSE 0 END),
-                    COUNT(*)
-             FROM (SELECT timestamp_ms, tx_count, gas_used, gas_limit
-                   FROM blocks ORDER BY number DESC LIMIT ?1)",
-            params![window],
-            |r| {
-                Ok((
-                    r.get::<_, Option<i64>>(0)?.unwrap_or(0),
-                    r.get::<_, Option<i64>>(1)?.unwrap_or(0),
-                    r.get::<_, Option<i64>>(2)?.unwrap_or(0),
-                    r.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
-                    r.get::<_, Option<f64>>(4)?.unwrap_or(0.0),
-                    r.get::<_, Option<i64>>(5)?.unwrap_or(0),
-                ))
-            },
-        )
-        .unwrap_or((0, 0, 0, 0.0, 0.0, 0));
-
-    let span_ms = (max_ms - min_ms).max(1) as f64;
-    let avg_block_time_ms = if n > 1 { span_ms / (n - 1) as f64 } else { 0.0 };
-    let tps = if span_ms > 0.0 {
-        tx_sum as f64 / span_ms * 1000.0
-    } else {
-        0.0
-    };
-    let gas_util_pct = if gas_den > 0.0 {
-        gas_sum / gas_den * 100.0
-    } else {
-        0.0
-    };
     let latest_block = conn.query_row("SELECT MAX(number) FROM blocks", [], |r| {
         r.get::<_, Option<i64>>(0)
     })?;
 
     // Index progress, so the home page and the stream never recount blocks.
-    // Read through `conn`: a helper taking `&Db` would deadlock on the
-    // connection lock this function already holds.
-    let chain_head: i64 = conn
-        .query_row("SELECT value FROM kv WHERE key='chain_head'", [], |r| {
-            r.get::<_, String>(0)
-        })
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+    // Until the first head arrives, the newest indexed block stands in.
+    let chain_head = (head as i64).max(latest_block.unwrap_or(0));
     let index_pct = if chain_head > 0 {
         (total_blocks as f64 / chain_head as f64 * 100.0).clamp(0.0, 100.0)
     } else {
         0.0
     };
+
+    // Each minute of the hour before the newest block, oldest first: the charts
+    // plot it and the tiles average it. A lagging index still has data.
+    let mut tx_per_minute = vec![0_i64; CHART_MINUTES];
+    let mut gas_per_minute = vec![0_i64; CHART_MINUTES];
+    let (mut blocks, mut gas_limit, mut first_ms, mut last_ms) = (0, 0, i64::MAX, 0);
+    let mut minutes = conn.prepare(
+        "SELECT (timestamp - start - 1) / 60, SUM(tx_count), SUM(gas_used),
+                COUNT(*), SUM(gas_limit), MIN(timestamp_ms), MAX(timestamp_ms)
+         FROM blocks, (SELECT MAX(timestamp) - ?1 AS start FROM blocks)
+         WHERE timestamp > start GROUP BY 1",
+    )?;
+    let mut rows = minutes.query(params![60 * CHART_MINUTES as i64])?;
+    while let Some(r) = rows.next()? {
+        let minute: usize = r.get(0)?;
+        tx_per_minute[minute] = r.get(1)?;
+        gas_per_minute[minute] = r.get(2)?;
+        blocks += r.get::<_, i64>(3)?;
+        gas_limit += r.get::<_, i64>(4)?;
+        first_ms = first_ms.min(r.get(5)?);
+        last_ms = last_ms.max(r.get(6)?);
+    }
+    // Millisecond timestamps, since sub-second blocks share a whole second.
+    let span_ms = (last_ms - first_ms).max(0) as f64;
+    let ratio = |n: f64, d: f64| if d > 0.0 { n / d } else { 0.0 };
+    let avg_block_time_ms = ratio(span_ms, (blocks - 1) as f64);
+    let tps = ratio(tx_per_minute.iter().sum::<i64>() as f64 * 1000.0, span_ms);
+    let gas_util_pct = ratio(
+        gas_per_minute.iter().sum::<i64>() as f64 * 100.0,
+        gas_limit as f64,
+    );
 
     let stats = serde_json::json!({
         "latest_block": latest_block,
@@ -1246,6 +1187,8 @@ fn compute_and_store_stats(db: &Db) -> Result<Value> {
         "gas_util_pct": gas_util_pct,
         "chain_head": chain_head,
         "index_pct": index_pct,
+        "tx_per_minute": tx_per_minute,
+        "gas_per_minute": gas_per_minute,
         "updated_at": now,
     });
     // Still written to kv: it seeds the in-memory copy across a restart.
@@ -1257,6 +1200,98 @@ fn compute_and_store_stats(db: &Db) -> Result<Value> {
 mod tests {
     use super::*;
     use crate::decoder::TRANSFER_TOPIC;
+
+    /// Each block counts in the minute it falls in, counted back from the newest.
+    #[test]
+    fn the_hour_before_the_newest_block_is_charted_and_averaged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stats.db");
+        let db: Db = Arc::new(Mutex::new(db::init_db(path.to_str().unwrap()).unwrap()));
+        let end = 1_700_000_000;
+        let blocks = [
+            (1, end - 3600, 9),
+            (2, end - 3599, 1),
+            (3, end - 61, 2),
+            (4, end - 30, 3),
+            (5, end, 4),
+        ];
+        for (number, timestamp, txs) in blocks {
+            db::lock(&db)
+                .execute(
+                    "INSERT INTO blocks (number, hash, parent_hash, timestamp, timestamp_ms,
+                                         tx_count, gas_used, gas_limit)
+                     VALUES (?1, ?1, ?1, ?2, ?2 * 1000, ?3, ?3 * 10, 1000)",
+                    params![number, timestamp, txs],
+                )
+                .unwrap();
+        }
+
+        let stats = compute_and_store_stats(&db, 0).unwrap();
+        let txs: Vec<i64> = serde_json::from_value(stats["tx_per_minute"].clone()).unwrap();
+        assert_eq!(txs.len(), CHART_MINUTES);
+        // The block an hour before the newest is outside the hour.
+        assert_eq!((txs[0], txs[58], txs[59]), (1, 2, 7));
+        assert_eq!(txs.iter().sum::<i64>(), 10);
+        assert_eq!(stats["gas_per_minute"][59], 70);
+
+        // The tiles average the same hour: 10 transactions and 100 of 4,000 gas
+        // over the 3,599 s from the first block in it to the newest.
+        let close = |k: &str, want: f64| (stats[k].as_f64().unwrap() - want).abs() < 1e-9;
+        assert!(close("tps", 10.0 / 3599.0), "{stats}");
+        assert!(close("gas_util_pct", 2.5));
+        assert!(close("avg_block_time_ms", 3_599_000.0 / 3.0));
+    }
+
+    #[tokio::test]
+    async fn a_refused_range_is_fetched_in_halves() {
+        use axum::{routing::post, Json, Router};
+
+        // Like reth past its response size cap: one error, not an array.
+        let handler = |Json(body): Json<Value>| async move {
+            let answer = |c: &Value| {
+                let block = json!({"number": c["params"][0], "transactions": []});
+                json!({"jsonrpc": "2.0", "id": c["id"], "result": block})
+            };
+            Json(match &body {
+                Value::Array(calls) if calls.len() > 2 => {
+                    json!({"jsonrpc": "2.0", "id": null, "error": {
+                        "code": -32011, "message": "The batch response was too large",
+                    }})
+                }
+                Value::Array(calls) => Value::Array(calls.iter().map(answer).collect()),
+                call => answer(call),
+            })
+        };
+        let rpc = ChainRpc::test_node(Router::new().route("/", post(handler))).await;
+
+        let blocks = fetch_raw_blocks(&rpc, 1..=7).await.unwrap();
+        let numbers: Vec<_> = blocks
+            .iter()
+            .map(|(b, _)| b["number"].as_str().unwrap())
+            .collect();
+        assert_eq!(numbers, ["0x1", "0x2", "0x3", "0x4", "0x5", "0x6", "0x7"]);
+    }
+
+    /// Halving a request the node did not answer would multiply the load on a node that is down.
+    #[tokio::test]
+    async fn a_failed_request_is_not_retried_in_halves() {
+        use axum::{http::StatusCode, routing::post, Router};
+        use std::sync::atomic::AtomicUsize;
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counted = hits.clone();
+        let handler = move || {
+            let counted = counted.clone();
+            async move {
+                counted.fetch_add(1, Ordering::SeqCst);
+                StatusCode::BAD_GATEWAY
+            }
+        };
+        let rpc = ChainRpc::test_node(Router::new().route("/", post(handler))).await;
+
+        assert!(fetch_raw_blocks(&rpc, 1..=7).await.is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
 
     fn chunks(from: u64, to: u64, batch: u64) -> Vec<RangeInclusive<u64>> {
         block_chunks(from, to, batch).collect()
@@ -1308,6 +1343,39 @@ mod tests {
             chunks(u64::MAX - 1, u64::MAX, 16),
             vec![u64::MAX - 1..=u64::MAX]
         );
+    }
+
+    /// A full disk holds the batch; writing resumes once there is room.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_write_is_held_until_it_lands() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("full.db");
+        let db: Db = Arc::new(Mutex::new(db::init_db(path.to_str().unwrap()).unwrap()));
+        // Clamps to the current size: no page can be added.
+        db::lock(&db)
+            .pragma_update(None, "max_page_count", 1)
+            .unwrap();
+
+        let (tx, rx) = mpsc::channel(8);
+        let (_stop, shutdown) = watch::channel(false);
+        let writer = tokio::spawn(write_loop(db.clone(), rx, shutdown));
+        for n in [1, 2] {
+            let raw = json!({"number": format!("0x{n:x}"), "hash": format!("0x{n:064x}")});
+            let mut bundle = assemble_bundle(&raw, None);
+            bundle.block.extra_data = "0".repeat(1 << 16);
+            tx.send(bundle).await.unwrap();
+        }
+
+        tokio::time::sleep(WRITE_RETRY * 3).await;
+        assert_eq!(db::get_min_block_number(&db), None, "the disk is full");
+
+        db::lock(&db)
+            .pragma_update(None, "max_page_count", 1 << 30)
+            .unwrap();
+        drop(tx);
+        writer.await.unwrap();
+        assert!(db::get_block_by_number(&db, 1).is_some());
+        assert!(db::get_block_by_number(&db, 2).is_some());
     }
 
     /// A block that did not come back must not be stepped over: what the forward
@@ -1426,5 +1494,34 @@ mod tests {
         assert_eq!(bundle.transfers[0].to_addr, checksum_address(&to));
         assert_eq!(bundle.transfers[0].amount, "100");
         assert_eq!(bundle.transfers[0].token_addr, checksum_address(&token));
+    }
+
+    #[test]
+    fn a_memo_transfer_counts_once() {
+        let tx_hash = format!("0x{}", "ff".repeat(32));
+        let topic = |byte: &str| format!("0x{}{}", "00".repeat(12), byte.repeat(20));
+        let log = |index: &str, topics: Vec<String>| {
+            json!({
+                "address": format!("0x{}", "aa".repeat(20)),
+                "logIndex": index,
+                "topics": topics,
+                "data": format!("0x{:064x}", 100u64),
+            })
+        };
+        let raw = json!({"number": "0x10", "transactions": [{"hash": tx_hash}]});
+        let receipts = json!([{
+            "transactionHash": tx_hash,
+            "logs": [
+                log("0x0", vec![TRANSFER_TOPIC.clone(), topic("1a"), topic("2b")]),
+                log("0x1", vec![
+                    crate::decoder::TRANSFER_WITH_MEMO_TOPIC.clone(),
+                    topic("1a"),
+                    topic("2b"),
+                    format!("0x{}", "ee".repeat(32)),
+                ]),
+            ],
+        }]);
+        let bundle = assemble_bundle(&raw, Some(&receipts));
+        assert_eq!(bundle.transfers.len(), 1);
     }
 }

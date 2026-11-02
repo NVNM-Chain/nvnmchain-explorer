@@ -26,7 +26,7 @@
                 <span class="avatar" style="width:28px;height:28px;border-radius:8px;font-size:12px;">{{ token.symbol | truncate(length=2) | upper | fallback(value='T') }}</span>
                 <div class="min-w-0">
                     <a href="{{ get_token_url(address=token.address) }}" class="text-blue-400 hover:text-blue-300 font-medium block truncate">{{ token.name | fallback(value=truncate_hash(h=token.address)) }}</a>
-                    <span class="text-faint text-[11px]">{{ token.currency | fallback(value='TIP-20') }}</span>
+                    <span class="text-faint text-[11px]">{{ token.currency | fallback(value='—') }}</span>
                 </div>
             </div>
             <div class="w-28 px-3 py-3 hidden md:block text-dim">{{ token.symbol }}</div>

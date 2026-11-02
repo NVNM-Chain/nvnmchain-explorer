@@ -13,5 +13,5 @@ log them with `tracing` or propagate them.
 
 ## Tests
 
-- No network: `cargo test --lib --test decoder --test anchoring --test pages`
+- No network: `cargo test --lib --test decoder --test anchoring --test pages --test baseline`
 - Against the live chain RPC: `cargo test --test live_rpc`
