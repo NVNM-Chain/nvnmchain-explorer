@@ -125,6 +125,11 @@ fn page_ctx_for(latest_block: Option<crate::models::Block>, extra: Value) -> Val
         "latest_block".into(),
         serde_json::to_value(latest_block).unwrap_or(Value::Null),
     );
+    // The commit the image was built from; a local build without `GIT_SHA` names none.
+    map.insert(
+        "commit".into(),
+        json!(option_env!("GIT_SHA").filter(|sha| !sha.is_empty())),
+    );
     // The search box echoes it; only the search page has one to echo.
     map.insert("query".into(), json!(""));
     merge_into(&mut map, extra);

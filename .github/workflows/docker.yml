@@ -59,6 +59,7 @@ jobs:
           file: Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
+          build-args: GIT_SHA=${{ github.sha }}
           # amd64 only: nothing deploys arm64, and building it meant emulating
           # the whole Rust dependency compile under QEMU.
           platforms: linux/amd64

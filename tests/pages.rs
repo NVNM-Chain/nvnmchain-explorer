@@ -646,6 +646,30 @@ async fn a_proxy_names_its_implementation() {
     );
 }
 
+/// Every page names the commit the binary was built from, when the build said.
+#[tokio::test]
+async fn pages_name_the_build_commit() {
+    let (_dir, base) = serve(Value::Null).await;
+    let page = get_json(&base, "/blocks?").await;
+    assert_eq!(page["commit"], json!(option_env!("GIT_SHA")));
+    if let Some(sha) = option_env!("GIT_SHA") {
+        let html = reqwest::get(format!("{base}/blocks"))
+            .await
+            .expect("blocks")
+            .text()
+            .await
+            .expect("body");
+        assert!(
+            html.contains(&format!("/commit/{sha}\"")),
+            "the footer links the commit"
+        );
+        assert!(
+            html.contains(&format!(">{}<", &sha[..7])),
+            "and shows it short"
+        );
+    }
+}
+
 /// The activity charts draw the stats' series, and are left out until the
 /// stats have one.
 #[tokio::test]

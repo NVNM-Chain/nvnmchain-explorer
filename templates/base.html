@@ -372,6 +372,7 @@
                 {% if latest_block %}#{{ latest_block.number }}{% endif %}
                 · <a href="https://rpc.nvnm.canary.mantrachain.dev" target="_blank" class="hover:text-blue-300">RPC</a>
                 · <a href="https://github.com/yihuang/nvnmchain-explorer" target="_blank" class="hover:text-blue-300">GitHub</a>
+                {% if commit %}· <a href="https://github.com/yihuang/nvnmchain-explorer/commit/{{ commit }}" target="_blank" class="hover:text-blue-300" title="{{ commit }}">{{ commit | truncate(length=7, end="") }}</a>{% endif %}
             </span>
         </div>
     </footer>
