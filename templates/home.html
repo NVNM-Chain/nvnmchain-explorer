@@ -8,7 +8,11 @@
     <div class="card-body">
         <div class="flex items-center justify-between gap-3 mb-2">
             <span class="text-xs text-dim">Index progress — <span id="idx-indexed" class="mono">{{ indexed_display }}</span> / <span id="idx-head" class="mono">{{ head_display }}</span> blocks indexed</span>
+            {% if index_stale %}
+            <span id="idx-pct" class="badge badge-error">not updating, last {{ format_time_ago(timestamp=stats.updated_at) }}</span>
+            {% else %}
             <span id="idx-pct" class="mono text-xs text-blue-400">{{ index_pct_display }}%</span>
+            {% endif %}
         </div>
         <div class="h-1.5 rounded-full" style="background: rgba(255,255,255,0.06); overflow: hidden;">
             <div id="idx-bar" style="width: {{ index_pct_display }}%; height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-2));"></div>
@@ -410,7 +414,12 @@
         put('idx-indexed', num(s.total_blocks));
         put('idx-head', num(s.chain_head));
         if (typeof s.index_pct === 'number') {
-            put('idx-pct', s.index_pct.toFixed(1) + '%');
+            var pct = document.getElementById('idx-pct');
+            if (pct) {
+                // Fresh stats: the index is updating again.
+                pct.className = 'mono text-xs text-blue-400';
+                pct.textContent = s.index_pct.toFixed(1) + '%';
+            }
             var bar = document.getElementById('idx-bar');
             if (bar) bar.style.width = s.index_pct.toFixed(1) + '%';
         }

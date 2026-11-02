@@ -758,10 +758,17 @@ pub async fn home(
     } else {
         0.0
     };
+    // Stats that stopped moving must not read as caught up.
+    let stale_after = (state.cfg.stats_interval_seconds * 3.0).max(60.0) as i64;
+    let index_stale = stats
+        .get("updated_at")
+        .and_then(Value::as_i64)
+        .is_some_and(|at| db::now_ts() - at > stale_after);
     let ctx = page_ctx_for(
         latest_block,
         json!({
             "stats": stats,
+            "index_stale": index_stale,
             "recent_blocks": recent_blocks,
             "recent_txs": recent_txs,
             "recent_block_count": state.cfg.recent_block_count,

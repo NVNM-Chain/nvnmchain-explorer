@@ -943,6 +943,45 @@ async fn backfill_loop(mut ix: Indexer) {
     }
 }
 
+/// How long the writer waits before trying a failed write again.
+const WRITE_RETRY: Duration = Duration::from_secs(5);
+
+/// Persist what the fetch loops send, retrying a failed write: the loops never
+/// come back for a batch.
+async fn write_loop(
+    db: Db,
+    mut bundle_rx: mpsc::Receiver<BlockBundle>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    // Bundles one commit may carry. A writer that keeps up sees an empty queue
+    // and commits per block; batching engages only once it falls behind.
+    const MAX_BATCH: usize = 64;
+
+    while let Some(bundle) = bundle_rx.recv().await {
+        // On shutdown, stop draining the queue: in-flight bundles are
+        // dropped and re-fetched on the next start.
+        if *shutdown.borrow() {
+            break;
+        }
+        // Fold in whatever is already queued; `try_recv` never waits, so
+        // this adds no latency.
+        let mut batch = vec![bundle];
+        while batch.len() < MAX_BATCH {
+            let Ok(next) = bundle_rx.try_recv() else {
+                break;
+            };
+            batch.push(next);
+        }
+        while let Err(e) = db::save_block_bundles(&db, &batch) {
+            let (first, last) = (batch[0].block.number, batch[batch.len() - 1].block.number);
+            tracing::error!("blocks {first}..={last} not written, retrying: {e:#}");
+            if sleep_or_shutdown(&mut shutdown, WRITE_RETRY).await {
+                return;
+            }
+        }
+    }
+}
+
 /// Run the indexer: one serialized DB writer plus forward and backfill loops.
 pub async fn run_forever(
     rpc: ChainRpc,
@@ -991,50 +1030,8 @@ pub async fn run_forever(
         }
     });
 
-    let (bundle_tx, mut bundle_rx) = mpsc::channel::<BlockBundle>(1024);
-    let writer_db = db.clone();
-    let writer_shutdown = shutdown.clone();
-    // The writer only persists. The forward loop streams what it fetched, in
-    // number order, before handing it here: concurrent fetches complete out
-    // of order, so the writer could not emit gaplessly, and backfill must not
-    // reach the live feed at all. A viewer can see a block a moment before it
-    // is queryable, while the writer commits it.
-    // How many queued bundles may share one commit. Only bounds how much one
-    // transaction holds: a writer that is keeping up sees an empty queue and
-    // commits per block; batching engages only once it falls behind.
-    const MAX_BATCH: usize = 64;
-
-    let writer = tokio::spawn(async move {
-        while let Some(bundle) = bundle_rx.recv().await {
-            // On shutdown, stop draining the queue: in-flight bundles are
-            // dropped and re-fetched on the next start.
-            if *writer_shutdown.borrow() {
-                break;
-            }
-            // Fold in whatever is already queued; `try_recv` never waits, so
-            // this adds no latency.
-            let mut batch = vec![bundle];
-            while batch.len() < MAX_BATCH {
-                let Ok(next) = bundle_rx.try_recv() else {
-                    break;
-                };
-                batch.push(next);
-            }
-            if let Err(e) = db::save_block_bundles(&writer_db, &batch) {
-                // One bad bundle failed the whole batch; write the rest on
-                // their own so one block is lost rather than sixty-four.
-                let (first, last) = (batch[0].block.number, batch[batch.len() - 1].block.number);
-                warn!(
-                    "db write failed for blocks {first}..={last}: {e:#}; writing them one by one"
-                );
-                for bundle in &batch {
-                    if let Err(e) = db::save_block_bundle(&writer_db, bundle) {
-                        tracing::error!("block {} not written: {e:#}", bundle.block.number);
-                    }
-                }
-            }
-        }
-    });
+    let (bundle_tx, bundle_rx) = mpsc::channel::<BlockBundle>(1024);
+    let writer = tokio::spawn(write_loop(db.clone(), bundle_rx, shutdown.clone()));
 
     let ix = Indexer {
         rpc,
@@ -1346,6 +1343,39 @@ mod tests {
             chunks(u64::MAX - 1, u64::MAX, 16),
             vec![u64::MAX - 1..=u64::MAX]
         );
+    }
+
+    /// A full disk holds the batch; writing resumes once there is room.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_write_is_held_until_it_lands() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("full.db");
+        let db: Db = Arc::new(Mutex::new(db::init_db(path.to_str().unwrap()).unwrap()));
+        // Clamps to the current size: no page can be added.
+        db::lock(&db)
+            .pragma_update(None, "max_page_count", 1)
+            .unwrap();
+
+        let (tx, rx) = mpsc::channel(8);
+        let (_stop, shutdown) = watch::channel(false);
+        let writer = tokio::spawn(write_loop(db.clone(), rx, shutdown));
+        for n in [1, 2] {
+            let raw = json!({"number": format!("0x{n:x}"), "hash": format!("0x{n:064x}")});
+            let mut bundle = assemble_bundle(&raw, None);
+            bundle.block.extra_data = "0".repeat(1 << 16);
+            tx.send(bundle).await.unwrap();
+        }
+
+        tokio::time::sleep(WRITE_RETRY * 3).await;
+        assert_eq!(db::get_min_block_number(&db), None, "the disk is full");
+
+        db::lock(&db)
+            .pragma_update(None, "max_page_count", 1 << 30)
+            .unwrap();
+        drop(tx);
+        writer.await.unwrap();
+        assert!(db::get_block_by_number(&db, 1).is_some());
+        assert!(db::get_block_by_number(&db, 2).is_some());
     }
 
     /// A block that did not come back must not be stepped over: what the forward

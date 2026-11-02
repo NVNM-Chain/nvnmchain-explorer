@@ -738,6 +738,33 @@ async fn the_live_feed_follows_the_database() {
     assert_eq!(home["latest_num"], json!(102));
 }
 
+/// Index progress that stopped moving says so instead of showing a frozen percentage.
+#[tokio::test]
+async fn stale_index_progress_says_it_is_not_updating() {
+    let stats = |updated_at: i64| {
+        json!({
+            "latest_block": 100,
+            "chain_head": 100,
+            "total_blocks": 100,
+            "total_txns": 0,
+            "token_count": 0,
+            "updated_at": updated_at,
+        })
+    };
+    let (_dir, base) = serve(stats(db::now_ts() - 3600)).await;
+    assert_eq!(get_json(&base, "/?").await["index_stale"], json!(true));
+    let html = reqwest::get(format!("{base}/"))
+        .await
+        .expect("home")
+        .text()
+        .await
+        .expect("body");
+    assert!(html.contains("not updating"), "{html}");
+
+    let (_dir, base) = serve(stats(db::now_ts())).await;
+    assert_eq!(get_json(&base, "/?").await["index_stale"], json!(false));
+}
+
 /// Pressing Enter in the search box resolves to one destination, and the
 /// candidates are tried in the order a reader means them. A block hash and a
 /// transaction hash are the same shape, so only asking the index tells them
