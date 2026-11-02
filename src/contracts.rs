@@ -1,4 +1,4 @@
-//! Contract identification and labels, mirroring `app/contracts.py`.
+//! Contract identification and labels.
 
 use alloy_primitives::Address;
 use serde::Serialize;

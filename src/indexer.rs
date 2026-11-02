@@ -25,7 +25,7 @@ use crate::db::{self, Db};
 use crate::decoder::{checksum_address, decode_event, DecodedEvent, TRANSFER_TOPIC};
 use crate::models::{AnchoringEvent, BlockBundle, Transaction, TransferEvent};
 use crate::parse::{parse_block, parse_transaction};
-use crate::rpc::{ChainRpc, RpcError};
+use crate::rpc::{decimal_amount, int_to_hex_str, parse_int_any, ChainRpc, RpcError};
 use crate::summary::ZERO_ADDRESS;
 use crate::tokens::{fetch_token_metadata, has_control_chars};
 
@@ -117,7 +117,7 @@ fn assemble_bundle(raw_block: &Value, receipts: Option<&Value>) -> BlockBundle {
         // Re-encode the RPC object with the official tempo primitives; the
         // block already carries the signed tx, so no extra per-tx RPC. Read in
         // place: a copy of every transaction object per block adds up.
-        if let Ok(signed) = crate::tempo::AASigned::deserialize(tx_data) {
+        if let Ok(signed) = tempo_primitives::AASigned::deserialize(tx_data) {
             let mut buf = Vec::new();
             signed.eip2718_encode(&mut buf);
             tx.raw = Some(format!("0x{}", hex::encode(buf)));
@@ -349,10 +349,7 @@ async fn attach_token_metadata(
 /// Copy onto a transaction what only its receipt knows.
 fn apply_receipt_fields(tx: &mut Transaction, receipt: &Value) {
     tx.receipt_data = Some(serde_json::to_string(receipt).unwrap_or_else(|_| "{}".into()));
-    tx.status = receipt
-        .get("status")
-        .map(crate::rpc::parse_int_any)
-        .unwrap_or(1);
+    tx.status = receipt.get("status").map(parse_int_any).unwrap_or(1);
     // Some nodes fill receipt `to` with the first call's destination even when
     // the tx itself has no top-level `to` (tempo-style `calls` transactions).
     if tx.to_addr.is_none() {
@@ -360,10 +357,7 @@ fn apply_receipt_fields(tx: &mut Transaction, receipt: &Value) {
             tx.to_addr = Some(to.to_string());
         }
     }
-    tx.gas_used = receipt
-        .get("gasUsed")
-        .map(crate::rpc::parse_int_any)
-        .unwrap_or(0);
+    tx.gas_used = receipt.get("gasUsed").map(parse_int_any).unwrap_or(0);
     if let Some(addr) = receipt.get("contractAddress").and_then(Value::as_str) {
         tx.contract_address = Some(checksum_address(addr));
     }
@@ -376,13 +370,10 @@ fn apply_receipt_fields(tx: &mut Transaction, receipt: &Value) {
         .get("feeAmount")
         .filter(|v| v.is_string() || v.is_number())
     {
-        tx.fee_amount = crate::rpc::decimal_amount(fee_amount);
+        tx.fee_amount = decimal_amount(fee_amount);
     }
     if let Some(egp) = receipt.get("effectiveGasPrice") {
-        tx.base_fee = match egp {
-            Value::String(s) => s.clone(),
-            _ => crate::rpc::int_to_hex_str(egp),
-        };
+        tx.base_fee = int_to_hex_str(egp);
     }
 }
 
@@ -513,7 +504,7 @@ fn apply_receipt(
         // unparsable index gets a unique fallback instead of colliding at 0.
         let log_index = log
             .get("logIndex")
-            .map(crate::rpc::parse_int_any)
+            .map(parse_int_any)
             .filter(|n| *n >= 0)
             .unwrap_or(*next_log_index as i64);
         *next_log_index = (*next_log_index).max(log_index as u64 + 1);
@@ -563,7 +554,7 @@ pub async fn backfill_anchoring(rpc: &ChainRpc, db: &Db) -> Result<()> {
         {
             Ok(logs) => logs,
             // The node answered with an error: almost always its range cap.
-            Err(e) if e.downcast_ref::<crate::rpc::RpcError>().is_some() => {
+            Err(e) if e.is::<RpcError>() => {
                 if window == 1 {
                     return Err(e).with_context(|| format!("anchoring logs {from}..{to}"));
                 }
@@ -604,14 +595,14 @@ pub async fn backfill_anchoring(rpc: &ChainRpc, db: &Db) -> Result<()> {
 /// One row from a raw log, stamped from the block the indexer already holds. A
 /// block not indexed yet brings its own rows when it is.
 fn anchoring_event_from_log(conn: &Connection, log: &Value) -> Option<AnchoringEvent> {
-    let block_number = crate::rpc::parse_int_any(log.get("blockNumber")?);
+    let block_number = parse_int_any(log.get("blockNumber")?);
     let timestamp = db::get_block_timestamp(conn, block_number)?;
     let decoded = decode_event(log)?;
     anchoring_event(
         &decoded,
         decoded.transaction_hash.as_deref()?,
         block_number,
-        crate::rpc::parse_int_any(log.get("logIndex")?),
+        parse_int_any(log.get("logIndex")?),
         timestamp,
     )
 }
@@ -702,14 +693,6 @@ struct Indexer {
 }
 
 impl Indexer {
-    fn shutting_down(&self) -> bool {
-        *self.shutdown.borrow()
-    }
-
-    fn set_tip_lag(&self, lag: u64) {
-        self.tip_lag.store(lag, Ordering::Relaxed);
-    }
-
     /// Fetch `from..=to` as multi-block RPC batches, returning bundles in
     /// number order so the caller can emit a gapless live feed.
     async fn fetch_range(&self, from: u64, to: u64) -> Vec<BlockBundle> {
@@ -721,7 +704,7 @@ impl Indexer {
         let mut set = tokio::task::JoinSet::new();
         let mut out = Vec::with_capacity((to - from + 1).min(16384) as usize);
         loop {
-            if self.shutting_down() {
+            if *self.shutdown.borrow() {
                 set.abort_all();
                 break;
             }
@@ -829,7 +812,7 @@ async fn forward_loop(mut ix: Indexer) {
     info!("forward loop started from block {sent}");
 
     while let Some(head) = head_rx.recv().await {
-        if ix.shutting_down() {
+        if *ix.shutdown.borrow() {
             break;
         }
         // A fast head feed delivers every block; fold queued heads into one
@@ -849,13 +832,14 @@ async fn forward_loop(mut ix: Indexer) {
         // Window the catch-up so the writer starts before a large gap has
         // finished fetching, and so memory stays bounded.
         while sent < head {
-            if ix.shutting_down() {
+            if *ix.shutdown.borrow() {
                 return;
             }
             head = drain_heads(&mut head_rx, head);
             ix.chain_head.store(head, Ordering::Relaxed);
             let end = sent.saturating_add(ix.cfg.batch).min(head);
-            ix.set_tip_lag(head.saturating_sub(sent));
+            ix.tip_lag
+                .store(head.saturating_sub(sent), Ordering::Relaxed);
             // Cut at the first hole: this loop never comes back for one.
             let bundles = contiguous_from(ix.fetch_range(sent + 1, end).await, sent + 1);
             // Nothing past `sent` came back: the fetch failed, or the node has
@@ -873,7 +857,7 @@ async fn forward_loop(mut ix: Indexer) {
             }
             sent = reached;
         }
-        ix.set_tip_lag(0);
+        ix.tip_lag.store(0, Ordering::Relaxed);
     }
     warn!("forward loop stopped (head feed closed)");
 }
@@ -890,7 +874,7 @@ async fn backfill_loop(mut ix: Indexer) {
     let mut frontier: Option<u64> = db::get_min_block_number(&ix.db).map(|n| n as u64);
     let mut consecutive_failures = 0u32;
     loop {
-        if ix.shutting_down() {
+        if *ix.shutdown.borrow() {
             break;
         }
         if ix.tip_lag.load(Ordering::Relaxed) > TIP_YIELD_LAG {

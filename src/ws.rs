@@ -1,5 +1,7 @@
 //! WebSocket `newHeads` feed with a polling fallback.
 
+use std::future::Future;
+use std::pin::pin;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -16,24 +18,42 @@ use crate::rpc::ChainRpc;
 const RETRY_BASE: Duration = Duration::from_millis(500);
 const RETRY_CAP: Duration = Duration::from_secs(300);
 
-/// Poll the chain head once and forward it; returns false when the consumer
-/// is gone (callers should stop).
-async fn poll_once(rpc: &ChainRpc, tx: &mpsc::Sender<u64>) -> bool {
-    match rpc.eth_block_number().await {
-        Ok(head) => tx.send(head).await.is_ok(),
-        Err(e) => {
-            warn!("poll head failed: {e:#}");
-            true
+/// Poll the head every `poll` until `stop` resolves, forwarding each to `tx`.
+/// `None` when the consumer is gone or shutdown was requested.
+async fn poll_until<T>(
+    rpc: &ChainRpc,
+    tx: &mpsc::Sender<u64>,
+    poll: Duration,
+    shutdown: &mut watch::Receiver<bool>,
+    stop: impl Future<Output = T>,
+) -> Option<T> {
+    let mut stop = pin!(stop);
+    loop {
+        if *shutdown.borrow() {
+            return None;
+        }
+        match rpc.eth_block_number().await {
+            Ok(head) if tx.send(head).await.is_err() => return None,
+            Ok(_) => {}
+            Err(e) => warn!("poll head failed: {e:#}"),
+        }
+        tokio::select! {
+            stopped = &mut stop => return Some(stopped),
+            _ = tokio::time::sleep(poll) => {}
+            r = shutdown.changed() => {
+                if r.is_err() || *shutdown.borrow() {
+                    return None;
+                }
+            }
         }
     }
 }
 
 /// Forward every new chain head to `tx`.
 ///
-/// Subscribes to `eth_subscribe("newHeads")` over WebSocket for instant block
-/// notifications. When the socket is unreachable or drops, it falls back to
-/// polling `eth_blockNumber` and keeps retrying the socket so the feed heals
-/// on its own.
+/// Subscribes to `eth_subscribe("newHeads")` over WebSocket and retries the
+/// socket when it fails or drops; polling `eth_blockNumber` runs throughout,
+/// so heads keep arriving meanwhile.
 pub async fn head_watcher(
     rpc: ChainRpc,
     ws_url: String,
@@ -44,76 +64,27 @@ pub async fn head_watcher(
 ) {
     let poll = poll.max(Duration::from_millis(100));
     if !index_ws {
-        // Pure polling mode.
-        loop {
-            if *shutdown.borrow() {
-                return;
-            }
-            if !poll_once(&rpc, &tx).await {
-                return;
-            }
-            tokio::select! {
-                _ = tokio::time::sleep(poll) => {}
-                r = shutdown.changed() => {
-                    if r.is_err() || *shutdown.borrow() {
-                        return;
-                    }
-                }
-            }
-        }
+        poll_until(&rpc, &tx, poll, &mut shutdown, std::future::pending::<()>()).await;
+        return;
     }
 
     let mut retry = RETRY_BASE;
     let mut consecutive_failures = 0u32;
     loop {
-        if *shutdown.borrow() {
-            return;
-        }
-        // Try the socket in the background while polling keeps the feed warm:
         let url = ws_url.clone();
         let tx2 = tx.clone();
-        let ws_task = tokio::spawn(async move { subscribe_ws(&url, &tx2).await });
-        let outcome = loop {
-            if *shutdown.borrow() {
-                ws_task.abort();
-                return;
-            }
-            if !poll_once(&rpc, &tx).await {
-                ws_task.abort();
-                return;
-            }
-            if ws_task.is_finished() {
-                break match ws_task.await {
-                    Ok(res) => res,
-                    Err(e) => Err(anyhow::anyhow!("websocket task failed: {e}")),
-                };
-            }
-            tokio::select! {
-                _ = tokio::time::sleep(poll) => {}
-                r = shutdown.changed() => {
-                    if r.is_err() || *shutdown.borrow() {
-                        ws_task.abort();
-                        return;
-                    }
-                }
-            }
+        let mut ws_task = tokio::spawn(async move { subscribe_ws(&url, &tx2).await });
+        let Some(joined) = poll_until(&rpc, &tx, poll, &mut shutdown, &mut ws_task).await else {
+            ws_task.abort();
+            return;
         };
-        match outcome {
+        let outcome = joined.unwrap_or_else(|e| Err(anyhow::anyhow!("websocket task failed: {e}")));
+        let pause = match outcome {
             Ok(()) => {
                 consecutive_failures = 0;
                 retry = RETRY_BASE;
                 warn!("websocket subscription ended; reconnecting");
-                // Keep polling during the brief reconnect pause.
-                let until = tokio::time::Instant::now() + Duration::from_millis(250);
-                while tokio::time::Instant::now() < until {
-                    if *shutdown.borrow() {
-                        return;
-                    }
-                    if !poll_once(&rpc, &tx).await {
-                        return;
-                    }
-                    tokio::time::sleep(poll).await;
-                }
+                Duration::from_millis(250)
             }
             Err(e) => {
                 consecutive_failures += 1;
@@ -127,20 +98,17 @@ pub async fn head_watcher(
                         "websocket head feed still unreachable ({e:#}); next retry in {retry:?}"
                     );
                 }
-                // Poll continuously during the backoff so head detection never
-                // stalls while the socket is unreachable.
-                let until = tokio::time::Instant::now() + retry;
-                while tokio::time::Instant::now() < until {
-                    if *shutdown.borrow() {
-                        return;
-                    }
-                    if !poll_once(&rpc, &tx).await {
-                        return;
-                    }
-                    tokio::time::sleep(poll).await;
-                }
+                let pause = retry;
                 retry = (retry * 2).min(RETRY_CAP);
+                pause
             }
+        };
+        let pausing = tokio::time::sleep(pause);
+        if poll_until(&rpc, &tx, poll, &mut shutdown, pausing)
+            .await
+            .is_none()
+        {
+            return;
         }
     }
 }
@@ -203,6 +171,57 @@ fn parse_head(value: &Value) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A node whose head is always 42.
+    async fn node() -> ChainRpc {
+        use axum::{routing::post, Json, Router};
+        let handler = |Json(call): Json<Value>| async move {
+            Json(serde_json::json!({"jsonrpc": "2.0", "id": call["id"], "result": "0x2a"}))
+        };
+        ChainRpc::test_node(Router::new().route("/", post(handler))).await
+    }
+
+    /// A closed port fails the subscription at once; polling stands in until shutdown.
+    #[tokio::test]
+    async fn polling_carries_the_feed_while_the_socket_is_down() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let (stop, shutdown) = watch::channel(false);
+        let watcher = tokio::spawn(head_watcher(
+            node().await,
+            "ws://127.0.0.1:1".into(),
+            true,
+            Duration::from_millis(100),
+            tx,
+            shutdown,
+        ));
+        assert_eq!(rx.recv().await, Some(42));
+        assert_eq!(rx.recv().await, Some(42));
+        stop.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), watcher)
+            .await
+            .expect("stopped on shutdown")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn pure_polling_stops_when_the_consumer_goes() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let (_stop, shutdown) = watch::channel(false);
+        let watcher = tokio::spawn(head_watcher(
+            node().await,
+            String::new(),
+            false,
+            Duration::from_millis(100),
+            tx,
+            shutdown,
+        ));
+        assert_eq!(rx.recv().await, Some(42));
+        drop(rx);
+        tokio::time::timeout(Duration::from_secs(2), watcher)
+            .await
+            .expect("stopped without a consumer")
+            .unwrap();
+    }
 
     #[test]
     fn parses_eth_subscription_head() {

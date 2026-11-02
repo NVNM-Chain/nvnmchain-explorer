@@ -1,4 +1,4 @@
-//! SQLite storage layer, mirroring `app/database.py` + `app/models.py`.
+//! SQLite storage layer.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -337,12 +337,8 @@ pub fn init_db(path: &str) -> Result<Connection> {
             PRIMARY KEY (token_addr, holder_addr)
         );
 
-        -- Unused: selector names are cached in memory now.
-        CREATE TABLE IF NOT EXISTS selector_names (
-            selector TEXT PRIMARY KEY,
-            signature TEXT NOT NULL DEFAULT '',
-            fetched_at INTEGER NOT NULL DEFAULT 0
-        );
+        -- Selector names are cached in memory; the DROP clears the table older builds kept.
+        DROP TABLE IF EXISTS selector_names;
         "#,
     )?;
     // The holdings of one token, in listing order — holder counts become
@@ -1342,10 +1338,6 @@ fn count_holders(conn: &Connection, token: &str) -> rusqlite::Result<i64> {
 }
 
 /// Recount one token's holders and write the total onto its metadata row.
-///
-/// The two tables spell an address differently — `token_balances` on the
-/// checksummed text, `token_metadata` on bytes — so the count and the update
-/// bind different forms of the same address.
 fn update_holder_count(conn: &Connection, token: &str) -> Result<()> {
     let count = count_holders(conn, token)?;
     exec_cached(
@@ -1439,22 +1431,12 @@ fn row_to_transfer_json(row: &rusqlite::Row) -> rusqlite::Result<Value> {
             1,
         ),
     };
-    Ok(json!({
-        "id": transfer.id,
-        "tx_hash": transfer.tx_hash,
-        "block_number": transfer.block_number,
-        "log_index": transfer.log_index,
-        "token_addr": transfer.token_addr,
-        "from_addr": transfer.from_addr,
-        "to_addr": transfer.to_addr,
-        "amount": transfer.amount,
-        "timestamp": transfer.timestamp,
-        "created_at": transfer.created_at,
-        "tx_from": tx_from,
-        "tx_to": tx_to,
-        "tx_timestamp": tx_timestamp,
-        "tx_status": tx_status,
-    }))
+    let mut out = json!(transfer);
+    out["tx_from"] = json!(tx_from);
+    out["tx_to"] = json!(tx_to);
+    out["tx_timestamp"] = json!(tx_timestamp);
+    out["tx_status"] = json!(tx_status);
+    Ok(out)
 }
 
 /// One page of transfers, joined to their transactions. `keys` selects the

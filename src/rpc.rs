@@ -1,7 +1,6 @@
-//! Async JSON-RPC client, mirroring `app/rpc.py`.
+//! Async JSON-RPC client.
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,6 +13,7 @@ use tokio::time::Instant;
 
 use crate::config::Settings;
 
+#[derive(Clone)]
 pub struct ChainRpc {
     client: Client,
     url: String,
@@ -21,20 +21,7 @@ pub struct ChainRpc {
     /// client default, so [`ChainRpc::http_client`] never carries it to a
     /// third party.
     api_key: Option<HeaderValue>,
-    req_id: AtomicU64,
     pace: Option<Arc<BatchPace>>,
-}
-
-impl Clone for ChainRpc {
-    fn clone(&self) -> Self {
-        Self {
-            client: self.client.clone(),
-            url: self.url.clone(),
-            api_key: self.api_key.clone(),
-            req_id: AtomicU64::new(self.req_id.load(Ordering::Relaxed)),
-            pace: self.pace.clone(),
-        }
-    }
 }
 
 /// Spaces batch requests `gap` apart across a client and its clones, for a
@@ -113,7 +100,6 @@ impl ChainRpc {
             client,
             url: url.into(),
             api_key: None,
-            req_id: AtomicU64::new(0),
             pace: None,
         })
     }
@@ -164,14 +150,10 @@ impl ChainRpc {
         }
     }
 
-    fn next_id(&self) -> u64 {
-        self.req_id.fetch_add(1, Ordering::Relaxed)
-    }
-
     pub async fn call(&self, method: &str, params: Value) -> Result<Value> {
         let payload = json!({
             "jsonrpc": "2.0",
-            "id": self.next_id(),
+            "id": 1,
             "method": method,
             "params": params,
         });
@@ -422,25 +404,11 @@ pub fn parse_int_any(value: &Value) -> i64 {
     }
 }
 
-/// Format an integer-like JSON value as a hex string; `0x`-prefixed string
-/// values are returned unchanged.
+/// A JSON number as hex; a string is kept as the node spelled it.
 pub fn int_to_hex_str(value: &Value) -> String {
     match value {
-        Value::String(s) if s.starts_with("0x") => s.clone(),
-        Value::String(s) => {
-            if let Ok(n) = s.parse::<u128>() {
-                format!("0x{n:x}")
-            } else {
-                s.clone()
-            }
-        }
-        Value::Number(n) => {
-            if let Some(i) = n.as_u128() {
-                format!("0x{i:x}")
-            } else {
-                "0x0".into()
-            }
-        }
+        Value::String(s) => s.clone(),
+        Value::Number(n) => format!("0x{:x}", n.as_u128().unwrap_or(0)),
         _ => "0x0".into(),
     }
 }
@@ -501,6 +469,14 @@ mod tests {
         assert_eq!(parse_int_any(&json!("")), 0);
         assert_eq!(parse_int_any(&json!("nonsense")), 0);
         assert_eq!(parse_int_any(&Value::Null), 0);
+    }
+
+    #[test]
+    fn a_gas_price_string_keeps_the_nodes_spelling() {
+        assert_eq!(int_to_hex_str(&json!("0x4a")), "0x4a");
+        assert_eq!(int_to_hex_str(&json!("1500")), "1500");
+        assert_eq!(int_to_hex_str(&json!(26)), "0x1a");
+        assert_eq!(int_to_hex_str(&Value::Null), "0x0");
     }
 
     /// A node that answers every request with an empty JSON-RPC result and
@@ -583,7 +559,7 @@ mod tests {
     async fn a_paced_client_spaces_batches_and_waits_out_a_429() {
         use axum::response::IntoResponse;
         use axum::{routing::post, Json, Router};
-        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::{AtomicBool, Ordering};
 
         // Turns the first batch away for a second, then answers.
         let turned_away = Arc::new(AtomicBool::new(false));

@@ -18,12 +18,12 @@ use ethers_core::abi::{
     decode as abi_decode, ethabi::RawLog, Contract, Event, Function, HumanReadableParser, Param,
     ParamType, Token, Uint as EthersUint,
 };
-use num_bigint::BigInt;
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha3::{Digest, Keccak256};
 
 use crate::models::Transaction;
+use crate::rpc::decimal_amount;
 
 // ---------------------------------------------------------------------------
 // The ABI registry
@@ -136,14 +136,10 @@ struct NamedContract {
 
 /// Everything the registry answers, built once.
 pub(crate) struct Registry {
-    /// Registration order, so a lookup can say which ABI a match came from.
     contracts: Vec<NamedContract>,
-    /// Selector -> (contract index, function).
-    functions: HashMap<[u8; 4], (usize, Function)>,
-    /// `topic0` -> (contract index, event).
-    events: HashMap<[u8; 32], (usize, Event)>,
-    /// Selector -> (contract index, error).
-    errors: HashMap<[u8; 4], (usize, AbiError)>,
+    functions: HashMap<[u8; 4], Function>,
+    pub(crate) events: HashMap<[u8; 32], Event>,
+    errors: HashMap<[u8; 4], AbiError>,
 }
 
 /// Canonical `name(type,type)` signature — what the selector/topic hashes.
@@ -215,12 +211,11 @@ impl Registry {
                 }
             }));
         for (name, contract) in parsed {
-            let index = registry.contracts.len();
             for function in contract.functions() {
                 registry
                     .functions
                     .entry(selector(&function_signature(function)))
-                    .or_insert_with(|| (index, function.clone()));
+                    .or_insert_with(|| function.clone());
             }
             for event in contract.events() {
                 if event.anonymous {
@@ -229,24 +224,17 @@ impl Registry {
                 registry
                     .events
                     .entry(keccak256(event_signature(event).as_bytes()))
-                    .or_insert_with(|| (index, event.clone()));
+                    .or_insert_with(|| event.clone());
             }
             for error in contract.errors() {
                 registry
                     .errors
                     .entry(selector(&error_signature(error)))
-                    .or_insert_with(|| (index, error.clone()));
+                    .or_insert_with(|| error.clone());
             }
             registry.contracts.push(NamedContract { name, contract });
         }
         registry
-    }
-
-    /// Every event the registry can decode, in no particular order. Exists
-    /// for the test that holds the phrasing table to it.
-    #[cfg(test)]
-    pub(crate) fn events(&self) -> impl Iterator<Item = &Event> {
-        self.events.values().map(|(_, event)| event)
     }
 
     /// The whole ABI registered under `name`, for the pages that list what a
@@ -256,28 +244,6 @@ impl Registry {
             .iter()
             .find(|c| c.name == name)
             .map(|c| &c.contract)
-    }
-
-    fn contract_name(&self, index: usize) -> &'static str {
-        self.contracts.get(index).map(|c| c.name).unwrap_or("")
-    }
-
-    fn function(&self, selector: &[u8; 4]) -> Option<(&'static str, &Function)> {
-        self.functions
-            .get(selector)
-            .map(|(i, f)| (self.contract_name(*i), f))
-    }
-
-    pub(crate) fn event(&self, topic0: &[u8; 32]) -> Option<(&'static str, &Event)> {
-        self.events
-            .get(topic0)
-            .map(|(i, e)| (self.contract_name(*i), e))
-    }
-
-    fn error(&self, selector: &[u8; 4]) -> Option<(&'static str, &AbiError)> {
-        self.errors
-            .get(selector)
-            .map(|(i, e)| (self.contract_name(*i), e))
     }
 }
 
@@ -308,9 +274,9 @@ pub struct ParsedTx {
 /// Decode a raw RLP transaction (`0x…` hex) with the official tempo
 /// primitives (the alloy fork that knows the typed 0x76 transaction).
 pub fn parse_raw_tx(raw: &str) -> ParsedTx {
-    use crate::tempo::TempoTxEnvelope;
     use alloy_eips::Decodable2718;
     use alloy_primitives::TxKind;
+    use tempo_primitives::TempoTxEnvelope;
 
     let Ok(bytes) = hex::decode(raw.strip_prefix("0x").unwrap_or(raw)) else {
         return ParsedTx::default();
@@ -594,8 +560,8 @@ pub fn decode_function_call(data: &str) -> Option<DecodedCall> {
     let (selector, args) = split_calldata(data)?;
     let sel_hex = format!("0x{}", hex::encode(selector));
 
-    let (name, signature, params) = match REGISTRY.function(&selector) {
-        Some((_, function)) => (
+    let (name, signature, params) = match REGISTRY.functions.get(&selector) {
+        Some(function) => (
             Some(function.name.clone()),
             Some(function_signature(function)),
             decoded_params(&function.inputs, &args),
@@ -617,8 +583,8 @@ pub fn function_name(data: &str) -> Option<String> {
     let selector_hex = data.strip_prefix("0x").unwrap_or(data).get(..8)?;
     let mut selector = [0u8; 4];
     hex::decode_to_slice(selector_hex, &mut selector).ok()?;
-    Some(match REGISTRY.function(&selector) {
-        Some((_, function)) => function.name.clone(),
+    Some(match REGISTRY.functions.get(&selector) {
+        Some(function) => function.name.clone(),
         None => format!("0x{}", hex::encode(selector)),
     })
 }
@@ -675,7 +641,7 @@ impl DecodedError {
 /// Decode ABI-encoded revert data (`0x…`) against the built-in error table.
 pub fn decode_revert(data: &str) -> Option<DecodedError> {
     let (selector, args) = split_calldata(data)?;
-    let (_, error) = REGISTRY.error(&selector)?;
+    let error = REGISTRY.errors.get(&selector)?;
     Some(DecodedError {
         name: error.name.clone(),
         signature: error_signature(error),
@@ -703,22 +669,12 @@ pub fn revert_data_in(message: &str) -> Option<String> {
 // Event decoding
 // ---------------------------------------------------------------------------
 
-/// The signatures of the logs the explorer decodes.
-pub const TRANSFER_SIGNATURE: &str = "Transfer(address,address,uint256)";
-pub const TRANSFER_WITH_MEMO_SIGNATURE: &str = "TransferWithMemo(address,address,uint256,bytes32)";
-pub const APPROVAL_SIGNATURE: &str = "Approval(address,address,uint256)";
-
-/// `keccak256` of the signature beside it, in the lowercase `0x…` form the
-/// chain reports `topic0` in.
-///
-/// Derived, never written out: a mistyped hash does not fail loudly, it
-/// silently matches nothing, as `TRANSFER_WITH_MEMO_TOPIC` once did at 63 hex digits.
+/// `topic0` in the lowercase `0x…` form the chain reports it. Derived, because a
+/// mistyped hash matches nothing and fails silently.
 pub static TRANSFER_TOPIC: LazyLock<String> =
-    LazyLock::new(|| keccak_hex(TRANSFER_SIGNATURE.as_bytes()));
+    LazyLock::new(|| keccak_hex(b"Transfer(address,address,uint256)"));
 pub static TRANSFER_WITH_MEMO_TOPIC: LazyLock<String> =
-    LazyLock::new(|| keccak_hex(TRANSFER_WITH_MEMO_SIGNATURE.as_bytes()));
-pub static APPROVAL_TOPIC: LazyLock<String> =
-    LazyLock::new(|| keccak_hex(APPROVAL_SIGNATURE.as_bytes()));
+    LazyLock::new(|| keccak_hex(b"TransferWithMemo(address,address,uint256,bytes32)"));
 
 /// Whether `addr` is 20 hex-encoded bytes — the shape, not the checksum.
 pub fn is_valid_address(addr: &str) -> bool {
@@ -735,13 +691,13 @@ pub fn address_from_topic(topic: &str) -> String {
 /// Format one decoded log argument. An indexed dynamic parameter (string,
 /// bytes, array, tuple) is in the log only as its keccak hash, so that is what
 /// it renders as.
-fn format_log_token(param: &Param, indexed: bool, token: &Token) -> String {
-    if indexed && is_dynamic(&param.kind) {
+fn format_log_token(kind: &ParamType, indexed: bool, token: &Token) -> String {
+    if indexed && is_dynamic(kind) {
         if let Token::FixedBytes(bytes) = token {
             return hex_bytes(bytes);
         }
     }
-    format_token(&param.kind, token)
+    format_token(kind, token)
 }
 
 /// Whether an indexed parameter of this type is stored hashed in its topic.
@@ -777,18 +733,11 @@ fn decode_log_params(event: &Event, topics: &[Value], data: &str) -> Option<Vec<
             .iter()
             .enumerate()
             .zip(decoded.params.iter())
-            .map(|((i, input), got)| {
-                let param = Param {
-                    name: input.name.clone(),
-                    kind: input.kind.clone(),
-                    internal_type: None,
-                };
-                DecodedParam {
-                    ty: input.kind.to_string(),
-                    name: param_name(&input.name, i),
-                    value: format_log_token(&param, input.indexed, &got.value),
-                    indexed: input.indexed,
-                }
+            .map(|((i, input), got)| DecodedParam {
+                ty: input.kind.to_string(),
+                name: param_name(&input.name, i),
+                value: format_log_token(&input.kind, input.indexed, &got.value),
+                indexed: input.indexed,
             })
             .collect(),
     )
@@ -828,10 +777,10 @@ pub fn decode_event(log: &Value) -> Option<DecodedEvent> {
         .and_then(|b| {
             let mut key = [0u8; 32];
             key.copy_from_slice(&b);
-            REGISTRY.event(&key)
+            REGISTRY.events.get(&key)
         });
 
-    if let Some((_, event)) = known {
+    if let Some(event) = known {
         return Some(DecodedEvent {
             name: Some(event.name.clone()),
             signature: Some(event_signature(event)),
@@ -870,26 +819,6 @@ pub fn decode_event(log: &Value) -> Option<DecodedEvent> {
 // Trace flattening
 // ---------------------------------------------------------------------------
 
-fn hex_to_dec(value: &Value, default: &str) -> String {
-    match value {
-        Value::String(s) => {
-            let s = s.strip_prefix("0x").unwrap_or(s);
-            if s.is_empty() {
-                default.into()
-            } else {
-                BigInt::parse_bytes(s.as_bytes(), 16)
-                    .map(|n| n.to_string())
-                    .unwrap_or_else(|| default.into())
-            }
-        }
-        Value::Number(n) => n
-            .as_i64()
-            .map(|i| i.to_string())
-            .unwrap_or_else(|| default.into()),
-        _ => default.into(),
-    }
-}
-
 fn walk_trace(node: &Value, depth: usize, result: &mut Vec<Value>) {
     let input = node.get("input").and_then(Value::as_str).unwrap_or("0x");
     let kind = node.get("type").and_then(Value::as_str).unwrap_or("CALL");
@@ -910,9 +839,9 @@ fn walk_trace(node: &Value, depth: usize, result: &mut Vec<Value>) {
         "to": node.get("to").and_then(Value::as_str).unwrap_or(""),
         "data": input,
         "output": node.get("output").and_then(Value::as_str).unwrap_or(""),
-        "value": hex_to_dec(node.get("value").unwrap_or(&Value::Null), "0"),
-        "gas": hex_to_dec(node.get("gas").unwrap_or(&Value::Null), "0"),
-        "gas_used": hex_to_dec(node.get("gasUsed").unwrap_or(&Value::Null), "0"),
+        "value": decimal_amount(&node["value"]),
+        "gas": decimal_amount(&node["gas"]),
+        "gas_used": decimal_amount(&node["gasUsed"]),
         "decoded": decoded.unwrap_or(Value::Null),
         "children": [],
     });
@@ -1079,7 +1008,10 @@ mod tests {
     #[test]
     fn signatures_are_canonical() {
         let transfer = selector("transfer(address,uint256)");
-        let (_, f) = REGISTRY.function(&transfer).expect("transfer registered");
+        let f = REGISTRY
+            .functions
+            .get(&transfer)
+            .expect("transfer registered");
         assert_eq!(function_signature(f), "transfer(address,uint256)");
         assert_eq!(f.short_signature(), transfer);
     }
@@ -1089,8 +1021,9 @@ mod tests {
     #[test]
     fn transfer_with_memo_is_registered_with_an_indexed_memo() {
         let topic0 = keccak256(b"TransferWithMemo(address,address,uint256,bytes32)");
-        let (_, event) = REGISTRY
-            .event(&topic0)
+        let event = REGISTRY
+            .events
+            .get(&topic0)
             .expect("TransferWithMemo registered");
         assert_eq!(event.name, "TransferWithMemo");
         let memo = event.inputs.last().expect("memo param");
@@ -1100,11 +1033,12 @@ mod tests {
     /// Solidity's built-in `revert("…")` must decode like any custom error.
     #[test]
     fn builtin_revert_errors_are_registered() {
-        let (_, error) = REGISTRY
-            .error(&selector("Error(string)"))
+        let error = REGISTRY
+            .errors
+            .get(&selector("Error(string)"))
             .expect("Error(string) registered");
         assert_eq!(error.name, "Error");
-        assert!(REGISTRY.error(&selector("Panic(uint256)")).is_some());
+        assert!(REGISTRY.errors.contains_key(&selector("Panic(uint256)")));
     }
 
     /// A declaration that does not parse registers nothing, which would show
@@ -1149,10 +1083,6 @@ mod tests {
             (
                 &*TRANSFER_WITH_MEMO_TOPIC,
                 "0x57bc7354aa85aed339e000bccffabbc529466af35f0772c8f8ee1145927de7f0",
-            ),
-            (
-                &*APPROVAL_TOPIC,
-                "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925",
             ),
         ] {
             assert_eq!(topic, expected);

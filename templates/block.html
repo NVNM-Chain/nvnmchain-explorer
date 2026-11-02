@@ -134,8 +134,6 @@
                 <div class="w-32 px-3 py-3">
                     {% if tx.method %}
                     <span class="badge badge-method mono">{{ tx.method }}</span>
-                    {% elif tx.method_id and tx.method_id != '0x' %}
-                    <span class="badge badge-info mono">{{ tx.method_id }}</span>
                     {% else %}
                     <span class="text-faint">—</span>
                     {% endif %}

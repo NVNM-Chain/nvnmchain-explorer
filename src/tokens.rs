@@ -1,5 +1,4 @@
-//! TIP-20 / ERC-20 token metadata fetching and amount formatting,
-//! mirroring `app/tokens.py`.
+//! TIP-20 / ERC-20 token metadata fetching and amount formatting.
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -86,7 +85,7 @@ fn decode_uint256_result(raw: &str) -> String {
 /// empty string rather than render as garbage.
 pub fn sanitize_metadata_text(s: &str) -> String {
     let trimmed = s.trim_end_matches('\0');
-    if trimmed.chars().any(|c| c.is_control()) {
+    if has_control_chars(trimmed) {
         String::new()
     } else {
         trimmed.trim().to_string()

@@ -1763,7 +1763,8 @@ mod tests {
     #[test]
     fn every_registered_event_has_a_phrase() {
         let mut missing: Vec<String> = REGISTRY
-            .events()
+            .events
+            .values()
             .map(event_signature)
             .filter(|signature| phrase_for(signature).is_none())
             .collect();
@@ -1779,7 +1780,7 @@ mod tests {
         for phrase in PHRASES {
             let topic0 = crate::decoder::keccak256(phrase.signature.as_bytes());
             assert!(
-                REGISTRY.event(&topic0).is_some(),
+                REGISTRY.events.contains_key(&topic0),
                 "`{}` matches no registered event",
                 phrase.signature
             );

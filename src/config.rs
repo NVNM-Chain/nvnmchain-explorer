@@ -1,4 +1,4 @@
-//! Runtime configuration, mirroring `app/config.py`.
+//! Runtime configuration.
 //!
 //! Defaults target the chain we validate against; override with env vars.
 
@@ -109,10 +109,8 @@ fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
 
 /// A finite number of seconds; `inf` or `nan` would panic where a `Duration` is built.
 fn env_f64(key: &str, default: f64) -> f64 {
-    env::var(key)
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .filter(|v: &f64| v.is_finite())
+    Some(env_parse(key, default))
+        .filter(|seconds| seconds.is_finite())
         .unwrap_or(default)
 }
 
@@ -190,12 +188,6 @@ fn rpc_api_key(raw: Option<String>) -> Option<HeaderValue> {
             tracing::warn!("NVNM_RPC_API_KEY is not a valid header value; sending no x-api-key");
             None
         }
-    }
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self::from_env()
     }
 }
 

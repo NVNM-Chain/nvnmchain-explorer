@@ -85,9 +85,7 @@ pub struct Transaction {
     pub fee_amount: String,
     /// Full calldata (`0x…`); kept so list pages can show method badges.
     pub input: String,
-    /// The node's raw transaction object (decoded JSON). Everything else the
-    /// tx page shows — gas/fee fields, nonce, calls, signature type — is
-    /// parsed from this at runtime instead of being stored redundantly.
+    /// RLP bytes as `0x…` hex; the tx page parses gas, nonce, calls and signature type from them.
     pub raw: Option<String>,
     pub trace_data: Option<String>,
     pub receipt_data: Option<String>,

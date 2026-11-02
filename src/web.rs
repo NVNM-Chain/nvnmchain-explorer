@@ -33,10 +33,11 @@ use crate::db::{self, Db, TxColumns};
 use crate::decoder::{
     checksum_address, decode_event, decode_function_call, decode_revert, decode_with_signature,
     event_signature, extract_balance_changes, extract_calls, flatten_trace, function_name,
-    function_signature, keccak_hex, revert_data_in, DecodedEvent, ParsedTx, REGISTRY,
+    function_signature, is_valid_address, keccak_hex, revert_data_in, truncate_hash, DecodedEvent,
+    ParsedTx, REGISTRY,
 };
 use crate::name_search;
-use crate::rpc::ChainRpc;
+use crate::rpc::{parse_int_any, ChainRpc};
 use crate::signatures;
 use crate::summary::{build_summary, known_events, truncate, Failure, TokenDisplay, Tokens};
 use crate::tempo_address::parse_virtual;
@@ -753,11 +754,10 @@ pub async fn home(
         .and_then(Value::as_i64)
         .unwrap_or(0);
     let chain_head = stats.get("chain_head").and_then(Value::as_i64).unwrap_or(0);
-    let index_pct = if chain_head > 0 {
-        (indexed_count as f64 / chain_head as f64 * 100.0).clamp(0.0, 100.0)
-    } else {
-        0.0
-    };
+    let index_pct = stats
+        .get("index_pct")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
     // Stats that stopped moving must not read as caught up.
     let stale_after = (state.cfg.stats_interval_seconds * 3.0).max(60.0) as i64;
     let index_stale = stats
@@ -1319,8 +1319,8 @@ fn gas_and_fee_ctx(
     receipt: Option<&Value>,
 ) -> Value {
     let gas_price = receipt
-        .and_then(|r| r.get("effectiveGasPrice").and_then(Value::as_str))
-        .map(parse_hex_i64)
+        .and_then(|r| r.get("effectiveGasPrice"))
+        .map(parse_int_any)
         .unwrap_or(0);
     let gas_used = tx.gas_used;
     let gas_limit = parsed.gas_limit.unwrap_or(0);
@@ -1973,7 +1973,6 @@ pub async fn search_page(
     render_html(&state.tera, "search.html", ctx)
 }
 
-/// Enough suggestions to be useful, few enough to read without scrolling.
 /// Somewhere the anchoring contract can send the reader.
 struct Hit {
     kind: &'static str,
@@ -2035,6 +2034,7 @@ async fn anchoring_hits(state: &AppState, q: &str, limit: usize) -> Vec<Hit> {
     hits
 }
 
+/// Enough suggestions to be useful, few enough to read without scrolling.
 const SUGGESTION_LIMIT: usize = 8;
 
 /// Suggestions for what the reader is typing, for the search box.
@@ -2242,16 +2242,6 @@ fn error_response(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-use crate::decoder::{is_valid_address, truncate_hash};
-
-fn parse_hex_i64(s: &str) -> i64 {
-    if let Some(h) = s.strip_prefix("0x") {
-        i64::from_str_radix(h, 16).unwrap_or(0)
-    } else {
-        s.parse().unwrap_or(0)
-    }
-}
 
 fn block_pct(gas_used: i64, gas_limit: i64) -> String {
     if gas_limit > 0 {

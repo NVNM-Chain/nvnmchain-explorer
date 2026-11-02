@@ -45,7 +45,7 @@
 //!
 //! Not covered:
 //!
-//! - `transactions.trace_data` and `selector_names`: see `UNEXERCISED`.
+//! - `transactions.trace_data`: see `UNEXERCISED`.
 //! - The `kv` keys the live loops write (`stats`, `anchoring_backfilled_to`).
 //!   Their values depend on the clock or on the chain's current head, so they
 //!   change on every run.
@@ -106,19 +106,13 @@ const COMMIT: usize = 64;
 
 /// Wall-clock write times: the only values two runs over the same answers
 /// may disagree on.
-const EXCLUDED_COLUMNS: &[&str] = &["created_at", "updated_at", "fetched_at"];
+const EXCLUDED_COLUMNS: &[&str] = &["created_at", "updated_at"];
 
 /// What the baseline leaves empty, and why: writes no recorded answer drives.
-const UNEXERCISED: &[(&str, &str)] = &[
-    (
-        "transactions.trace_data",
-        "a page keeps the trace it fetches in memory",
-    ),
-    (
-        "selector_names",
-        "a page keeps the names it looks up in memory",
-    ),
-];
+const UNEXERCISED: &[(&str, &str)] = &[(
+    "transactions.trace_data",
+    "a page keeps the trace it fetches in memory",
+)];
 
 /// JSON-RPC's code for a reverted call: the chain's answer, not a node failure.
 const REVERT: i64 = 3;

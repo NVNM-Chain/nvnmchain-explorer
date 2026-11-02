@@ -1,5 +1,4 @@
-//! Normalize raw RPC JSON into storage models (port of the `parse_*`
-//! functions in `app/rpc.py`).
+//! Normalize raw RPC JSON into storage models.
 
 use serde_json::Value;
 
