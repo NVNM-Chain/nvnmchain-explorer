@@ -1,12 +1,15 @@
 //! SQLite storage layer.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use rusqlite::types::{Type, ValueRef};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
+use zstd::bulk::Compressor;
 
 use crate::models::{
     AnchoringEvent, Block, BlockBundle, TokenMetadata, Transaction, TransferEvent,
@@ -705,9 +708,23 @@ pub fn get_recent_blocks(db: &Db, limit: usize) -> Vec<Block> {
 // Transactions
 // ---------------------------------------------------------------------------
 
+thread_local! {
+    /// Receipts compress to about a quarter: every log repeats the block and
+    /// transaction ids, and hex packs well. Building a context costs more than
+    /// compressing one receipt with it.
+    static RECEIPT_COMPRESSOR: RefCell<Compressor<'static>> =
+        RefCell::new(Compressor::new(zstd::DEFAULT_COMPRESSION_LEVEL).expect("zstd context"));
+}
+
 /// A rewrite that carries nothing for a blob keeps what is stored: the trace the
 /// transaction page cached, the raw bytes a failed decode left out.
 fn upsert_transaction(conn: &Connection, tx: &Transaction) -> Result<()> {
+    let receipt = tx
+        .receipt_data
+        .as_deref()
+        .map(|r| RECEIPT_COMPRESSOR.with(|c| c.borrow_mut().compress(r.as_bytes())))
+        .transpose()
+        .context("compress receipt")?;
     exec_cached(
         conn,
         r#"
@@ -743,7 +760,7 @@ fn upsert_transaction(conn: &Connection, tx: &Transaction) -> Result<()> {
             tx.input,
             tx.raw.as_deref().map(hex_blob),
             tx.trace_data,
-            tx.receipt_data,
+            receipt,
             tx.timestamp,
             tx.created_at,
         ],
@@ -765,7 +782,7 @@ const TX_COLS: &str = "hash, block_number, position, from_addr, to_addr, status,
 const TX_LIST_COLS: &str = "hash, block_number, position, from_addr, to_addr, status, gas_used, base_fee, contract_address, fee_token, fee_amount, input, NULL, NULL, NULL, timestamp, created_at";
 
 /// Which columns a transaction read carries. A listing shows a handful and never
-/// the three blobs; the transaction page and any JSON answer show them all.
+/// the three blobs, as JSON too; the transaction page shows them all.
 #[derive(Clone, Copy)]
 pub enum TxColumns {
     List,
@@ -797,10 +814,21 @@ fn row_to_tx(row: &rusqlite::Row) -> rusqlite::Result<Transaction> {
         input: row.get(11)?,
         raw: row.get::<_, Option<Vec<u8>>>(12)?.map(|b| blob_hex(&b)),
         trace_data: row.get(13)?,
-        receipt_data: row.get(14)?,
+        receipt_data: receipt_col(row, 14)?,
         timestamp: row.get(15)?,
         created_at: row.get(16)?,
     })
+}
+
+/// Column `i` of `row`, a receipt, as JSON: compressed, or the text an older build wrote.
+fn receipt_col(row: &rusqlite::Row, i: usize) -> rusqlite::Result<Option<String>> {
+    let ValueRef::Blob(bytes) = row.get_ref(i)? else {
+        return row.get(i);
+    };
+    zstd::Decoder::new(bytes)
+        .and_then(std::io::read_to_string)
+        .map(Some)
+        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(i, Type::Blob, Box::new(e)))
 }
 
 pub fn get_transaction(db: &Db, hash: &str) -> Option<Transaction> {

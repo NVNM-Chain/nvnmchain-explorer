@@ -704,6 +704,39 @@ fn a_rewrite_without_the_blobs_keeps_them() {
     assert_eq!(stored.receipt_data.as_deref(), Some("{}"));
 }
 
+/// A receipt is stored compressed and read back as its JSON, and one an older
+/// build stored as text still reads.
+#[test]
+fn receipts_are_stored_compressed() {
+    let (_dir, db) = temp_db("receipts.db");
+    let raw_block = sample_raw_block();
+    let block = parse_block(&raw_block);
+    let mut tx = parse_transaction(&raw_block["transactions"][0], &block);
+    let zeros = format!("0x{}", "00".repeat(64));
+    let logs = vec![json!({"data": zeros}); 4];
+    let receipt = json!({"status": "0x1", "logs": logs}).to_string();
+    tx.receipt_data = Some(receipt.clone());
+    db::save_transaction(&db, &tx).unwrap();
+
+    let (kind, bytes): (String, usize) = db::lock(&db)
+        .query_row(
+            "SELECT typeof(receipt_data), length(receipt_data) FROM transactions",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(kind, "blob");
+    assert!(bytes < receipt.len() / 4, "{bytes} bytes");
+    let stored = db::get_transaction(&db, &tx.hash).unwrap();
+    assert_eq!(stored.receipt_data, tx.receipt_data);
+
+    db::lock(&db)
+        .execute("UPDATE transactions SET receipt_data = ?1", [&receipt])
+        .unwrap();
+    let legacy = db::get_transaction(&db, &tx.hash).unwrap();
+    assert_eq!(legacy.receipt_data, tx.receipt_data);
+}
+
 /// A database from before the counters is counted once when it opens, and the
 /// writer carries on from there.
 #[test]

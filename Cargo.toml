@@ -24,6 +24,7 @@ tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tower-http = { version = "0.6", features = ["cors"] }
+zstd = "0.13"
 
 # The chain's own crates: its tx types to RLP-decode the typed 0x76 transaction, and every
 # precompile interface as Solidity the compiler checks rather than ABI JSON vendored here.
