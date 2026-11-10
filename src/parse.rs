@@ -75,15 +75,11 @@ pub fn parse_transaction(tx: &Value, block: &Block) -> Transaction {
         .get("feeAmount")
         .map(decimal_amount)
         .unwrap_or_else(|| "0".into());
-    let input = {
-        let input = str_field(tx, "input");
-        let data = str_field(tx, "data");
-        if input.is_empty() && !data.is_empty() {
-            data
-        } else {
-            input
-        }
-    };
+    // Legacy objects say `0x` for no calldata; a 0x76 one omits the field.
+    let input = [str_field(tx, "input"), str_field(tx, "data")]
+        .into_iter()
+        .find(|s| !s.is_empty())
+        .unwrap_or_else(|| "0x".into());
     Transaction {
         hash: str_field(tx, "hash"),
         block_number: tx.get("blockNumber").map(parse_int_any).unwrap_or(0),

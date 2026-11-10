@@ -737,6 +737,79 @@ fn receipts_are_stored_compressed() {
     assert_eq!(legacy.receipt_data, tx.receipt_data);
 }
 
+/// Calldata is stored as bytes and read back as its hex, and hex an older build
+/// stored as text still reads.
+#[test]
+fn calldata_is_stored_as_bytes() {
+    let (_dir, db) = temp_db("calldata.db");
+    let raw_block = sample_raw_block();
+    let block = parse_block(&raw_block);
+    let mut tx = parse_transaction(&raw_block["transactions"][0], &block);
+    tx.input = format!("0xa9059cbb{}", "11".repeat(64));
+    db::save_transaction(&db, &tx).unwrap();
+
+    let (kind, bytes): (String, i64) = db::lock(&db)
+        .query_row(
+            "SELECT typeof(input), length(input) FROM transactions",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((kind.as_str(), bytes), ("blob", 68));
+    assert_eq!(db::get_transaction(&db, &tx.hash).unwrap().input, tx.input);
+
+    db::lock(&db)
+        .execute("UPDATE transactions SET input = ?1", [&tx.input])
+        .unwrap();
+    assert_eq!(db::get_transaction(&db, &tx.hash).unwrap().input, tx.input);
+}
+
+/// Rows an older build wrote as text are rewritten in place, and a second run
+/// finds nothing to do.
+#[test]
+fn rows_older_builds_wrote_as_text_are_packed() {
+    let (_dir, db) = temp_db("pack.db");
+    let raw_block = sample_raw_block();
+    let block = parse_block(&raw_block);
+    let mut tx = parse_transaction(&raw_block["transactions"][0], &block);
+    tx.input = format!("0xa9059cbb{}", "22".repeat(64));
+    tx.receipt_data = Some(json!({"status": "0x1", "logs": []}).to_string());
+    db::save_transaction(&db, &tx).unwrap();
+    db::lock(&db)
+        .execute(
+            "UPDATE transactions SET input = ?1, receipt_data = ?2",
+            rusqlite::params![tx.input, tx.receipt_data],
+        )
+        .unwrap();
+    let kinds = |db: &Db| -> (String, String) {
+        db::lock(db)
+            .query_row(
+                "SELECT typeof(input), typeof(receipt_data) FROM transactions",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    };
+    assert_eq!(kinds(&db), ("text".into(), "text".into()));
+
+    db::pack_legacy_transactions(&db).unwrap();
+    assert_eq!(kinds(&db), ("blob".into(), "blob".into()));
+    let packed = db::get_transaction(&db, &tx.hash).unwrap();
+    assert_eq!(packed.input, tx.input);
+    assert_eq!(packed.receipt_data, tx.receipt_data);
+    assert_eq!(db::get_kv(&db, db::PACKED_KEY).as_deref(), Some("1"));
+
+    let mut later = tx.clone();
+    later.hash = format!("0x{}", "ee".repeat(32));
+    db::save_transaction(&db, &later).unwrap();
+    db::pack_legacy_transactions(&db).unwrap();
+    assert_eq!(
+        db::get_kv(&db, db::PACKED_KEY).as_deref(),
+        Some("2"),
+        "a run that finds nothing moves the mark past the rows written packed"
+    );
+}
+
 /// A database from before the counters is counted once when it opens, and the
 /// writer carries on from there.
 #[test]

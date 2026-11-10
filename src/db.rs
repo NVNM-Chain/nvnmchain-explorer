@@ -3,10 +3,10 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use rusqlite::types::{Type, ValueRef};
+use rusqlite::types::{self, Type, ValueRef};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use zstd::bulk::Compressor;
@@ -716,15 +716,25 @@ thread_local! {
         RefCell::new(Compressor::new(zstd::DEFAULT_COMPRESSION_LEVEL).expect("zstd context"));
 }
 
+/// A receipt as stored: compressed.
+fn pack_receipt(json: &str) -> Result<Vec<u8>> {
+    RECEIPT_COMPRESSOR
+        .with(|c| c.borrow_mut().compress(json.as_bytes()))
+        .context("compress receipt")
+}
+
+/// Calldata as stored: bytes, half the hex. What does not decode stays text.
+fn pack_input(hex: &str) -> types::Value {
+    match hex::decode(hex.trim_start_matches("0x")) {
+        Ok(bytes) => types::Value::Blob(bytes),
+        Err(_) => types::Value::Text(hex.into()),
+    }
+}
+
 /// A rewrite that carries nothing for a blob keeps what is stored: the trace the
 /// transaction page cached, the raw bytes a failed decode left out.
 fn upsert_transaction(conn: &Connection, tx: &Transaction) -> Result<()> {
-    let receipt = tx
-        .receipt_data
-        .as_deref()
-        .map(|r| RECEIPT_COMPRESSOR.with(|c| c.borrow_mut().compress(r.as_bytes())))
-        .transpose()
-        .context("compress receipt")?;
+    let receipt = tx.receipt_data.as_deref().map(pack_receipt).transpose()?;
     exec_cached(
         conn,
         r#"
@@ -757,7 +767,7 @@ fn upsert_transaction(conn: &Connection, tx: &Transaction) -> Result<()> {
             tx.contract_address.as_deref().map(hex_blob),
             tx.fee_token.as_deref().map(hex_blob),
             tx.fee_amount,
-            tx.input,
+            pack_input(&tx.input),
             tx.raw.as_deref().map(hex_blob),
             tx.trace_data,
             receipt,
@@ -771,6 +781,75 @@ fn upsert_transaction(conn: &Connection, tx: &Transaction) -> Result<()> {
 pub fn save_transaction(db: &Db, tx: &Transaction) -> Result<()> {
     let conn = lock(db);
     upsert_transaction(&conn, tx)
+}
+
+/// The rowid [`pack_legacy_transactions`] has reached.
+pub const PACKED_KEY: &str = "transactions_packed_to";
+
+/// Rewrite the rows older builds stored as text, receipts compressed and
+/// calldata as bytes, so two fit a page. A few hundred rows at a time: the
+/// writer and the pages get the connection in between, and the WAL
+/// checkpoints. A stopped run carries on from the kv row.
+pub fn pack_legacy_transactions(db: &Db) -> Result<()> {
+    const CHUNK: i64 = 500;
+    let mut from: i64 = get_kv(db, PACKED_KEY)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let mut packed = 0usize;
+    loop {
+        let mut conn = lock(db);
+        let txn = conn.transaction().context("begin pack")?;
+        // The columns still text, NULL where one is already packed.
+        let rows: Vec<(i64, Option<String>, Option<String>)> = {
+            let mut stmt = txn.prepare_cached(
+                "SELECT rowid,
+                        CASE WHEN typeof(receipt_data) = 'text' THEN receipt_data END,
+                        CASE WHEN typeof(input) = 'text' THEN input END
+                 FROM transactions
+                 WHERE rowid > ?1 AND (typeof(receipt_data) = 'text' OR typeof(input) = 'text')
+                 ORDER BY rowid LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![from, CHUNK], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let Some(&(last, _, _)) = rows.last() else {
+            // Nothing left: the next run starts past the rows this build wrote packed,
+            // rather than reading them all again to find that out.
+            let end: i64 = txn.query_row(
+                "SELECT COALESCE(MAX(rowid), 0) FROM transactions",
+                [],
+                |r| r.get(0),
+            )?;
+            if end > from {
+                set_kv(&txn, PACKED_KEY, &end.to_string())?;
+                txn.commit().context("commit pack")?;
+            }
+            break;
+        };
+        for (rowid, receipt, input) in &rows {
+            let receipt = receipt.as_deref().map(pack_receipt).transpose()?;
+            let input = input.as_deref().map(pack_input);
+            exec_cached(
+                &txn,
+                "UPDATE transactions SET receipt_data = COALESCE(?1, receipt_data),
+                                         input = COALESCE(?2, input)
+                 WHERE rowid = ?3",
+                params![receipt, input, rowid],
+            )?;
+        }
+        set_kv(&txn, PACKED_KEY, &last.to_string())?;
+        txn.commit().context("commit pack")?;
+        drop(conn);
+        from = last;
+        packed += rows.len();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if packed > 0 {
+        tracing::info!("packed {packed} transaction row(s) older builds wrote as text");
+    }
+    Ok(())
 }
 
 const TX_COLS: &str = "hash, block_number, position, from_addr, to_addr, status, gas_used, base_fee, contract_address, fee_token, fee_amount, input, raw, trace_data, receipt_data, timestamp, created_at";
@@ -811,7 +890,11 @@ fn row_to_tx(row: &rusqlite::Row) -> rusqlite::Result<Transaction> {
         contract_address: row.get::<_, Option<Vec<u8>>>(8)?.map(|b| blob_addr(&b)),
         fee_token: row.get::<_, Option<Vec<u8>>>(9)?.map(|b| blob_addr(&b)),
         fee_amount: row.get(10)?,
-        input: row.get(11)?,
+        // Bytes, or the hex an older build wrote.
+        input: match row.get_ref(11)? {
+            ValueRef::Blob(bytes) => blob_hex(bytes),
+            _ => row.get(11)?,
+        },
         raw: row.get::<_, Option<Vec<u8>>>(12)?.map(|b| blob_hex(&b)),
         trace_data: row.get(13)?,
         receipt_data: receipt_col(row, 14)?,

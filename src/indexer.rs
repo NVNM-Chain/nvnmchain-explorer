@@ -1005,6 +1005,13 @@ pub async fn run_forever(
     });
     let rebuild_db = db.clone();
     tokio::spawn(async move { repair_derived_tables(&rebuild_db) });
+    // Minutes of work on a large database, so on a thread of its own.
+    let pack_db = db.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = db::pack_legacy_transactions(&pack_db) {
+            warn!("packing transaction rows failed: {e:#}");
+        }
+    });
     // Anchoring rows for blocks indexed before the table existed.
     let anchoring_rpc = rpc.clone();
     let anchoring_db = db.clone();
