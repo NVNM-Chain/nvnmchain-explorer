@@ -143,6 +143,7 @@ and never overrides variables already set in the environment.
 | `INDEX_CONCURRENCY` | `32` | Blocks fetched in parallel |
 | `STATS_INTERVAL_SECONDS` | `5` | How often the dashboard stats are recomputed |
 | `SIGNATURE_LOOKUP_URL` | OpenChain | Signature directory for selectors no built-in ABI declares; set empty to disable ([Decoding](#decoding)) |
+| `TIDX_URL` | unset | A tidx to read transfers, balances and holder counts from; the explorer then indexes none of its own |
 | `RUST_LOG` | `nvnmchain_explorer=info` | Log verbosity |
 
 ## Routes

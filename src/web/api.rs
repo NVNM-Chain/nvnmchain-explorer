@@ -11,7 +11,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use super::{
-    address_type, enrich_transfers, find_block, page_param, token_holders, AppState, PER_PAGE,
+    address_transactions, address_type, find_block, page_param, token_holders, AppState, PER_PAGE,
 };
 use crate::anchoring::{self, Record, Registry};
 use crate::contracts::identify_address;
@@ -64,10 +64,10 @@ impl IntoResponse for ApiError {
     }
 }
 
-/// A read the node did not answer.
+/// A read the node or the tidx did not answer.
 impl From<anyhow::Error> for ApiError {
     fn from(err: anyhow::Error) -> Self {
-        tracing::warn!("node read failed: {err:#}");
+        tracing::warn!("read failed: {err:#}");
         ApiError(StatusCode::BAD_GATEWAY, format!("{err:#}"))
     }
 }
@@ -185,7 +185,8 @@ async fn address_txs(
 ) -> Result<Json<List<Value>>, ApiError> {
     let address = checked(&address)?;
     let page = page_param(&query);
-    let txs = db::get_address_transactions(&state.db, &address, page, PER_PAGE, TxColumns::List)
+    let txs = address_transactions(&state, &address, page, TxColumns::List)
+        .await?
         .iter()
         .map(tx_item)
         .collect();
@@ -199,9 +200,10 @@ async fn address_transfers(
 ) -> Result<Json<List<Value>>, ApiError> {
     let address = checked(&address)?;
     let page = page_param(&query);
-    let mut transfers = db::get_address_transfers(&state.db, &address, page, PER_PAGE);
-    enrich_transfers(&state, &mut transfers);
-    Ok(listing(transfers, page))
+    Ok(listing(
+        super::address_transfers(&state, &address, page).await?,
+        page,
+    ))
 }
 
 /// Not paged: an address holds few enough tokens.
@@ -209,7 +211,7 @@ async fn address_holdings(
     State(state): State<AppState>,
     Path(address): Path<String>,
 ) -> Result<Json<List<Value>>, ApiError> {
-    let items = db::get_address_holdings(&state.db, &checked(&address)?);
+    let items = super::address_holdings(&state, &checked(&address)?).await?;
     Ok(Json(List {
         items,
         next_page: None,
@@ -242,7 +244,7 @@ async fn holders(
 ) -> Result<Json<List<Value>>, ApiError> {
     let meta = indexed_token(&state, &address)?;
     let page = page_param(&query);
-    let holders = token_holders(&state, &meta.address, &meta, page, PER_PAGE);
+    let holders = token_holders(&state, &meta.address, &meta, page, PER_PAGE).await?;
     Ok(listing(holders, page))
 }
 
@@ -253,7 +255,7 @@ async fn token_transfers(
 ) -> Result<Json<List<Value>>, ApiError> {
     let meta = indexed_token(&state, &address)?;
     let page = page_param(&query);
-    let transfers = db::get_token_transfers(&state.db, &meta.address, page, PER_PAGE);
+    let transfers = super::token_transfers(&state, &meta.address, page).await?;
     Ok(listing(transfers, page))
 }
 

@@ -7,6 +7,8 @@ use std::fmt;
 
 use reqwest::header::HeaderValue;
 
+use crate::tidx::Tidx;
+
 pub const DEFAULT_RPC_URL: &str = "https://rpc.nvnm.canary.mantrachain.dev";
 pub const DEFAULT_WS_URL: &str = "wss://rpc.nvnm.canary.mantrachain.dev";
 /// Chain id reported by the RPC above (`eth_chainId` → 0xc0316).
@@ -78,6 +80,8 @@ pub struct Settings {
     /// limiter can let this client through. Marked sensitive: `Debug` prints
     /// `Sensitive`, never the key.
     pub rpc_api_key: Option<HeaderValue>,
+    /// Named by `TIDX_URL`.
+    pub tidx: Option<Tidx>,
 }
 
 /// OpenChain's signature directory, queried at most once per selector per
@@ -119,6 +123,7 @@ impl Settings {
     /// rest of the explorer can build a `Duration` or a window from one as it is.
     pub fn from_env() -> Self {
         let port: u64 = env_parse("PORT", DEFAULT_PORT.into());
+        let chain_id = env_parse("CHAIN_ID", DEFAULT_CHAIN_ID);
         Self {
             role: role(),
             rpc_url: rpc_url(),
@@ -126,7 +131,7 @@ impl Settings {
             index_ws: env::var("INDEX_WS")
                 .map(|v| v != "0" && v.to_lowercase() != "false")
                 .unwrap_or(false),
-            chain_id: env_parse("CHAIN_ID", DEFAULT_CHAIN_ID),
+            chain_id,
             host: env_or("HOST", "0.0.0.0"),
             port: u16::try_from(port).unwrap_or_else(|_| {
                 tracing::warn!("PORT {port} is not a port number; listening on {DEFAULT_PORT}");
@@ -142,6 +147,10 @@ impl Settings {
             stats_interval_seconds: env_f64("STATS_INTERVAL_SECONDS", 5.0).clamp(1.0, 3600.0),
             signature_lookup_url: signature_lookup_url(),
             rpc_api_key: rpc_api_key(env::var("NVNM_RPC_API_KEY").ok()),
+            tidx: env::var("TIDX_URL")
+                .ok()
+                .filter(|url| !url.trim().is_empty())
+                .map(|url| Tidx::new(url.trim(), chain_id)),
         }
     }
 }

@@ -307,6 +307,7 @@ async fn web_api_serves_indexed_data() {
         // no part in that, and would be a network call per page view.
         signature_lookup_url: None,
         rpc_api_key: CHAIN.rpc_api_key.clone(),
+        tidx: None,
     };
     let tera = web::build_tera(db.clone()).expect("tera");
     let (block_tx, _) = broadcast::channel::<Value>(64);

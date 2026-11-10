@@ -41,6 +41,7 @@ use crate::rpc::{parse_int_any, ChainRpc};
 use crate::signatures;
 use crate::summary::{build_summary, known_events, truncate, Failure, TokenDisplay, Tokens};
 use crate::tempo_address::parse_virtual;
+use crate::tidx::Tidx;
 use crate::tokens::{
     fetch_token_metadata, format_token_amount, format_token_amount_with_symbol, has_control_chars,
 };
@@ -661,15 +662,21 @@ pub fn address_label(db: &Db, address: &str) -> Option<String> {
 /// One page of a token's holders, with balances in the token's own units and
 /// each share of supply. The share is percent with four decimals, divided in
 /// big integers so a supply too large for an f64 still comes out exact.
-fn token_holders(
+async fn token_holders(
     state: &AppState,
     token: &str,
     meta: &crate::models::TokenMetadata,
     page: u32,
     per_page: u32,
-) -> Vec<Value> {
+) -> Result<Vec<Value>> {
     let supply = BigInt::parse_bytes(meta.total_supply.as_bytes(), 10).unwrap_or_default();
-    db::get_token_holders(&state.db, token, page, per_page)
+    let holders = tidx_or(
+        state,
+        |t| t.token_holders(token, page, per_page),
+        || db::get_token_holders(&state.db, token, page, per_page),
+    )
+    .await?;
+    let rows = holders
         .into_iter()
         .enumerate()
         .map(|(i, (address, balance))| {
@@ -691,7 +698,8 @@ fn token_holders(
                 "share": share,
             })
         })
-        .collect()
+        .collect();
+    Ok(rows)
 }
 
 /// Base fee × gas used. Tempo pays it to the validator rather than burning it.
@@ -1527,24 +1535,36 @@ pub async fn address_page(
 
     // Both totals on every tab: the header shows them side by side, and the
     // pager needs the total for whichever tab is open.
-    let tx_count = db::get_address_transaction_count(&state.db, &checksummed);
-    let transfer_count = db::get_address_transfer_count(&state.db, &checksummed);
-
-    let (transactions, html_transactions) = if tab == "transfers" {
-        let mut transfers = db::get_address_transfers(&state.db, &checksummed, page, per_page);
-        enrich_transfers(&state, &mut transfers);
-        (transfers.clone(), transfers)
-    } else {
-        let txs =
-            db::get_address_transactions(&state.db, &checksummed, page, per_page, TxColumns::List);
-        let html_txs: Vec<Value> = txs.iter().map(tx_row).collect();
-        (
-            txs.into_iter()
-                .map(|t| serde_json::to_value(t).unwrap_or(Value::Null))
-                .collect::<Vec<Value>>(),
-            html_txs,
-        )
+    let counts = tidx_or(
+        &state,
+        |t| t.address_counts(&checksummed),
+        || {
+            (
+                db::get_address_transaction_count(&state.db, &checksummed),
+                db::get_address_transfer_count(&state.db, &checksummed),
+            )
+        },
+    );
+    let listing = async {
+        Ok::<_, anyhow::Error>(if tab == "transfers" {
+            let transfers = address_transfers(&state, &checksummed, page).await?;
+            (transfers.clone(), transfers)
+        } else {
+            let txs = address_transactions(&state, &checksummed, page, TxColumns::List).await?;
+            let html_txs: Vec<Value> = txs.iter().map(tx_row).collect();
+            (
+                txs.into_iter()
+                    .map(|t| serde_json::to_value(t).unwrap_or(Value::Null))
+                    .collect::<Vec<Value>>(),
+                html_txs,
+            )
+        })
     };
+    let ((tx_count, transfer_count), holdings, (transactions, html_transactions)) =
+        match tokio::try_join!(counts, address_holdings(&state, &checksummed), listing) {
+            Ok(all) => all,
+            Err(e) => return node_failed(&state, &headers, &query, e),
+        };
     let total_pages = match tab.as_str() {
         "transfers" => total_pages(transfer_count, per_page),
         // Holdings is not paged: an address holds few enough tokens.
@@ -1594,7 +1614,7 @@ pub async fn address_page(
             "virtual_address": virtual_address,
             "transactions": transactions,
             "html_transactions": html_transactions,
-            "holdings": db::get_address_holdings(&state.db, &checksummed),
+            "holdings": holdings,
             "tx_count": tx_count,
             "transfer_count": transfer_count,
             "page": page,
@@ -1657,21 +1677,26 @@ pub async fn token_page(
         .unwrap_or_else(|| "transfers".into());
     let page = page_param(&query);
     let per_page = PER_PAGE;
-    let transfers = if tab == "transfers" {
-        db::get_token_transfers(&state.db, &checksummed, page, per_page)
-    } else {
-        Vec::new()
+    let listing = async {
+        Ok::<_, anyhow::Error>(match tab.as_str() {
+            "transfers" => (
+                token_transfers(&state, &checksummed, page).await?,
+                Vec::new(),
+            ),
+            "holders" => (
+                Vec::new(),
+                token_holders(&state, &checksummed, &meta, page, per_page).await?,
+            ),
+            _ => (Vec::new(), Vec::new()),
+        })
     };
-
+    let ((transfers, holder_rows), transfer_count) =
+        match tokio::try_join!(listing, token_transfer_count(&state, &checksummed)) {
+            Ok(all) => all,
+            Err(e) => return node_failed(&state, &headers, &query, e),
+        };
     // Kept with the balances by the writer, so the page does not recount them.
     let holders = meta.holder_count;
-    let transfer_count = db::get_token_transfer_count(&state.db, &checksummed);
-    // The balances are already indexed — the page just never showed them.
-    let holder_rows = if tab == "holders" {
-        token_holders(&state, &checksummed, &meta, page, per_page)
-    } else {
-        Vec::new()
-    };
     let total_pages = total_pages(
         if tab == "holders" {
             holders
@@ -1845,7 +1870,7 @@ fn node_failed(
     query: &HashMap<String, String>,
     err: anyhow::Error,
 ) -> Response {
-    tracing::warn!("node read failed: {err:#}");
+    tracing::warn!("read failed: {err:#}");
     error_response(
         state,
         headers,
@@ -2254,6 +2279,105 @@ fn comma_num(n: i64) -> String {
         out.push(c);
     }
     out
+}
+
+/// `read` from the tidx when there is one, else `local` from SQLite. A tidx
+/// that fails is an error, not a quiet SQLite page: SQLite keeps no transfers
+/// beside a tidx, so that page would be empty.
+async fn tidx_or<T, F: std::future::Future<Output = Result<T>>>(
+    state: &AppState,
+    read: impl FnOnce(Tidx) -> F,
+    local: impl FnOnce() -> T,
+) -> Result<T> {
+    match state.cfg.tidx.clone() {
+        Some(tidx) => read(tidx).await,
+        None => Ok(local()),
+    }
+}
+
+async fn address_transactions(
+    state: &AppState,
+    address: &str,
+    page: u32,
+    columns: TxColumns,
+) -> Result<Vec<crate::models::Transaction>> {
+    tidx_or(
+        state,
+        |t| t.address_transactions(address, page, PER_PAGE),
+        || db::get_address_transactions(&state.db, address, page, PER_PAGE, columns),
+    )
+    .await
+}
+
+async fn address_transfers(state: &AppState, address: &str, page: u32) -> Result<Vec<Value>> {
+    let mut transfers = tidx_or(
+        state,
+        |t| t.address_transfers(address, page, PER_PAGE),
+        || db::get_address_transfers(&state.db, address, page, PER_PAGE),
+    )
+    .await?;
+    enrich_transfers(state, &mut transfers);
+    Ok(transfers)
+}
+
+async fn address_holdings(state: &AppState, address: &str) -> Result<Vec<Value>> {
+    tidx_or(
+        state,
+        |t| tidx_holdings(state, t, address),
+        || db::get_address_holdings(&state.db, address),
+    )
+    .await
+}
+
+async fn token_transfers(state: &AppState, token: &str, page: u32) -> Result<Vec<Value>> {
+    tidx_or(
+        state,
+        |t| t.token_transfers(token, page, PER_PAGE),
+        || db::get_token_transfers(&state.db, token, page, PER_PAGE),
+    )
+    .await
+}
+
+async fn token_transfer_count(state: &AppState, token: &str) -> Result<i64> {
+    tidx_or(
+        state,
+        |t| t.token_transfer_count(token),
+        || db::get_token_transfer_count(&state.db, token),
+    )
+    .await
+}
+
+/// tidx holds balances of tokens the explorer never indexed, such as those
+/// only genesis moved, so the node names those.
+async fn tidx_holdings(state: &AppState, tidx: Tidx, address: &str) -> Result<Vec<Value>> {
+    let balances = tidx.address_balances(address).await?;
+    let mut names: HashMap<String, (String, String, i64)> =
+        token_metas(&state.db, balances.iter().map(|(token, _)| token.clone()))
+            .into_values()
+            .map(|m| (m.address, (m.name, m.symbol, m.decimals)))
+            .collect();
+    let unnamed: Vec<&String> = balances
+        .iter()
+        .map(|(token, _)| token)
+        .filter(|token| !names.contains_key(*token))
+        .collect();
+    if !unnamed.is_empty() {
+        for m in fetch_token_metadata(&state.rpc, unnamed).await? {
+            names.insert(m.address, (m.name, m.symbol, m.decimals));
+        }
+    }
+    let holdings = balances.into_iter().filter_map(|(token, balance)| {
+        let (name, symbol, decimals) = names.remove(&token)?;
+        Some(json!({
+            "token": token,
+            "name": name,
+            "symbol": symbol,
+            "decimals": decimals,
+            "formatted": format_token_amount(&balance, decimals),
+            "balance": balance,
+        }))
+    });
+    Ok(holdings.collect())
 }
 
 /// Attach token symbol/decimals + formatted amounts to transfer rows.

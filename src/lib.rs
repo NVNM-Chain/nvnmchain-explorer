@@ -14,6 +14,7 @@ pub mod rpc;
 pub mod signatures;
 pub mod summary;
 pub mod tempo_address;
+pub mod tidx;
 pub mod tokens;
 pub mod web;
 pub mod ws;

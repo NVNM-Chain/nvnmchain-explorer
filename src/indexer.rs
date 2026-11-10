@@ -27,6 +27,7 @@ use crate::models::{AnchoringEvent, BlockBundle, Transaction, TransferEvent};
 use crate::parse::{parse_block, parse_transaction};
 use crate::rpc::{decimal_amount, int_to_hex_str, parse_int_any, ChainRpc, RpcError};
 use crate::summary::ZERO_ADDRESS;
+use crate::tidx::Tidx;
 use crate::tokens::{fetch_token_metadata, has_control_chars};
 
 /// How many blocks share one JSON-RPC HTTP request. Sixteen empty blocks
@@ -46,6 +47,7 @@ pub struct IndexerConfig {
     pub ws_url: String,
     pub index_ws: bool,
     pub stats_interval: Duration,
+    pub tidx: Option<Tidx>,
 }
 
 impl IndexerConfig {
@@ -57,6 +59,7 @@ impl IndexerConfig {
             ws_url: s.ws_url.clone(),
             index_ws: s.index_ws,
             stats_interval: Duration::from_secs_f64(s.stats_interval_seconds),
+            tidx: s.tidx.clone(),
         }
     }
 }
@@ -935,6 +938,7 @@ const WRITE_RETRY: Duration = Duration::from_secs(5);
 async fn write_loop(
     db: Db,
     mut bundle_rx: mpsc::Receiver<BlockBundle>,
+    index_transfers: bool,
     mut shutdown: watch::Receiver<bool>,
 ) {
     // Bundles one commit may carry. A writer that keeps up sees an empty queue
@@ -956,6 +960,11 @@ async fn write_loop(
             };
             batch.push(next);
         }
+        if !index_transfers {
+            for bundle in &mut batch {
+                bundle.transfers.clear();
+            }
+        }
         while let Err(e) = db::save_block_bundles(&db, &batch) {
             let (first, last) = (batch[0].block.number, batch[batch.len() - 1].block.number);
             tracing::error!("blocks {first}..={last} not written, retrying: {e:#}");
@@ -975,19 +984,26 @@ pub async fn run_forever(
 ) {
     let stats_interval = cfg.stats_interval;
     let chain_head = Arc::new(AtomicU64::new(0));
+    // A tidx keeps the transfers and balances; see `tidx`.
+    let own_transfers = cfg.tidx.is_none();
     tokio::spawn(stats_loop(
         db.clone(),
         stats_interval,
         chain_head.clone(),
         shutdown.clone(),
     ));
+    if let Some(tidx) = cfg.tidx.clone() {
+        tokio::spawn(holder_counts_loop(db.clone(), tidx, shutdown.clone()));
+    }
 
-    tokio::spawn(genesis_loop(
-        rpc.clone(),
-        db.clone(),
-        stats_interval,
-        shutdown.clone(),
-    ));
+    if own_transfers {
+        tokio::spawn(genesis_loop(
+            rpc.clone(),
+            db.clone(),
+            stats_interval,
+            shutdown.clone(),
+        ));
+    }
 
     // Seed the token-metadata cache and repair balances on legacy databases.
     let known_tokens = Arc::new(Mutex::new(
@@ -1003,8 +1019,10 @@ pub async fn run_forever(
             warn!("token metadata repair failed: {e:#}");
         }
     });
-    let rebuild_db = db.clone();
-    tokio::spawn(async move { repair_derived_tables(&rebuild_db) });
+    if own_transfers {
+        let rebuild_db = db.clone();
+        tokio::spawn(async move { repair_derived_tables(&rebuild_db) });
+    }
     // Minutes of work on a large database, so on a thread of its own.
     let pack_db = db.clone();
     tokio::task::spawn_blocking(move || {
@@ -1022,7 +1040,12 @@ pub async fn run_forever(
     });
 
     let (bundle_tx, bundle_rx) = mpsc::channel::<BlockBundle>(1024);
-    let writer = tokio::spawn(write_loop(db.clone(), bundle_rx, shutdown.clone()));
+    let writer = tokio::spawn(write_loop(
+        db.clone(),
+        bundle_rx,
+        own_transfers,
+        shutdown.clone(),
+    ));
 
     let ix = Indexer {
         rpc,
@@ -1075,6 +1098,21 @@ async fn add_genesis_balances(rpc: &ChainRpc, db: &Db) -> Result<()> {
         db::save_genesis_balances(db, &rows, cursor)?;
     }
     Ok(())
+}
+
+/// Each token's holder count as the tidx last counted it, written onto its
+/// metadata row. Its snapshots refresh every quarter hour, so a minute's lag
+/// shows nothing stale.
+async fn holder_counts_loop(db: Db, tidx: Tidx, mut shutdown: watch::Receiver<bool>) {
+    loop {
+        let counts = tidx.clone().token_holder_counts().await;
+        if let Err(e) = counts.and_then(|counts| db::set_holder_counts(&db, &counts)) {
+            warn!("holder counts from tidx: {e:#}");
+        }
+        if sleep_or_shutdown(&mut shutdown, Duration::from_secs(60)).await {
+            break;
+        }
+    }
 }
 
 /// Recompute the home-page stats blob into the `kv` table every interval so
@@ -1349,7 +1387,7 @@ mod tests {
 
         let (tx, rx) = mpsc::channel(8);
         let (_stop, shutdown) = watch::channel(false);
-        let writer = tokio::spawn(write_loop(db.clone(), rx, shutdown));
+        let writer = tokio::spawn(write_loop(db.clone(), rx, true, shutdown));
         for n in [1, 2] {
             let raw = json!({"number": format!("0x{n:x}"), "hash": format!("0x{n:064x}")});
             let mut bundle = assemble_bundle(&raw, None);
@@ -1367,6 +1405,37 @@ mod tests {
         writer.await.unwrap();
         assert!(db::get_block_by_number(&db, 1).is_some());
         assert!(db::get_block_by_number(&db, 2).is_some());
+    }
+
+    /// With a tidx, the writer keeps the block and skips its transfers.
+    #[tokio::test]
+    async fn with_a_tidx_transfers_are_not_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tidx.db");
+        let db: Db = Arc::new(Mutex::new(db::init_db(path.to_str().unwrap()).unwrap()));
+        let (tx, rx) = mpsc::channel(8);
+        let (_stop, shutdown) = watch::channel(false);
+        let writer = tokio::spawn(write_loop(db.clone(), rx, false, shutdown));
+        let holder = "0x1111111111111111111111111111111111111111";
+        let raw = json!({"number": "0x1", "hash": format!("0x{:064x}", 1)});
+        let mut bundle = assemble_bundle(&raw, None);
+        bundle.transfers = vec![TransferEvent {
+            id: 0,
+            tx_hash: String::new(),
+            block_number: 1,
+            log_index: 0,
+            token_addr: "0x20C0000000000000000000000000000000000000".into(),
+            from_addr: ZERO_ADDRESS.into(),
+            to_addr: holder.into(),
+            amount: "1".into(),
+            timestamp: 0,
+            created_at: 0,
+        }];
+        tx.send(bundle).await.unwrap();
+        drop(tx);
+        writer.await.unwrap();
+        assert!(db::get_block_by_number(&db, 1).is_some());
+        assert_eq!(db::get_address_transfer_count(&db, holder), 0);
     }
 
     /// A block that did not come back must not be stepped over: what the forward

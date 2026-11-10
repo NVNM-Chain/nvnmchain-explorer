@@ -1448,6 +1448,21 @@ fn count_holders(conn: &Connection, token: &str) -> rusqlite::Result<i64> {
     .query_row(params![hex_blob(token)], |r| r.get(0))
 }
 
+/// Write each token's holder count as tidx counted it.
+pub fn set_holder_counts(db: &Db, counts: &[(String, i64)]) -> Result<()> {
+    let mut conn = lock(db);
+    let txn = conn.transaction()?;
+    for (token, count) in counts {
+        exec_cached(
+            &txn,
+            "UPDATE token_metadata SET holder_count=?1, updated_at=?2 WHERE address=?3",
+            params![count, now_ts(), hex_blob(token)],
+        )?;
+    }
+    txn.commit()?;
+    Ok(())
+}
+
 /// Recount one token's holders and write the total onto its metadata row.
 fn update_holder_count(conn: &Connection, token: &str) -> Result<()> {
     let count = count_holders(conn, token)?;

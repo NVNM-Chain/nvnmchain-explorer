@@ -45,7 +45,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run unit tests
-        run: cargo test --lib --test decoder --test anchoring --test pages --test baseline
+        run: cargo test --lib --test decoder --test anchoring --test pages --test baseline --test tidx
 
       - name: Run live RPC integration tests
         run: cargo test --test live_rpc
