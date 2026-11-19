@@ -66,6 +66,10 @@ enum Slot {
     Hex(&'static str),
     /// A `bytes32` role, by name when it is one of the known ones.
     Role(&'static str),
+    /// An anchoring registry's id, linked to its page.
+    Registry(&'static str),
+    /// An anchoring record's id, linked to its page in the event's `registryId`.
+    Record(&'static str),
 }
 
 /// How one event reads. `action` opens the sentence and names a failure
@@ -813,7 +817,7 @@ static PHRASES: &[Phrase] = &[
         "Add Registry",
         &[Slot::Value("name")],
     )
-    .notes(&[("Registry", Slot::Value("registryId"))]),
+    .notes(&[("Registry", Slot::Registry("registryId"))]),
     phrase(
         "AddRecord(address,uint64,uint64,uint64,string)",
         "record added",
@@ -826,8 +830,8 @@ static PHRASES: &[Phrase] = &[
         ],
     )
     .notes(&[
-        ("Registry", Slot::Value("registryId")),
-        ("Record", Slot::Value("recordId")),
+        ("Registry", Slot::Registry("registryId")),
+        ("Record", Slot::Record("recordId")),
     ]),
     phrase(
         "UpdateRecordStatus(address,uint64,uint64,uint64,string)",
@@ -836,8 +840,8 @@ static PHRASES: &[Phrase] = &[
         &[Slot::Value("status"), Slot::Word("on version"), Slot::Value("index")],
     )
     .notes(&[
-        ("Registry", Slot::Value("registryId")),
-        ("Record", Slot::Value("recordId")),
+        ("Registry", Slot::Registry("registryId")),
+        ("Record", Slot::Record("recordId")),
     ]),
     phrase(
         "GrantRole(address,uint64,string,address,string)",
@@ -846,7 +850,7 @@ static PHRASES: &[Phrase] = &[
         &[Slot::Value("role"), Slot::Word("to"), Slot::Account("account")],
     )
     .notes(&[
-        ("Registry", Slot::Value("registryId")),
+        ("Registry", Slot::Registry("registryId")),
         ("Record", Slot::Value("checksum")),
     ]),
     phrase(
@@ -856,7 +860,7 @@ static PHRASES: &[Phrase] = &[
         &[Slot::Value("role"), Slot::Word("from"), Slot::Account("account")],
     )
     .notes(&[
-        ("Registry", Slot::Value("registryId")),
+        ("Registry", Slot::Registry("registryId")),
         ("Record", Slot::Value("checksum")),
     ]),
     // ---- Zone factory (0x5AF2…) ----------------------------------------
@@ -1061,8 +1065,8 @@ pub struct KnownEvent {
     pub headline: String,
     /// A memo or other free-form note the sender attached.
     pub note: Option<String>,
-    /// `(label, value)` details shown beneath the sentence.
-    pub details: Vec<(String, String)>,
+    /// `(label, value, page)` shown beneath the sentence, `page` being where the value links.
+    pub details: Vec<(String, String, Option<String>)>,
     pub from: Option<String>,
     pub to: Option<String>,
     /// The addresses the headline shows truncated, in its order, for a page to link.
@@ -1122,13 +1126,27 @@ fn render_slot(slot: &Slot, event: &DecodedEvent, tokens: &Tokens) -> Option<Str
                 _ => truncate(address),
             }
         }
-        Slot::Value(name) => event.param(name)?.to_string(),
+        Slot::Value(name) | Slot::Registry(name) | Slot::Record(name) => {
+            event.param(name)?.to_string()
+        }
         Slot::Hex(name) => truncate(event.param(name)?),
         Slot::Role(name) => {
             let word = event.param(name)?;
             role_name(word).unwrap_or_else(|| truncate(word))
         }
     })
+}
+
+/// The page a slot's value links to, for an anchoring registry or record.
+fn slot_page(slot: &Slot, event: &DecodedEvent) -> Option<String> {
+    match slot {
+        Slot::Registry(name) => Some(format!("/anchoring/{}", event.param(name)?)),
+        Slot::Record(name) => {
+            let registry = event.param("registryId")?;
+            Some(format!("/anchoring/{registry}/{}", event.param(name)?))
+        }
+        _ => None,
+    }
 }
 
 fn phrase_for(signature: &str) -> Option<&'static Phrase> {
@@ -1154,9 +1172,10 @@ fn known_event(
             .notes
             .iter()
             .filter_map(|(label, slot)| {
-                render_slot(slot, event, tokens).map(|v| ((*label).to_string(), v))
+                let value = render_slot(slot, event, tokens)?;
+                Some(((*label).to_string(), value, slot_page(slot, event)))
             })
-            .filter(|(_, value)| !value.is_empty())
+            .filter(|(_, value, _)| !value.is_empty())
             .collect(),
         from: event.param("from").map(String::from),
         to: event.param("to").map(String::from),
@@ -1614,6 +1633,45 @@ mod tests {
         );
         assert_eq!(event.headline, "Upgrade to 0x63Ff…a927");
         assert_eq!(event.accounts, [implementation]);
+    }
+
+    /// A record's registry and record ids link to their anchoring pages.
+    #[test]
+    fn an_added_record_links_its_registry_and_record() {
+        let caller = "0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65";
+        let data = ethers_core::abi::encode(&[
+            ethers_core::abi::Token::Uint(300.into()),
+            ethers_core::abi::Token::Uint(11.into()),
+            ethers_core::abi::Token::Uint(1.into()),
+            ethers_core::abi::Token::String("106 F. Supp. 2d 1227".into()),
+        ]);
+        let event = say(
+            &json!({
+                "address": "0x0000000000000000000000000000000000000a00",
+                "topics": [
+                    keccak_hex(b"AddRecord(address,uint64,uint64,uint64,string)"),
+                    topic(caller),
+                ],
+                "data": format!("0x{}", hex::encode(data)),
+                "logIndex": "0x0",
+            }),
+            None,
+        );
+        assert_eq!(
+            event.details,
+            [
+                (
+                    "Registry".into(),
+                    "300".into(),
+                    Some("/anchoring/300".into())
+                ),
+                (
+                    "Record".into(),
+                    "11".into(),
+                    Some("/anchoring/300/11".into())
+                ),
+            ]
+        );
     }
 
     /// The headline sentence the whole feature exists for.

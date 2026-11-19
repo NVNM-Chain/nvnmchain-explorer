@@ -344,7 +344,7 @@
         {% if event.known.details %}
         <div class="text-xs mb-2 space-x-3">
             {% for detail in event.known.details %}
-            <span class="text-faint">{{ detail.0 }}:</span><span class="ml-1">{{ detail.1 }}</span>
+            <span class="text-faint">{{ detail.0 }}:</span>{% if detail.2 %}<a href="{{ detail.2 }}" class="ml-1 text-blue-400 hover:text-blue-300">{{ detail.1 }}</a>{% else %}<span class="ml-1">{{ detail.1 }}</span>{% endif %}
             {% endfor %}
         </div>
         {% endif %}
