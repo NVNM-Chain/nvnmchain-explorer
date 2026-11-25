@@ -133,9 +133,9 @@ and never overrides variables already set in the environment.
 |-----|---------|---------|
 | `ROLE` | `ALL` | `ALL`, `INDEXER` or `WEB`; informational for now (logged at startup, every role still runs indexer and server) |
 | `NVNM_RPC` | `https://rpc.nvnm.canary.mantrachain.dev` | JSON-RPC endpoint (legacy `TEMPO_RPC` also accepted) |
-| `WS_URL` | `wss://ws.nvnm.canary.mantrachain.dev` | WebSocket endpoint for `newHeads` |
+| `WS_URL` | `wss://rpc.nvnm.canary.mantrachain.dev` | WebSocket endpoint for `newHeads` |
 | `INDEX_WS` | `1` | Set `0` to disable the WebSocket feed (pure polling) |
-| `CHAIN_ID` | `787222` | Chain id shown in the UI |
+| `CHAIN_ID` | `787222` | Chain id; for `7872` (mainnet), `787223` (testnet) and `787222` (canary) it also picks the two defaults above and the footer's RPC link |
 | `DB_PATH` | `explorer.db` | SQLite database path |
 | `HOST` / `PORT` | `0.0.0.0` / `8080` | Bind address |
 | `INDEX_POLL_SECONDS` | `1` | Poll interval when the WebSocket feed is unavailable |

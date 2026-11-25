@@ -24,7 +24,7 @@ use tokio::sync::{broadcast, watch};
 use tower_http::cors::CorsLayer;
 
 use crate::anchoring;
-use crate::config::Settings;
+use crate::config::{network, Settings};
 use crate::contracts::{
     abis_for_address, get_contract_name, identify_address, is_tip20_token, proxy, search_named,
     ProxyTarget,
@@ -106,16 +106,25 @@ fn html_or_json(
 /// `base.html`, so every one of these must be present or the render fails —
 /// build page contexts through here rather than by hand.
 fn page_ctx(state: &AppState, extra: Value) -> Value {
-    page_ctx_for(db::get_latest_block(&state.db), extra)
+    page_ctx_for(state, db::get_latest_block(&state.db), extra)
 }
 
 /// [`page_ctx`] for handlers that have already read the tip, so the page does
 /// not query for it twice.
-fn page_ctx_for(latest_block: Option<crate::models::Block>, extra: Value) -> Value {
+fn page_ctx_for(
+    state: &AppState,
+    latest_block: Option<crate::models::Block>,
+    extra: Value,
+) -> Value {
     let mut map = serde_json::Map::new();
     map.insert(
         "latest_block".into(),
         serde_json::to_value(latest_block).unwrap_or(Value::Null),
+    );
+    // The network's public RPC: `NVNM_RPC` can be an address only the explorer reaches.
+    map.insert(
+        "rpc_link".into(),
+        json!(network(state.cfg.chain_id).map(|(rpc, _)| rpc)),
     );
     // The commit the image was built from; a local build without `GIT_SHA` names none.
     map.insert(
@@ -763,6 +772,7 @@ pub async fn home(
         .and_then(Value::as_i64)
         .is_some_and(|at| db::now_ts() - at > stale_after);
     let ctx = page_ctx_for(
+        &state,
         latest_block,
         json!({
             "stats": stats,
@@ -1037,6 +1047,7 @@ pub async fn blocks_page(
         .collect();
 
     let ctx = page_ctx_for(
+        &state,
         latest,
         json!({
             "blocks": blocks,
@@ -1075,6 +1086,7 @@ pub async fn txs_page(
         .collect();
 
     let ctx = page_ctx_for(
+        &state,
         db::get_latest_block(&state.db),
         json!({
             "transactions": txs,

@@ -96,11 +96,27 @@ fn env_or(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
+/// The public JSON-RPC and WebSocket endpoints of NVNM's network `chain_id`; `None` for another chain.
+pub fn network(chain_id: u64) -> Option<(&'static str, &'static str)> {
+    match chain_id {
+        7_872 => Some((
+            "https://rpc.nvnm.mainnet.nvnmchain.io",
+            "wss://rpc.nvnm.mainnet.nvnmchain.io",
+        )),
+        787_223 => Some((
+            "https://rpc.nvnm.testnet.nvnmchain.io",
+            "wss://rpc.nvnm.testnet.nvnmchain.io",
+        )),
+        DEFAULT_CHAIN_ID => Some((DEFAULT_RPC_URL, DEFAULT_WS_URL)),
+        _ => None,
+    }
+}
+
 /// Read `NVNM_RPC`, falling back to the legacy `TEMPO_RPC` variable.
-fn rpc_url() -> String {
+fn rpc_url(default: &str) -> String {
     env::var("NVNM_RPC")
         .or_else(|_| env::var("TEMPO_RPC"))
-        .unwrap_or_else(|_| DEFAULT_RPC_URL.to_string())
+        .unwrap_or_else(|_| default.to_string())
 }
 
 /// `key` parsed as a `T`, or `default` when it is unset or does not parse.
@@ -124,10 +140,11 @@ impl Settings {
     pub fn from_env() -> Self {
         let port: u64 = env_parse("PORT", DEFAULT_PORT.into());
         let chain_id = env_parse("CHAIN_ID", DEFAULT_CHAIN_ID);
+        let (rpc, ws) = network(chain_id).unwrap_or((DEFAULT_RPC_URL, DEFAULT_WS_URL));
         Self {
             role: role(),
-            rpc_url: rpc_url(),
-            ws_url: env_or("WS_URL", DEFAULT_WS_URL),
+            rpc_url: rpc_url(rpc),
+            ws_url: env_or("WS_URL", ws),
             index_ws: env::var("INDEX_WS")
                 .map(|v| v != "0" && v.to_lowercase() != "false")
                 .unwrap_or(false),
