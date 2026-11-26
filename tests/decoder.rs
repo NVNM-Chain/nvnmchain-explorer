@@ -705,7 +705,7 @@ fn a_rewrite_without_the_blobs_keeps_them() {
 }
 
 /// A receipt is stored compressed and read back as its JSON, and one an older
-/// build stored as text still reads.
+/// build stored without the dictionary, or as text, still reads.
 #[test]
 fn receipts_are_stored_compressed() {
     let (_dir, db) = temp_db("receipts.db");
@@ -730,11 +730,16 @@ fn receipts_are_stored_compressed() {
     let stored = db::get_transaction(&db, &tx.hash).unwrap();
     assert_eq!(stored.receipt_data, tx.receipt_data);
 
-    db::lock(&db)
-        .execute("UPDATE transactions SET receipt_data = ?1", [&receipt])
-        .unwrap();
-    let legacy = db::get_transaction(&db, &tx.hash).unwrap();
-    assert_eq!(legacy.receipt_data, tx.receipt_data);
+    for legacy in [
+        rusqlite::types::Value::Blob(zstd::bulk::compress(receipt.as_bytes(), 3).unwrap()),
+        rusqlite::types::Value::Text(receipt.clone()),
+    ] {
+        db::lock(&db)
+            .execute("UPDATE transactions SET receipt_data = ?1", [&legacy])
+            .unwrap();
+        let stored = db::get_transaction(&db, &tx.hash).unwrap();
+        assert_eq!(stored.receipt_data, tx.receipt_data);
+    }
 }
 
 /// Calldata is stored as bytes and read back as its hex, and hex an older build
@@ -808,15 +813,29 @@ fn rows_older_builds_wrote_unpacked_are_packed() {
     assert_eq!(packed.receipt_data, tx.receipt_data);
     assert_eq!(db::get_kv(&db, db::PACKED_KEY).as_deref(), Some("1"));
 
+    // A receipt compressed before the dictionary is compressed again with it.
     let mut later = tx.clone();
     later.hash = format!("0x{}", "ee".repeat(32));
     db::save_transaction(&db, &later).unwrap();
+    let json = later.receipt_data.as_ref().unwrap().as_bytes();
+    db::lock(&db)
+        .execute(
+            "UPDATE transactions SET receipt_data = ?1 WHERE rowid = 2",
+            [zstd::bulk::compress(json, 3).unwrap()],
+        )
+        .unwrap();
     db::pack_legacy_transactions(&db).unwrap();
-    assert_eq!(
-        db::get_kv(&db, db::PACKED_KEY).as_deref(),
-        Some("2"),
-        "a run that finds nothing moves the mark past the rows written packed"
-    );
+    let frame: Vec<u8> = db::lock(&db)
+        .query_row(
+            "SELECT receipt_data FROM transactions WHERE rowid = 2",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(zstd::zstd_safe::get_dict_id_from_frame(&frame).is_some());
+    let packed = db::get_transaction(&db, &later.hash).unwrap();
+    assert_eq!(packed.receipt_data, later.receipt_data);
+    assert_eq!(db::get_kv(&db, db::PACKED_KEY).as_deref(), Some("2"));
 }
 
 /// A database from before the counters is counted once when it opens, and the
