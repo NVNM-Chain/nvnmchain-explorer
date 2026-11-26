@@ -710,18 +710,23 @@ pub fn get_recent_blocks(db: &Db, limit: usize) -> Vec<Block> {
 
 thread_local! {
     /// Receipts compress to about a quarter: every log repeats the block and
-    /// transaction ids, and hex packs well. Building a context costs more than
-    /// compressing one receipt with it.
-    static RECEIPT_COMPRESSOR: RefCell<Compressor<'static>> =
+    /// transaction ids, and hex packs well. Signed transactions do too: their
+    /// calls are mostly ABI padding. Building a context costs more than
+    /// compressing one blob with it.
+    static COMPRESSOR: RefCell<Compressor<'static>> =
         RefCell::new(Compressor::new(zstd::DEFAULT_COMPRESSION_LEVEL).expect("zstd context"));
 }
 
-/// A receipt as stored: compressed.
-fn pack_receipt(json: &str) -> Result<Vec<u8>> {
-    RECEIPT_COMPRESSOR
-        .with(|c| c.borrow_mut().compress(json.as_bytes()))
-        .context("compress receipt")
+/// A receipt or signed transaction as stored: compressed.
+fn compress(bytes: impl AsRef<[u8]>) -> Result<Vec<u8>> {
+    COMPRESSOR
+        .with(|c| c.borrow_mut().compress(bytes.as_ref()))
+        .context("compress")
 }
+
+/// How a compressed `raw` starts. An uncompressed one starts with its EIP-2718
+/// type byte, and no type 0x28 exists.
+const ZSTD_MAGIC: [u8; 4] = zstd::zstd_safe::MAGICNUMBER.to_le_bytes();
 
 /// Calldata as stored: bytes, half the hex. What does not decode stays text.
 fn pack_input(hex: &str) -> types::Value {
@@ -734,7 +739,8 @@ fn pack_input(hex: &str) -> types::Value {
 /// A rewrite that carries nothing for a blob keeps what is stored: the trace the
 /// transaction page cached, the raw bytes a failed decode left out.
 fn upsert_transaction(conn: &Connection, tx: &Transaction) -> Result<()> {
-    let receipt = tx.receipt_data.as_deref().map(pack_receipt).transpose()?;
+    let receipt = tx.receipt_data.as_deref().map(compress).transpose()?;
+    let raw = tx.raw.as_deref().map(hex_blob).map(compress).transpose()?;
     exec_cached(
         conn,
         r#"
@@ -768,7 +774,7 @@ fn upsert_transaction(conn: &Connection, tx: &Transaction) -> Result<()> {
             tx.fee_token.as_deref().map(hex_blob),
             tx.fee_amount,
             pack_input(&tx.input),
-            tx.raw.as_deref().map(hex_blob),
+            raw,
             tx.trace_data,
             receipt,
             tx.timestamp,
@@ -783,71 +789,70 @@ pub fn save_transaction(db: &Db, tx: &Transaction) -> Result<()> {
     upsert_transaction(&conn, tx)
 }
 
-/// The rowid [`pack_legacy_transactions`] has reached.
-pub const PACKED_KEY: &str = "transactions_packed_to";
+/// The rowid [`pack_legacy_transactions`] has reached. Renamed when the packer
+/// takes on a column, so a database an older packer finished is read again.
+pub const PACKED_KEY: &str = "transactions_packed_v2_to";
 
-/// Rewrite the rows older builds stored as text, receipts compressed and
-/// calldata as bytes, so two fit a page. A few hundred rows at a time: the
-/// writer and the pages get the connection in between, and the WAL
-/// checkpoints. A stopped run carries on from the kv row.
+/// Rewrite the rows older builds stored unpacked: receipts and signed
+/// transactions compressed, calldata as bytes. A few hundred rowids at a time,
+/// packed or not, so the writer and the pages get the connection in between
+/// and the WAL checkpoints. A stopped run carries on from the kv row.
 pub fn pack_legacy_transactions(db: &Db) -> Result<()> {
     const CHUNK: i64 = 500;
+    // A rowid and the columns still unpacked, NULL where one is already packed.
+    type Unpacked = (i64, Option<String>, Option<String>, Option<Vec<u8>>);
     let mut from: i64 = get_kv(db, PACKED_KEY)
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+    // Rows past this one are this build's, written packed.
+    let end: i64 = lock(db).query_row(
+        "SELECT COALESCE(MAX(rowid), 0) FROM transactions",
+        [],
+        |r| r.get(0),
+    )?;
     let mut packed = 0usize;
-    loop {
+    while from < end {
+        let to = (from + CHUNK).min(end);
         let mut conn = lock(db);
         let txn = conn.transaction().context("begin pack")?;
-        // The columns still text, NULL where one is already packed.
-        let rows: Vec<(i64, Option<String>, Option<String>)> = {
+        let rows: Vec<Unpacked> = {
             let mut stmt = txn.prepare_cached(
                 "SELECT rowid,
                         CASE WHEN typeof(receipt_data) = 'text' THEN receipt_data END,
-                        CASE WHEN typeof(input) = 'text' THEN input END
+                        CASE WHEN typeof(input) = 'text' THEN input END,
+                        CASE WHEN substr(raw, 1, 4) <> ?3 THEN raw END
                  FROM transactions
-                 WHERE rowid > ?1 AND (typeof(receipt_data) = 'text' OR typeof(input) = 'text')
-                 ORDER BY rowid LIMIT ?2",
+                 WHERE rowid > ?1 AND rowid <= ?2
+                   AND (typeof(receipt_data) = 'text' OR typeof(input) = 'text'
+                        OR substr(raw, 1, 4) <> ?3)",
             )?;
-            let rows = stmt.query_map(params![from, CHUNK], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            let rows = stmt.query_map(params![from, to, &ZSTD_MAGIC[..]], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
             })?;
             rows.collect::<rusqlite::Result<_>>()?
         };
-        let Some(&(last, _, _)) = rows.last() else {
-            // Nothing left: the next run starts past the rows this build wrote packed,
-            // rather than reading them all again to find that out.
-            let end: i64 = txn.query_row(
-                "SELECT COALESCE(MAX(rowid), 0) FROM transactions",
-                [],
-                |r| r.get(0),
-            )?;
-            if end > from {
-                set_kv(&txn, PACKED_KEY, &end.to_string())?;
-                txn.commit().context("commit pack")?;
-            }
-            break;
-        };
-        for (rowid, receipt, input) in &rows {
-            let receipt = receipt.as_deref().map(pack_receipt).transpose()?;
+        for (rowid, receipt, input, raw) in &rows {
+            let receipt = receipt.as_deref().map(compress).transpose()?;
             let input = input.as_deref().map(pack_input);
+            let raw = raw.as_deref().map(compress).transpose()?;
             exec_cached(
                 &txn,
                 "UPDATE transactions SET receipt_data = COALESCE(?1, receipt_data),
-                                         input = COALESCE(?2, input)
-                 WHERE rowid = ?3",
-                params![receipt, input, rowid],
+                                         input = COALESCE(?2, input),
+                                         raw = COALESCE(?3, raw)
+                 WHERE rowid = ?4",
+                params![receipt, input, raw, rowid],
             )?;
         }
-        set_kv(&txn, PACKED_KEY, &last.to_string())?;
+        set_kv(&txn, PACKED_KEY, &to.to_string())?;
         txn.commit().context("commit pack")?;
         drop(conn);
-        from = last;
+        from = to;
         packed += rows.len();
         std::thread::sleep(Duration::from_millis(20));
     }
     if packed > 0 {
-        tracing::info!("packed {packed} transaction row(s) older builds wrote as text");
+        tracing::info!("packed {packed} transaction row(s) older builds wrote unpacked");
     }
     Ok(())
 }
@@ -895,7 +900,7 @@ fn row_to_tx(row: &rusqlite::Row) -> rusqlite::Result<Transaction> {
             ValueRef::Blob(bytes) => blob_hex(bytes),
             _ => row.get(11)?,
         },
-        raw: row.get::<_, Option<Vec<u8>>>(12)?.map(|b| blob_hex(&b)),
+        raw: raw_col(row, 12)?,
         trace_data: row.get(13)?,
         receipt_data: receipt_col(row, 14)?,
         timestamp: row.get(15)?,
@@ -911,6 +916,19 @@ fn receipt_col(row: &rusqlite::Row, i: usize) -> rusqlite::Result<Option<String>
     zstd::Decoder::new(bytes)
         .and_then(std::io::read_to_string)
         .map(Some)
+        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(i, Type::Blob, Box::new(e)))
+}
+
+/// Column `i` of `row`, a signed transaction, as hex: compressed, or the bytes an older build wrote.
+fn raw_col(row: &rusqlite::Row, i: usize) -> rusqlite::Result<Option<String>> {
+    let Some(bytes) = row.get_ref(i)?.as_blob_or_null()? else {
+        return Ok(None);
+    };
+    if !bytes.starts_with(&ZSTD_MAGIC) {
+        return Ok(Some(blob_hex(bytes)));
+    }
+    zstd::decode_all(bytes)
+        .map(|b| Some(blob_hex(&b)))
         .map_err(|e| rusqlite::Error::FromSqlConversionFailure(i, Type::Blob, Box::new(e)))
 }
 

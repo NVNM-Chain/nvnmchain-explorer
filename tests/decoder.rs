@@ -764,38 +764,47 @@ fn calldata_is_stored_as_bytes() {
     assert_eq!(db::get_transaction(&db, &tx.hash).unwrap().input, tx.input);
 }
 
-/// Rows an older build wrote as text are rewritten in place, and a second run
-/// finds nothing to do.
+/// Rows an older build wrote unpacked still read and are rewritten in place,
+/// and a second run finds nothing to do.
 #[test]
-fn rows_older_builds_wrote_as_text_are_packed() {
+fn rows_older_builds_wrote_unpacked_are_packed() {
     let (_dir, db) = temp_db("pack.db");
     let raw_block = sample_raw_block();
     let block = parse_block(&raw_block);
     let mut tx = parse_transaction(&raw_block["transactions"][0], &block);
     tx.input = format!("0xa9059cbb{}", "22".repeat(64));
+    tx.raw = Some(format!("0x76{}", "00".repeat(64)));
     tx.receipt_data = Some(json!({"status": "0x1", "logs": []}).to_string());
     db::save_transaction(&db, &tx).unwrap();
-    db::lock(&db)
-        .execute(
-            "UPDATE transactions SET input = ?1, receipt_data = ?2",
-            rusqlite::params![tx.input, tx.receipt_data],
-        )
-        .unwrap();
-    let kinds = |db: &Db| -> (String, String) {
+    // The raw column's first byte: the type 0x76, or zstd's magic.
+    let kinds = |db: &Db| -> (String, String, String) {
         db::lock(db)
             .query_row(
-                "SELECT typeof(input), typeof(receipt_data) FROM transactions",
+                "SELECT typeof(input), typeof(receipt_data), hex(substr(raw, 1, 1)) FROM transactions",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .unwrap()
     };
-    assert_eq!(kinds(&db), ("text".into(), "text".into()));
+    assert_eq!(kinds(&db).2, "28", "written compressed");
+    db::lock(&db)
+        .execute(
+            "UPDATE transactions SET input = ?1, receipt_data = ?2, raw = ?3",
+            rusqlite::params![
+                tx.input,
+                tx.receipt_data,
+                hex::decode(&tx.raw.as_ref().unwrap()[2..]).unwrap()
+            ],
+        )
+        .unwrap();
+    assert_eq!(kinds(&db), ("text".into(), "text".into(), "76".into()));
+    assert_eq!(db::get_transaction(&db, &tx.hash).unwrap().raw, tx.raw);
 
     db::pack_legacy_transactions(&db).unwrap();
-    assert_eq!(kinds(&db), ("blob".into(), "blob".into()));
+    assert_eq!(kinds(&db), ("blob".into(), "blob".into(), "28".into()));
     let packed = db::get_transaction(&db, &tx.hash).unwrap();
     assert_eq!(packed.input, tx.input);
+    assert_eq!(packed.raw, tx.raw);
     assert_eq!(packed.receipt_data, tx.receipt_data);
     assert_eq!(db::get_kv(&db, db::PACKED_KEY).as_deref(), Some("1"));
 
